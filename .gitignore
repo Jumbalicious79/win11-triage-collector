@@ -1,0 +1,13 @@
+# Reports (generated at runtime)
+reports/
+
+# Backups
+bak/
+
+# Optional tool binaries (user-provided, not committed)
+tools/
+
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini

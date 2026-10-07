@@ -443,6 +443,15 @@ function Copy-ForensicFile {
         return
     }
 
+    # Empty files hold nothing to collect (and empty copies are discarded
+    # anyway). Skipping them up front also avoids lock and shadow-copy
+    # fallbacks for files programs keep open while empty, such as the 0-byte
+    # SQLite journals Chromium browsers leave next to every database.
+    if ((Get-FileLength $SourcePath) -eq 0) {
+        Write-Verbose "Skipped empty file: $SourcePath"
+        return
+    }
+
     try {
         Ensure-Directory $DestDir
 
@@ -508,8 +517,8 @@ function Copy-ForensicFile {
                 return
             }
             # SQLite journal/WAL companions (History-journal, Cookies-journal,
-            # places.sqlite-wal, ...) only exist while the program is writing,
-            # so they are often missing from the shadow copy: not an error
+            # places.sqlite-wal, ...) can be created after the shadow copy was
+            # taken: not an error
             if ($SourcePath -match '-(journal|wal|shm)$') {
                 Log "Skipped (in use, not in the shadow copy; temporary database journal): $SourcePath"
                 return

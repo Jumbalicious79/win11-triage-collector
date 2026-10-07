@@ -2874,10 +2874,13 @@ if ($Categories -contains "Network") {
     Save-CommandOutput -Description "firewall_rules" `
         -DestPath (Join-Path $netDir "firewall_rules.txt") `
         -Command {
+            # Out-String with a wide width: Out-File cuts a table to the
+            # console width, which dropped the Direction/Action/Profile columns
             Get-NetFirewallRule -Enabled True -ErrorAction SilentlyContinue |
                 Select-Object DisplayName, Direction, Action, Profile |
                 Sort-Object Direction, DisplayName |
-                Format-Table -AutoSize -Wrap
+                Format-Table -AutoSize |
+                Out-String -Width 4096
         }
 
     Log "Collecting Wi-Fi profiles..."

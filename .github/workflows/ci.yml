@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  parse:
+    # The .bat launchers run the scripts in Windows PowerShell 5.1, so both
+    # editions must parse every script
+    name: Parse (${{ matrix.shell }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shell: [powershell, pwsh]
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parse all scripts
+        run: |
+          $root = (Get-Location).Path
+          $failed = $false
+          foreach ($file in Get-ChildItem -Path . -Filter *.ps1 -Recurse) {
+              $errors = $null
+              [void][System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$null, [ref]$errors)
+              $relPath = $file.FullName.Substring($root.Length + 1).Replace('\', '/')
+              foreach ($e in $errors) {
+                  Write-Host "::error file=$relPath,line=$($e.Extent.StartLineNumber)::$($e.Message)"
+                  $failed = $true
+              }
+          }
+          if ($failed) { exit 1 }
+          Write-Host "All scripts parse in PowerShell $($PSVersionTable.PSVersion)"
+
+  analyze:
+    name: PSScriptAnalyzer
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run PSScriptAnalyzer (errors only)
+        run: |
+          if (-not (Get-Module -ListAvailable -Name PSScriptAnalyzer)) {
+              Install-Module -Name PSScriptAnalyzer -Scope CurrentUser -Force
+          }
+          $results = @(Invoke-ScriptAnalyzer -Path . -Recurse -Severity Error)
+          foreach ($r in $results) {
+              Write-Host "::error file=$($r.ScriptName),line=$($r.Line)::$($r.RuleName): $($r.Message)"
+          }
+          if ($results.Count -gt 0) { exit 1 }
+          Write-Host "PSScriptAnalyzer: no errors"

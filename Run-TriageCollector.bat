@@ -4,12 +4,20 @@
 ::
 :: Usage:
 ::   Double-click                    -- collect from C: (live system)
-::   Run-TriageCollector.bat fast    -- skip the USN journal export
+::   Run-TriageCollector.bat fast    -- skip raw NTFS copies and the USN export
 ::   Run-TriageCollector.bat nozip   -- don't compress output
 ::   Run-TriageCollector.bat E       -- collect from E: (mounted image)
-::   Run-TriageCollector.bat E fast  -- collect from E:, skip the USN journal
+::   Run-TriageCollector.bat E fast  -- collect from E:, skip raw NTFS and USN
 ::
-:: Note: "fast" skips the USN journal, the timeline builder's largest source.
+:: FileSystem\ gets raw copies of the NTFS metafiles, read from the volume by a
+:: built-in reader (no extra tools): $MFT (file records, including deleted
+:: files not yet overwritten), $LogFile (NTFS transaction log) and $UsnJrnl_$J
+:: (USN change journal, allocated part only -- its sparse, already-freed part
+:: is left out). They feed the timeline builder's $MFT timeline and tools such
+:: as MFTECmd. $UsnJrnl_$J.txt is the same journal exported as text by fsutil.
+::
+:: Note: "fast" skips the raw NTFS copies ($MFT, $LogFile, $UsnJrnl:$J) and
+:: the fsutil USN export, the timeline builder's largest sources.
 
 net session >nul 2>&1
 if %errorlevel% equ 0 goto :elevated

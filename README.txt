@@ -10,9 +10,10 @@ Explorer. Both tools are available as separate repos for independent use.
 
   Companion project: https://github.com/Jumbalicious79/win11-timeline-builder
 
-Tested on Windows 11 Home Build 26200. Collects ~600 files in ~90 seconds,
-compresses to ~65 MB. Supports live system collection and mounted forensic
-images.
+Tested on Windows 11 Home Build 26200 (x64) and Windows 11 Pro 26100 (ARM64,
+Parallels on Apple silicon). A typical run collects ~450-500 files in about
+1-2 minutes; the zip size depends mostly on the raw $MFT (often 100 MB to
+several GB). Supports live system collection and mounted forensic images.
 
 
 ## Setup
@@ -29,7 +30,8 @@ Required directory structure:
       Run-TriageCollector.bat
       README.txt
       tools\                      <-- optional tools (each in own subfolder)
-        winpmem\                  <-- optional: winpmem.exe for memory capture
+        dumpit\                   <-- optional: DumpIt for memory capture
+                                      (download yourself; see its README.txt)
       reports\                    <-- collections save here
     win11-timeline-builder\       <-- companion repo
       timeline-builder.ps1
@@ -129,8 +131,8 @@ To prepare a USB drive as a portable forensic triage kit:
       triage-collector.ps1
       Run-TriageCollector.bat
       README.txt
-      tools\                      <-- optional: winpmem\ for memory capture
-        winpmem\                  <-- winpmem.exe goes here
+      tools\                      <-- optional: memory capture tool
+        dumpit\                   <-- DumpIt download extracted here
       reports\                    <-- collections save here
     win11-timeline-builder\
       timeline-builder.ps1
@@ -161,9 +163,9 @@ needed -- plug in, double-click, collect, analyze.
   file activity, and the largest files in the collection. Registry hives are
   always collected.
 
-  For memory capture: place winpmem.exe in tools\winpmem\ directory.
-  The script prompts on live system runs when a capture tool is detected.
-  See the "Optional Tools" section below for setup instructions.
+  For memory capture: extract Magnet DumpIt into tools\dumpit\ (see
+  tools\dumpit\README.txt). The script prompts on live system runs when a
+  capture tool is detected. See the "Optional Tools" section below.
 
 ### PowerShell (Admin)
 
@@ -203,13 +205,16 @@ folder automatically. Only the .zip remains:
     reports\
       TriageCollection_2026-04-08_08-04.zip    (~60 MB)
 
-If memory capture was included, the memory dump is saved separately (too large
-for zip -- Compress-Archive has a 2 GB file limit):
+If memory capture was included, the memory dump is saved next to the zip,
+not inside it (it is as large as the machine's RAM):
 
   win11-triage-collector\
     reports\
-      TriageCollection_2026-04-08_08-04.zip                (~60 MB artifacts)
-      TriageCollection_2026-04-08_08-04_memory_dump.raw    (~16-64 GB)
+      TriageCollection_2026-04-08_08-04.zip                (artifacts)
+      TriageCollection_2026-04-08_08-04_memory_dump.dmp    (= RAM size; DumpIt)
+
+DumpIt writes a Microsoft crash dump (.dmp); WinPmem and Magnet RAM Capture
+write a raw image (memory_dump.raw).
 
 Use -NoCompress to keep the uncompressed folder instead.
 
@@ -222,7 +227,7 @@ Inside the zip:
                                          times per file (see Output File Formats)
     systeminfo.txt                    -- system info snapshot
     Memory\                               -- only if memory capture was selected
-      memory_dump.raw                 -- full RAM dump (saved separately, not in zip)
+      memory_dump.dmp / .raw          -- full RAM dump (saved separately, not in zip)
       memory_acquisition_log.txt      -- capture tool output log
     FileSystem\
       $MFT                            -- Master File Table, raw copy
@@ -328,8 +333,9 @@ Inside the zip:
 
 ### Memory (opt-in, live system only)
 
-  memory_dump.raw    Full physical RAM capture via WinPmem, DumpIt, or Magnet
-                     RAM Capture (whichever is found in the tools\ directory).
+  memory_dump.dmp    Full physical RAM capture: a Microsoft crash dump from
+                     DumpIt (preferred), or memory_dump.raw from WinPmem or
+                     Magnet RAM Capture -- whichever is found in tools\.
                      Dump size equals installed RAM. Runs first to capture
                      pristine memory state before other collection.
                      Requires a capture tool in tools\ -- see Optional Tools.
@@ -752,12 +758,18 @@ the mounted image for a non-invasive collection.
 
 The script supports optional third-party tools for capabilities that require
 kernel-mode access (e.g., memory capture). These tools are NOT included in
-the repo -- you must download and place them manually.
+the repo -- their licenses don't allow redistribution, so you download and
+place them yourself. The repo ships each expected tool folder with a
+README.txt (download link and layout); git ignores everything else in tools\,
+so a downloaded tool is never committed.
 
   win11-triage-collector\
-    tools\                         <-- create this folder
-      winpmem\                     <-- subfolder per tool
-        winpmem.exe                <-- memory capture tool
+    tools\
+      dumpit\                      <-- in the repo: README.txt only
+        README.txt                 <-- where to get DumpIt and how it's used
+        ARM64\DumpIt.exe           <-- you add these (extract the download)
+        x64\DumpIt.exe
+        x86\DumpIt.exe
 
 Each tool gets its own subfolder, matching the timeline builder's layout.
 Tools placed here travel with the script on USB drives. If a tool is not
@@ -771,29 +783,42 @@ script auto-detects supported tools in the tools\ directory. On a live
 system, if a tool is found, the script prompts you to include memory
 capture before collection begins.
 
-  Recommended: WinPmem (open-source, signed driver, Windows 11 compatible)
+  Recommended: Magnet DumpIt (free, signed; native x86, x64 and ARM64)
+    1. Request it (registration form; the link arrives by email):
+       https://www.magnetforensics.com/resources/magnet-dumpit-for-windows/
+    2. Extract the download into win11-triage-collector\tools\dumpit\ as-is
+       (tools\dumpit\ARM64\DumpIt.exe, tools\dumpit\x64\DumpIt.exe, ...)
+    The script runs the build that matches the CPU, with
+    /TYPE DMP /NOCOMPRESS /QUIET, producing a Microsoft crash dump.
+    Details: tools\dumpit\README.txt
+
+  Alternative: WinPmem (open-source, signed driver; x86/x64 only)
     1. Download from: https://github.com/Velocidex/WinPmem/releases
     2. Download the latest winpmem_mini_x64.exe (or winpmem_x64.exe)
     3. Rename to winpmem.exe
     4. Place in: win11-triage-collector\tools\winpmem\winpmem.exe
 
-  Alternative: DumpIt (Magnet Forensics, free, signed driver)
-    1. Download from: https://www.magnetforensics.com/resources/magnet-dumpit-for-windows/
-    2. Place in: win11-triage-collector\tools\dumpit\dumpit.exe
-
-  Alternative: Magnet RAM Capture (Magnet Forensics, free)
+  Alternative: Magnet RAM Capture (Magnet Forensics, free; x86/x64 only)
     1. Download from: https://www.magnetforensics.com/resources/magnet-ram-capture/
     2. Place in: win11-triage-collector\tools\magnetram\MagnetRAMCapture.exe
 
   Tool priority: If multiple tools are present, the script uses the first
-  one found in this order: WinPmem > DumpIt > Magnet RAM Capture.
+  one found in this order: DumpIt > WinPmem > Magnet RAM Capture.
 
-  Output: Memory\memory_dump.raw in the collection output
+  Windows on ARM: a capture tool loads a kernel driver, and x64 drivers don't
+  load on ARM64 Windows. On ARM64 the script only uses ARM64 builds (DumpIt)
+  and skips the others with a note.
+
+  Output: Memory\memory_dump.dmp (DumpIt) or memory_dump.raw, saved next to
+          the zip as <collection>_memory_dump.dmp / .raw
   Storage: Dump size equals installed RAM (16 GB RAM = ~16 GB file).
            Ensure the output drive has enough free space.
   Timing: Adds 2-5 minutes depending on RAM size.
   Ordering: Runs FIRST to capture pristine RAM before other collection.
   Live only: Memory capture is skipped for mounted forensic images.
+  Analysis: win11-timeline-builder analyzes x64 dumps with Volatility 3.
+            Volatility 3 cannot analyze Windows ARM64 memory; open ARM64
+            dumps in WinDbg instead.
 
   If no tool is found in tools\, the script does not prompt and proceeds
   with standard artifact collection. No errors, no noise.
@@ -871,9 +896,10 @@ are downloaded, bundled, or required.
                        live RAM capture when placed in the tools\ directory.
                        https://github.com/Velocidex/WinPmem
 
-  Magnet Forensics     DumpIt and Magnet RAM Capture are free memory
-                       acquisition tools. Optionally supported as
-                       alternatives to WinPmem in the tools\ directory.
+  Magnet Forensics     DumpIt (the preferred capture tool, with native
+                       x86/x64/ARM64 builds) and Magnet RAM Capture are free
+                       memory acquisition tools, used when placed in the
+                       tools\ directory. Not redistributed with this repo.
                        https://www.magnetforensics.com/
 
   KAPE                 The artifact collection categories and Defender

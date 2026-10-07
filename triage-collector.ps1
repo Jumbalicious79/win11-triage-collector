@@ -169,29 +169,75 @@ if (-not (Test-Path "${script:TargetRoot}Windows\System32")) {
 # --- Optional tools directory ---
 $script:ToolsDir = Join-Path $PSScriptRoot "tools"
 
+# --- Memory capture tool (user-provided, in tools\) ---
+# Machine type of this OS (PE header values): 0x8664 x64, 0xAA64 ARM64, 0x14C x86
+function Get-NativeMachineType {
+    $arch = $env:PROCESSOR_ARCHITEW6432
+    if (-not $arch) { $arch = $env:PROCESSOR_ARCHITECTURE }
+    switch ($arch) {
+        "AMD64" { return 0x8664 }
+        "ARM64" { return 0xAA64 }
+        "x86"   { return 0x14C }
+        default { return 0 }
+    }
+}
+
+# Machine type from an executable's PE header, or 0 if it can't be read
+function Get-PeMachineType {
+    param([string]$Path)
+    try {
+        $bytes = New-Object byte[] 4096
+        $stream = [System.IO.File]::OpenRead($Path)
+        try { $read = $stream.Read($bytes, 0, $bytes.Length) } finally { $stream.Dispose() }
+        if ($read -lt 0x40) { return 0 }
+        $peOffset = [BitConverter]::ToInt32($bytes, 0x3C)
+        if ($peOffset -lt 0 -or $peOffset + 6 -gt $read) { return 0 }
+        return [int][BitConverter]::ToUInt16($bytes, $peOffset + 4)
+    }
+    catch {
+        Write-Verbose "Could not read PE header of ${Path}: $($_.Exception.Message)"
+        return 0
+    }
+}
+
+# First usable capture tool in tools\, preferring DumpIt (native x86, x64 and
+# ARM64 builds, extracted as tools\dumpit\<x86|x64|ARM64>\DumpIt.exe). A
+# capture tool loads a kernel driver, so on ARM64 Windows only ARM64 builds
+# can work (x64 drivers do not load there); other builds are skipped and
+# listed in $script:skippedMemTools.
+function Find-MemoryCaptureTool {
+    $native = Get-NativeMachineType
+    $archFolder = switch ($native) { 0x8664 { "x64" } 0xAA64 { "ARM64" } 0x14C { "x86" } default { "" } }
+    $candidates = @(
+        @{ Name = "DumpIt";    Paths = @("dumpit\$archFolder\DumpIt.exe", "dumpit\DumpIt.exe", "DumpIt.exe") },
+        @{ Name = "WinPmem";   Paths = @("winpmem\winpmem.exe", "winpmem.exe") },
+        @{ Name = "MagnetRAM"; Paths = @("magnetram\MagnetRAMCapture.exe", "MagnetRAMCapture.exe") }
+    )
+    $script:skippedMemTools = @()
+    foreach ($tool in $candidates) {
+        foreach ($relPath in $tool.Paths) {
+            $toolPath = Join-Path $script:ToolsDir $relPath
+            if (-not [System.IO.File]::Exists($toolPath)) { continue }
+            if ($native -eq 0xAA64 -and (Get-PeMachineType $toolPath) -ne 0xAA64) {
+                $script:skippedMemTools += "$($tool.Name) (tools\$relPath) is not an ARM64 build"
+                continue
+            }
+            return [PSCustomObject]@{ Name = $tool.Name; Path = $toolPath; RelPath = "tools\$relPath" }
+        }
+    }
+    return $null
+}
+
 # --- Interactive memory capture prompt ---
 # Only show if: live system, Memory not already in Categories, and a tool exists
 if ($script:IsLive -and ($Categories -notcontains "Memory")) {
-    $memToolFound = $false
-    $memToolInfo = ""
-    $supportedMemTools = @(
-        @{ Name = "WinPmem";    Paths = @("winpmem\winpmem.exe", "winpmem.exe") },
-        @{ Name = "DumpIt";     Paths = @("dumpit\dumpit.exe", "dumpit.exe") },
-        @{ Name = "MagnetRAM";  Paths = @("magnetram\MagnetRAMCapture.exe", "MagnetRAMCapture.exe") }
-    )
-    foreach ($tool in $supportedMemTools) {
-        foreach ($relPath in $tool.Paths) {
-            $toolPath = Join-Path $script:ToolsDir $relPath
-            if (Test-Path $toolPath) {
-                $memToolFound = $true
-                $memToolInfo = "$($tool.Name) (tools\$relPath)"
-                break
-            }
-        }
-        if ($memToolFound) { break }
+    $memCaptureTool = Find-MemoryCaptureTool
+    foreach ($skipped in $script:skippedMemTools) {
+        Write-Host "Memory capture: $skipped -- skipped (this is an ARM64 machine)." -ForegroundColor DarkGray
     }
 
-    if ($memToolFound) {
+    if ($memCaptureTool) {
+        $memToolInfo = "$($memCaptureTool.Name) ($($memCaptureTool.RelPath))"
         $ramGB = [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 0)
         Write-Host ""
         Write-Host "========================================" -ForegroundColor Cyan
@@ -920,29 +966,23 @@ if ($Categories -contains "Memory") {
         Log "Skipping Memory capture (mounted image -- not applicable)"
     } else {
         # Detect available memory capture tool in tools\ directory
-        $memTool = $null
-        $memToolName = ""
-        $supportedMemTools = @(
-            @{ Name = "WinPmem";    Paths = @("winpmem\winpmem.exe", "winpmem.exe") },
-            @{ Name = "DumpIt";     Paths = @("dumpit\dumpit.exe", "dumpit.exe") },
-            @{ Name = "MagnetRAM";  Paths = @("magnetram\MagnetRAMCapture.exe", "MagnetRAMCapture.exe") }
-        )
-        foreach ($tool in $supportedMemTools) {
-            foreach ($relPath in $tool.Paths) {
-                $toolPath = Join-Path $script:ToolsDir $relPath
-                if (Test-Path $toolPath) {
-                    $memTool = $toolPath
-                    $memToolName = $tool.Name
-                    break
-                }
-            }
-            if ($memTool) { break }
+        $memCaptureTool = Find-MemoryCaptureTool
+        foreach ($skipped in $script:skippedMemTools) {
+            Log "Memory capture: $skipped -- skipped (this is an ARM64 machine)."
         }
 
-        if ($memTool) {
+        if ($memCaptureTool) {
+            $memTool = $memCaptureTool.Path
+            $memToolName = $memCaptureTool.Name
             $memDir = Join-Path $OutputPath "Memory"
             Ensure-Directory $memDir
-            $dumpFile = Join-Path $memDir "memory_dump.raw"
+            # DumpIt writes a Microsoft crash dump (.dmp: WinDbg, Volatility);
+            # WinPmem and Magnet RAM Capture write a raw image
+            if ($memToolName -eq "DumpIt") {
+                $dumpFile = Join-Path $memDir "memory_dump.dmp"
+            } else {
+                $dumpFile = Join-Path $memDir "memory_dump.raw"
+            }
             $memLogFile = Join-Path $memDir "memory_acquisition_log.txt"
 
             $ramGB = [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 0)
@@ -956,7 +996,9 @@ if ($Categories -contains "Memory") {
                         $result = & $memTool acquire $dumpFile 2>&1
                     }
                     "DumpIt" {
-                        $result = & $memTool /output $dumpFile /quiet 2>&1
+                        # Uncompressed crash dump, no prompts (DumpIt may
+                        # otherwise compress automatically)
+                        $result = & $memTool /TYPE DMP /NOCOMPRESS /QUIET /OUTPUT $dumpFile 2>&1
                     }
                     "MagnetRAM" {
                         $result = & $memTool /accepteula /go /output $dumpFile 2>&1
@@ -982,18 +1024,17 @@ if ($Categories -contains "Memory") {
         } else {
             Log-Warning "Memory capture: no tool found in tools\ directory. Skipping."
             Log ""
-            Log "  To enable memory capture:"
-            Log "    1. Create a subfolder in tools\ for your chosen tool"
-            Log "    2. Download and place the .exe inside:"
+            Log "  To enable memory capture (see tools\dumpit\README.txt):"
             Log ""
-            Log "       WinPmem (recommended, open-source):"
+            Log "       DumpIt (Magnet Forensics, free; recommended -- x86, x64 and ARM64):"
+            Log "         https://www.magnetforensics.com/resources/magnet-dumpit-for-windows/"
+            Log "         Extract the download into tools\dumpit\ as-is"
+            Log "         (tools\dumpit\x64\DumpIt.exe, tools\dumpit\ARM64\DumpIt.exe, ...)"
+            Log ""
+            Log "       WinPmem (open-source; x64 only):"
             Log "         https://github.com/Velocidex/WinPmem/releases"
             Log "         Download winpmem_mini_x64.exe, rename to winpmem.exe"
             Log "         Place in: tools\winpmem\winpmem.exe"
-            Log ""
-            Log "       DumpIt (Magnet Forensics, free):"
-            Log "         https://www.magnetforensics.com/resources/magnet-dumpit-for-windows/"
-            Log "         Place in: tools\dumpit\dumpit.exe"
             Log ""
             Log "       Magnet RAM Capture (Magnet Forensics, free):"
             Log "         https://www.magnetforensics.com/resources/magnet-ram-capture/"
@@ -1886,7 +1927,15 @@ if ($Categories -contains "FileSystem") {
         try {
             $ujDest = Join-Path $fsDir '$UsnJrnl_$J.txt'
             fsutil usn readjournal ${TargetDrive}: csv 2>&1 | Out-File -LiteralPath $ujDest -Encoding utf8
-            if ((Get-FileLength $ujDest) -gt 0) {
+            # fsutil writes its error message (e.g. "Error:  Access is denied.")
+            # instead of a journal when it fails: a real export has a "Usn," header
+            $ujHead = @(Get-Content -LiteralPath $ujDest -TotalCount 20 -ErrorAction SilentlyContinue)
+            if ((Get-FileLength $ujDest) -gt 0 -and -not ($ujHead -match '^Usn,')) {
+                Log-Warning "fsutil could not export the USN journal: $((($ujHead | Where-Object { $_ }) -join ' ').Trim())"
+                Remove-Item -LiteralPath $ujDest -Force -ErrorAction SilentlyContinue
+                $script:errorCount++
+            }
+            elseif ((Get-FileLength $ujDest) -gt 0) {
                 Record-Manifest -SourcePath "(fsutil usn readjournal)" -DestPath $ujDest
                 Log-Success "Collected USN Journal via fsutil (CSV format)"
             } else {
@@ -3736,10 +3785,10 @@ $script:collectionCompleted = $true
 }
 
 # =============================================================
-# Collected copies keep the attributes of their source. Compress-Archive
-# in Windows PowerShell 5.1 silently leaves out hidden files (NTUSER.DAT,
-# UsrClass.dat, hive .LOG1/.LOG2, ...), so clear Hidden/System on
-# everything in the collection folder.
+# Collected copies keep the attributes of their source. Clear Hidden/System
+# on everything in the collection folder so nothing in the zip (NTUSER.DAT,
+# UsrClass.dat, hive .LOG1/.LOG2, ...) extracts as hidden, and older
+# zip tools that skip hidden files still include them.
 # =============================================================
 try {
     $hiddenMask = [int][System.IO.FileAttributes]::Hidden -bor [int][System.IO.FileAttributes]::System
@@ -3766,7 +3815,12 @@ try {
 $endTime = Get-Date
 $duration = $endTime - $script:startTime
 $zipPath = "$OutputPath.zip"
-$memDumpFile = Join-Path $OutputPath "Memory\memory_dump.raw"
+# Memory dump, if captured: memory_dump.dmp (DumpIt) or memory_dump.raw
+$memDumpFile = $null
+foreach ($dumpExt in @("dmp", "raw")) {
+    $dumpCandidate = Join-Path $OutputPath "Memory\memory_dump.$dumpExt"
+    if ((Get-FileLength $dumpCandidate) -ge 0) { $memDumpFile = $dumpCandidate; break }
+}
 $memDumpMovedTo = $null
 
 $summaryLines = @(
@@ -3786,8 +3840,8 @@ if ($NoCompress) {
     $summaryLines += "  Output:         $OutputPath"
 } else {
     $summaryLines += "  Output:         $zipPath"
-    if ((Get-FileLength $memDumpFile) -ge 0) {
-        $summaryLines += "  Memory dump:    ${OutputPath}_memory_dump.raw (kept outside the zip)"
+    if ($memDumpFile) {
+        $summaryLines += "  Memory dump:    ${OutputPath}_$(Split-Path $memDumpFile -Leaf) (kept outside the zip)"
     }
 }
 $summaryLines += "  Manifest:       collection_manifest.csv (inside collection)"
@@ -3806,12 +3860,13 @@ if (-not $NoCompress) {
     Log "  COMPRESSING OUTPUT"
     Log "============================================================="
 
-    # Check for memory dump -- too large for Compress-Archive (>2 GB limit)
-    if ((Get-FileLength $memDumpFile) -ge 0) {
+    # Memory dump: kept next to the zip, not inside it (as large as RAM, slow
+    # to compress, and analysis tools need the file itself)
+    if ($memDumpFile) {
         $dumpSizeGB = [math]::Round((Get-FileLength $memDumpFile) / 1GB, 2)
-        Log "Memory dump detected ($dumpSizeGB GB) -- excluding from zip (too large)."
+        Log "Memory dump detected ($dumpSizeGB GB) -- keeping it next to the zip."
         # Move dump out of the collection folder temporarily
-        $memDumpMovedTo = "${OutputPath}_memory_dump.raw"
+        $memDumpMovedTo = "${OutputPath}_$(Split-Path $memDumpFile -Leaf)"
         Move-Item -LiteralPath $memDumpFile -Destination $memDumpMovedTo -Force
         # Remove empty Memory folder if only the dump was in it
         $memDir = Join-Path $OutputPath "Memory"
@@ -3823,7 +3878,12 @@ if (-not $NoCompress) {
 
     Log "Compressing to: $zipPath"
     try {
-        Compress-Archive -LiteralPath $OutputPath -DestinationPath $zipPath -Force -ErrorAction Stop
+        # ZipFile instead of Compress-Archive: Compress-Archive in Windows
+        # PowerShell 5.1 fails on files over 2 GB (a large raw $MFT) and skips
+        # hidden files; ZipFile writes Zip64 and includes everything
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        if ([System.IO.File]::Exists($zipPath)) { [System.IO.File]::Delete($zipPath) }
+        [System.IO.Compression.ZipFile]::CreateFromDirectory($OutputPath, $zipPath, [System.IO.Compression.CompressionLevel]::Optimal, $true)
         $zipSize = [math]::Round((Get-FileLength $zipPath) / 1MB, 2)
         Log-Success "Compressed to $zipPath ($zipSize MB)"
 
@@ -3846,7 +3906,7 @@ if (-not $NoCompress) {
         if ($memDumpMovedTo -and (Test-Path -LiteralPath $memDumpMovedTo)) {
             $memDir = Join-Path $OutputPath "Memory"
             Ensure-Directory $memDir
-            Move-Item -LiteralPath $memDumpMovedTo -Destination (Join-Path $memDir "memory_dump.raw") -Force
+            Move-Item -LiteralPath $memDumpMovedTo -Destination $memDumpFile -Force
         }
     }
 }

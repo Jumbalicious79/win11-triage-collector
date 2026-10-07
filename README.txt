@@ -680,6 +680,21 @@ The fastest path from collection to analysis:
     window is closed or the machine loses power mid-run, cleanup may not get
     to run: check Windows Security exclusions and "vssadmin list shadows".
 
+  - Locked files (live system): when a normal copy fails because a program
+    has the file open, the script tries, in order:
+      1. the Volume Shadow Copy (point-in-time snapshot, made on first need)
+      2. a raw NTFS read: the file is looked up in the $MFT (a name index
+         built on first use, a few seconds) and its data is read straight
+         from the volume, which file locks don't prevent. Used for files the
+         shadow copy can't provide -- created after the snapshot was taken,
+         or no snapshot possible on that machine.
+    A raw read is not a point-in-time snapshot: a file being written during
+    the read can come out inconsistent. NTFS-compressed and EFS-encrypted
+    files cannot be read this way. Empty files are skipped (there is nothing
+    to collect; Chromium browsers keep 0-byte SQLite journals open).
+    Log: "Collected by raw NTFS read (file in use, not available from a
+    shadow copy)"
+
   - NTUSER.DAT and UsrClass.dat for the active user are locked. The script
     tries reg save via HKU\SID (works for logged-in users), then VSS shadow
     copy, then direct copy. On most systems reg save succeeds.
@@ -695,15 +710,13 @@ The fastest path from collection to analysis:
     jump lists, browser profiles, scheduled task XML, Defender and
     third-party AV logs) include hidden and system files. (Earlier versions
     skipped those in listings, and copied hidden files and then deleted
-    them as "empty".) The Amcache logs can still fail to collect if locked;
-    if the hive is dirty without logs, the timeline builder skips Amcache
-    parsing for that collection.
-    Warning: "Could not copy (locked): ...Amcache.hve.LOG1"
+    them as "empty".) Locked Amcache logs are taken from the shadow copy or
+    by raw NTFS read; if the hive is still dirty without its logs, the
+    timeline builder skips Amcache parsing for that collection.
 
-  - Some LNK shortcut files in the Recent folder may be locked by active
-    applications (e.g., Snipping Tool screenshots). The script collects all
-    unlocked files and warns about the locked ones. Most files are collected.
-    Warning: "Could not copy (locked): ...ms-screensketchedit...lnk"
+  - A file is reported as not collected only when the normal copy, the
+    shadow copy and the raw NTFS read all fail.
+    Warning: "Could not copy (locked; shadow copy and raw NTFS read also failed)"
 
   - Sysmon and Task Scheduler logs only collected if present on the system.
     These are not installed by default on Windows 11 Home.

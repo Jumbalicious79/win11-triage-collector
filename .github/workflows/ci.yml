@@ -41,6 +41,25 @@ jobs:
           if ($failed) { exit 1 }
           Write-Host "All scripts parse in PowerShell $($PSVersionTable.PSVersion)"
 
+  raw-copy-test:
+    # Locks test files and checks the collector still collects them by
+    # reading the volume directly (needs Administrator: Windows runners are
+    # elevated)
+    name: Raw copy test (${{ matrix.shell }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shell: [powershell, pwsh]
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run raw copy test
+        run: ./tests/Test-RawCopy.ps1
+
   analyze:
     name: PSScriptAnalyzer
     runs-on: windows-latest

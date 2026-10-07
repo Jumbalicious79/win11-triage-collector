@@ -837,6 +837,36 @@ capture before collection begins.
   with standard artifact collection. No errors, no noise.
 
 
+## Tests
+
+  tests\Test-RawCopy.ps1 (run as Administrator; also runs in CI)
+    Creates test files on the system drive, locks them so a normal copy
+    fails, and checks that the collector still collects them byte for byte
+    by reading the volume directly (the fallback after the shadow copy):
+    files in clusters and inside the MFT record, a non-ASCII name, a sparse
+    file, a file extended past its written data, and an NTFS-compressed
+    file, which the raw read must decline cleanly.
+
+  Planted-activity test (both tools, end to end, on a live machine)
+    1. In a normal (not elevated) PowerShell window, as the user to test:
+         powershell -ExecutionPolicy Bypass -File tests\Invoke-PlantedActivity.ps1
+       It does harmless, recognizable actions, all named TriageE2E_<id>: runs
+       a renamed copy of hostname.exe, backdates (timestomps) another copy,
+       adds a file to Recent items, creates and deletes a file, adds a Run
+       value and a disabled scheduled task, and opens an Edge page.
+       -Eicar also writes the EICAR antivirus test file (Defender detects
+       and quarantines it); -NoBrowser skips Edge.
+    2. Run-TriageCollector.bat, then Run-TimelineBuilder.bat on the new
+       collection (win11-timeline-builder next to this repository).
+    3. powershell -ExecutionPolicy Bypass -File tests\Test-PlantedActivity.ps1
+       Finds each action in the timeline by source and time. Required checks
+       fail the test; best-effort ones (BAM, Amcache, ShimCache, UserAssist,
+       jump list, deleted MFT record) depend on when Windows writes them and
+       are only reported. Restart before collecting to get ShimCache.
+    4. powershell -ExecutionPolicy Bypass -File tests\Invoke-PlantedActivity.ps1 -Cleanup
+       Removes the Run value, the task, the Recent shortcut and the files.
+
+
 ## Requirements
 
   - Windows 10 or Windows 11

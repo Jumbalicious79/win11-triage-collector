@@ -507,6 +507,13 @@ function Copy-ForensicFile {
                 Log "Collected from shadow copy (file in use): $SourcePath"
                 return
             }
+            # SQLite journal/WAL companions (History-journal, Cookies-journal,
+            # places.sqlite-wal, ...) only exist while the program is writing,
+            # so they are often missing from the shadow copy: not an error
+            if ($SourcePath -match '-(journal|wal|shm)$') {
+                Log "Skipped (in use, not in the shadow copy; temporary database journal): $SourcePath"
+                return
+            }
             Log-Warning "Could not copy (locked, shadow copy also failed): $SourcePath"
             $script:errorCount++
             return

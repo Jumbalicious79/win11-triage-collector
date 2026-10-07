@@ -4,8 +4,12 @@ reports/
 # Backups
 bak/
 
-# Optional tool binaries (user-provided, not committed)
-tools/
+# Optional tools (user-provided, never committed -- their licenses don't
+# allow redistribution). Only each tool folder's README.txt is tracked, so a
+# clone has the expected tools\<tool>\ layout with download instructions.
+tools/**
+!tools/**/
+!tools/*/README.txt
 
 # OS files
 .DS_Store

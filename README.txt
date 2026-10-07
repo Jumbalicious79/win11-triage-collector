@@ -10,9 +10,10 @@ Explorer. Both tools are available as separate repos for independent use.
 
   Companion project: https://github.com/Jumbalicious79/win11-timeline-builder
 
-Tested on Windows 11 Home Build 26200. Collects ~600 files in ~90 seconds,
-compresses to ~65 MB. Supports live system collection and mounted forensic
-images.
+Tested on Windows 11 Home Build 26200 (x64) and Windows 11 Pro 26100 (ARM64,
+Parallels on Apple silicon). A typical run collects ~450-500 files in about
+1-2 minutes; the zip size depends mostly on the raw $MFT (often 100 MB to
+several GB). Supports live system collection and mounted forensic images.
 
 
 ## Setup
@@ -29,7 +30,8 @@ Required directory structure:
       Run-TriageCollector.bat
       README.txt
       tools\                      <-- optional tools (each in own subfolder)
-        winpmem\                  <-- optional: winpmem.exe for memory capture
+        dumpit\                   <-- optional: DumpIt for memory capture
+                                      (download yourself; see its README.txt)
       reports\                    <-- collections save here
     win11-timeline-builder\       <-- companion repo
       timeline-builder.ps1
@@ -97,6 +99,9 @@ When collecting from a mounted image, the script auto-detects that the target
 is not the live system drive and switches to MOUNTED IMAGE mode:
 
   Collected (file-copy):
+    - Raw $MFT, $LogFile and $UsnJrnl:$J, read from the volume itself, when
+      the image is mounted as an NTFS volume whose root is the drive letter
+      (skipped for nested layouts such as E:\C\Windows)
     - Registry hives (from Windows\System32\config\)
     - Event logs (from Windows\System32\winevt\Logs\)
     - Prefetch files, browser data, user activity artifacts
@@ -126,8 +131,8 @@ To prepare a USB drive as a portable forensic triage kit:
       triage-collector.ps1
       Run-TriageCollector.bat
       README.txt
-      tools\                      <-- optional: winpmem\ for memory capture
-        winpmem\                  <-- winpmem.exe goes here
+      tools\                      <-- optional: memory capture tool
+        dumpit\                   <-- DumpIt download extracted here
       reports\                    <-- collections save here
     win11-timeline-builder\
       timeline-builder.ps1
@@ -146,17 +151,21 @@ needed -- plug in, double-click, collect, analyze.
 ### Double-click (recommended)
 
   Run-TriageCollector.bat              -- collect from C: (live system)
-  Run-TriageCollector.bat fast         -- skip the USN journal export
+  Run-TriageCollector.bat fast         -- skip the raw NTFS copies and the
+                                          USN journal export
   Run-TriageCollector.bat nozip        -- don't compress output
   Run-TriageCollector.bat E            -- collect from E: (mounted image)
-  Run-TriageCollector.bat E fast       -- collect from E:, skip the USN journal
+  Run-TriageCollector.bat E fast       -- collect from E:, skip the raw NTFS
+                                          copies and the USN journal export
 
-  Note: "fast" skips the USN journal, which is the timeline builder's largest
-  source of file activity. Registry hives are always collected.
+  Note: "fast" skips the raw NTFS copies ($MFT, $LogFile, $UsnJrnl:$J) and
+  the fsutil USN journal export -- the timeline builder's largest sources of
+  file activity, and the largest files in the collection. Registry hives are
+  always collected.
 
-  For memory capture: place winpmem.exe in tools\winpmem\ directory.
-  The script prompts on live system runs when a capture tool is detected.
-  See the "Optional Tools" section below for setup instructions.
+  For memory capture: extract Magnet DumpIt into tools\dumpit\ (see
+  tools\dumpit\README.txt). The script prompts on live system runs when a
+  capture tool is detected. See the "Optional Tools" section below.
 
 ### PowerShell (Admin)
 
@@ -196,13 +205,16 @@ folder automatically. Only the .zip remains:
     reports\
       TriageCollection_2026-04-08_08-04.zip    (~60 MB)
 
-If memory capture was included, the memory dump is saved separately (too large
-for zip -- Compress-Archive has a 2 GB file limit):
+If memory capture was included, the memory dump is saved next to the zip,
+not inside it (it is as large as the machine's RAM):
 
   win11-triage-collector\
     reports\
-      TriageCollection_2026-04-08_08-04.zip                (~60 MB artifacts)
-      TriageCollection_2026-04-08_08-04_memory_dump.raw    (~16-64 GB)
+      TriageCollection_2026-04-08_08-04.zip                (artifacts)
+      TriageCollection_2026-04-08_08-04_memory_dump.dmp    (= RAM size; DumpIt)
+
+DumpIt writes a Microsoft crash dump (.dmp); WinPmem and Magnet RAM Capture
+write a raw image (memory_dump.raw).
 
 Use -NoCompress to keep the uncompressed folder instead.
 
@@ -215,9 +227,13 @@ Inside the zip:
                                          times per file (see Output File Formats)
     systeminfo.txt                    -- system info snapshot
     Memory\                               -- only if memory capture was selected
-      memory_dump.raw                 -- full RAM dump (saved separately, not in zip)
+      memory_dump.dmp / .raw          -- full RAM dump (saved separately, not in zip)
       memory_acquisition_log.txt      -- capture tool output log
     FileSystem\
+      $MFT                            -- Master File Table, raw copy
+      $LogFile                        -- NTFS transaction log, raw copy
+      $UsnJrnl_$J                     -- USN Journal, raw copy of the
+                                         allocated part (binary records)
       $UsnJrnl_$J.txt                 -- USN Journal (fsutil CSV-style text)
     Registry\
       SYSTEM                          -- hardware, services, USB history, timezone
@@ -260,6 +276,7 @@ Inside the zip:
     Browser\
       buzz_\
         Chrome\                       -- History, Bookmarks, Login Data, etc.
+          <profile>\Network\Cookies   -- cookies (current Chromium location)
         Edge\                         -- same artifacts as Chrome
       (Firefox -- if installed)
     USB\
@@ -316,8 +333,9 @@ Inside the zip:
 
 ### Memory (opt-in, live system only)
 
-  memory_dump.raw    Full physical RAM capture via WinPmem, DumpIt, or Magnet
-                     RAM Capture (whichever is found in the tools\ directory).
+  memory_dump.dmp    Full physical RAM capture: a Microsoft crash dump from
+                     DumpIt (preferred), or memory_dump.raw from WinPmem or
+                     Magnet RAM Capture -- whichever is found in tools\.
                      Dump size equals installed RAM. Runs first to capture
                      pristine memory state before other collection.
                      Requires a capture tool in tools\ -- see Optional Tools.
@@ -325,14 +343,37 @@ Inside the zip:
 
 ### FileSystem
 
-  $UsnJrnl:$J   File change journal -- every create, modify, delete, rename.
-                Critical for timeline building. Collected via "fsutil usn
-                readjournal ... csv" into FileSystem\$UsnJrnl_$J.txt.
-  $MFT          Master File Table with all file records including deleted.
-                NTFS metafile -- needs a raw-disk reader (see Known
-                Limitations); normally not collected.
-  $LogFile      NTFS transaction log. Same limitation as $MFT.
-  -SkipLargeFiles ("fast") skips the USN journal export.
+  NTFS metafiles cannot be opened through the normal file APIs (not even in a
+  Volume Shadow Copy). The script reads them straight from the volume with a
+  built-in raw NTFS reader (C# compiled at run time via Add-Type, no
+  third-party tools): it finds $MFT from the boot sector, then each metafile's
+  file record and the clusters of its data, including data split across
+  several MFT records ($ATTRIBUTE_LIST). The copies are the on-disk bytes, for
+  the timeline builder's $MFT timeline and for external tools such as
+  MFTECmd (see Analyzing the Output).
+
+  $MFT          FileSystem\$MFT -- Master File Table: one record per file and
+                folder, including deleted ones whose records are not yet
+                reused (names, parent folders, $STANDARD_INFORMATION and
+                $FILE_NAME times, sizes). Typically 100 MB to a few GB.
+  $LogFile      FileSystem\$LogFile -- NTFS transaction log (recent metadata
+                changes). Usually 64 MB.
+  $UsnJrnl:$J   FileSystem\$UsnJrnl_$J -- USN change journal: every create,
+                modify, delete, rename. $J is a sparse stream: Windows frees
+                the oldest part as the journal grows, so its logical size can
+                be many GB while only the newest part (typically tens of MB)
+                is stored. The copy holds only that allocated part, in order;
+                the freed (all-zero) part is left out. MFTECmd and similar
+                tools parse this layout directly.
+                The same journal is also exported as text with "fsutil usn
+                readjournal ... csv" into FileSystem\$UsnJrnl_$J.txt, which
+                the timeline builder parses.
+
+  Raw copies need Administrator rights and an NTFS volume: the live system
+  drive, or a mounted image whose Windows folder is at the root of its drive
+  letter. Anything else (no access, damaged metadata, nested image layout)
+  is logged and the collection goes on; the fsutil export runs regardless.
+  -SkipLargeFiles ("fast") skips the raw copies and the fsutil export.
 
 ### Registry Hives
 
@@ -391,6 +432,10 @@ Inside the zip:
   History, Bookmarks, Login Data, Cookies, Downloads, Preferences.
   Supports Chrome, Edge, Brave, Opera, Opera GX, Vivaldi (all Chromium-based)
   and Firefox. Per-user, per-profile.
+  Cookies of the Chromium-based browsers: current versions keep them in
+  <profile>\Network\Cookies (collected to <profile>\Network\Cookies, with
+  Network\Cookies-journal if present); the profile-root Cookies file of
+  older versions is collected too when it exists.
 
 ### USB
 
@@ -473,7 +518,8 @@ time zone or locale.
   SHA256               Hash of the collected copy
   SourcePath           Original path; "HKLM\..." / "HKU\..." for reg save,
                        "(shadow)..." for shadow copies, "(command: ...)" for
-                       command output
+                       command output, "(raw NTFS \\.\C: $MFT)" etc. for the
+                       raw NTFS copies
   DestPath             Full path of the copy at collection time
   SizeBytes            Size of the copy
   CollectedAt          Collector's local time when the file was recorded
@@ -586,6 +632,7 @@ The fastest path from collection to analysis:
 ### With Eric Zimmerman's Tools (manual deep-dive)
 
   MFTECmd.exe -f "Collection\FileSystem\$MFT" --csv ".\parsed" --csvf mft.csv
+  MFTECmd.exe -f "Collection\FileSystem\$UsnJrnl_$J" -m "Collection\FileSystem\$MFT" --csv ".\parsed" --csvf usn.csv
   PECmd.exe -d "Collection\Execution\Prefetch" --csv ".\parsed" --csvf prefetch.csv
   EvtxECmd.exe -d "Collection\EventLogs" --csv ".\parsed" --csvf evtx.csv
   RECmd.exe --bn BatchExamples\RECmd_Batch_MC.reb -d "Collection\Registry" --csv ".\parsed"
@@ -609,11 +656,19 @@ The fastest path from collection to analysis:
 
 ## Known Limitations and Expected Warnings
 
-  - $MFT and $LogFile are NTFS metafiles. They cannot be read through normal
-    file copy APIs, not even from a Volume Shadow Copy, so this script does
-    not get them. Collecting them needs a raw-disk reader (e.g., FTK Imager)
-    or a full disk image. The USN Journal is collected via fsutil instead and
-    is the timeline builder's main source of file activity.
+  - $MFT, $LogFile and $UsnJrnl:$J are read raw from the volume. On a live
+    system they are copied while Windows keeps changing them, so they are a
+    near point-in-time snapshot, not an atomic one (the same holds for other
+    live raw-copy tools). The raw copies are skipped (logged, collection goes
+    on) when the volume cannot be opened (e.g., blocked by endpoint security),
+    when the target is not an NTFS volume, or for nested image layouts such
+    as E:\C\Windows -- mount the image so the volume itself has a drive
+    letter to get them.
+    Warning: "Raw $MFT, $LogFile and $UsnJrnl:$J not collected: cannot open \\.\C: (...)"
+
+  - Very large volumes (millions of files) can have a $MFT over 2 GB. If the
+    zip step fails on it, the uncompressed collection folder is kept (see the
+    log); run with -NoCompress and compress with another tool in that case.
 
   - Per-user live registry data (Run/RunOnce keys, RecentApps) covers every
     user whose hive is loaded, i.e. users logged in at collection time, not
@@ -636,7 +691,10 @@ The fastest path from collection to analysis:
 
   - Hidden files are collected, including the Amcache.hve transaction logs
     (.LOG1/.LOG2) and the hidden NTUSER.DAT / UsrClass.dat of users who are
-    not logged in. (Earlier versions copied hidden files and then deleted
+    not logged in. Folder listings of artifacts (Prefetch, Recent LNK files,
+    jump lists, browser profiles, scheduled task XML, Defender and
+    third-party AV logs) include hidden and system files. (Earlier versions
+    skipped those in listings, and copied hidden files and then deleted
     them as "empty".) The Amcache logs can still fail to collect if locked;
     if the hive is dirty without logs, the timeline builder skips Amcache
     parsing for that collection.
@@ -681,10 +739,11 @@ the mounted image for a non-invasive collection.
                    collection methods accordingly.
   -OutputPath      Where to save collected artifacts.
                    Default: reports\TriageCollection_<timestamp>
-  -SkipLargeFiles  Skip the USN journal export ($UsnJrnl:$J) for faster
-                   runs ("fast" in the .bat). The USN journal is the
-                   timeline builder's largest source. Registry hives are
-                   still collected.
+  -SkipLargeFiles  Skip the raw NTFS copies ($MFT, $LogFile, $UsnJrnl:$J)
+                   and the fsutil USN journal export for faster, smaller
+                   runs ("fast" in the .bat). These are the timeline
+                   builder's largest sources. Registry hives are still
+                   collected.
   -NoCompress      Keep uncompressed folder (don't zip and delete).
   -Categories      Specific categories to collect. Default: all (except Memory).
                    Valid: Memory, FileSystem, Registry, EventLogs, Execution,
@@ -699,12 +758,18 @@ the mounted image for a non-invasive collection.
 
 The script supports optional third-party tools for capabilities that require
 kernel-mode access (e.g., memory capture). These tools are NOT included in
-the repo -- you must download and place them manually.
+the repo -- their licenses don't allow redistribution, so you download and
+place them yourself. The repo ships each expected tool folder with a
+README.txt (download link and layout); git ignores everything else in tools\,
+so a downloaded tool is never committed.
 
   win11-triage-collector\
-    tools\                         <-- create this folder
-      winpmem\                     <-- subfolder per tool
-        winpmem.exe                <-- memory capture tool
+    tools\
+      dumpit\                      <-- in the repo: README.txt only
+        README.txt                 <-- where to get DumpIt and how it's used
+        ARM64\DumpIt.exe           <-- you add these (extract the download)
+        x64\DumpIt.exe
+        x86\DumpIt.exe
 
 Each tool gets its own subfolder, matching the timeline builder's layout.
 Tools placed here travel with the script on USB drives. If a tool is not
@@ -718,29 +783,42 @@ script auto-detects supported tools in the tools\ directory. On a live
 system, if a tool is found, the script prompts you to include memory
 capture before collection begins.
 
-  Recommended: WinPmem (open-source, signed driver, Windows 11 compatible)
+  Recommended: Magnet DumpIt (free, signed; native x86, x64 and ARM64)
+    1. Request it (registration form; the link arrives by email):
+       https://www.magnetforensics.com/resources/magnet-dumpit-for-windows/
+    2. Extract the download into win11-triage-collector\tools\dumpit\ as-is
+       (tools\dumpit\ARM64\DumpIt.exe, tools\dumpit\x64\DumpIt.exe, ...)
+    The script runs the build that matches the CPU, with
+    /TYPE DMP /NOCOMPRESS /QUIET, producing a Microsoft crash dump.
+    Details: tools\dumpit\README.txt
+
+  Alternative: WinPmem (open-source, signed driver; x86/x64 only)
     1. Download from: https://github.com/Velocidex/WinPmem/releases
     2. Download the latest winpmem_mini_x64.exe (or winpmem_x64.exe)
     3. Rename to winpmem.exe
     4. Place in: win11-triage-collector\tools\winpmem\winpmem.exe
 
-  Alternative: DumpIt (Magnet Forensics, free, signed driver)
-    1. Download from: https://www.magnetforensics.com/resources/magnet-dumpit-for-windows/
-    2. Place in: win11-triage-collector\tools\dumpit\dumpit.exe
-
-  Alternative: Magnet RAM Capture (Magnet Forensics, free)
+  Alternative: Magnet RAM Capture (Magnet Forensics, free; x86/x64 only)
     1. Download from: https://www.magnetforensics.com/resources/magnet-ram-capture/
     2. Place in: win11-triage-collector\tools\magnetram\MagnetRAMCapture.exe
 
   Tool priority: If multiple tools are present, the script uses the first
-  one found in this order: WinPmem > DumpIt > Magnet RAM Capture.
+  one found in this order: DumpIt > WinPmem > Magnet RAM Capture.
 
-  Output: Memory\memory_dump.raw in the collection output
+  Windows on ARM: a capture tool loads a kernel driver, and x64 drivers don't
+  load on ARM64 Windows. On ARM64 the script only uses ARM64 builds (DumpIt)
+  and skips the others with a note.
+
+  Output: Memory\memory_dump.dmp (DumpIt) or memory_dump.raw, saved next to
+          the zip as <collection>_memory_dump.dmp / .raw
   Storage: Dump size equals installed RAM (16 GB RAM = ~16 GB file).
            Ensure the output drive has enough free space.
   Timing: Adds 2-5 minutes depending on RAM size.
   Ordering: Runs FIRST to capture pristine RAM before other collection.
   Live only: Memory capture is skipped for mounted forensic images.
+  Analysis: win11-timeline-builder analyzes x64 dumps with Volatility 3.
+            Volatility 3 cannot analyze Windows ARM64 memory; open ARM64
+            dumps in WinDbg instead.
 
   If no tool is found in tools\, the script does not prompt and proceeds
   with standard artifact collection. No errors, no noise.
@@ -759,8 +837,8 @@ capture before collection begins.
 This script uses only tools that ship with Windows. No third-party binaries
 are downloaded, bundled, or required.
 
-  fsutil.exe           Collects USN Journal ($UsnJrnl:$J) in CSV format.
-                       Used as fallback when Volume Shadow Copy fails.
+  fsutil.exe           Exports the USN Journal ($UsnJrnl:$J) as CSV-style
+                       text ($UsnJrnl_$J.txt), next to the raw copy.
                        Ships with all Windows versions.
 
   reg.exe              Exports registry hives (SYSTEM, SOFTWARE, SAM,
@@ -772,7 +850,8 @@ are downloaded, bundled, or required.
                        Ships with all Windows versions.
 
   vssadmin.exe /       Creates and removes Volume Shadow Copy snapshots for
-  Win32_ShadowCopy     accessing locked files ($MFT, NTUSER.DAT, etc.).
+  Win32_ShadowCopy     accessing locked files (NTUSER.DAT, browser
+                       databases, etc.).
                        Uses WMI Win32_ShadowCopy class via PowerShell.
 
   robocopy.exe         Not used. Considered but requires Backup privileges
@@ -789,6 +868,11 @@ are downloaded, bundled, or required.
   RegQueryInfoKey      Windows API (advapi32.dll), called through a small
   (Add-Type)           Add-Type definition to read registry key last-write
                        times (services, drivers, Run keys).
+
+  Raw NTFS reader      Built into the script (C# compiled via Add-Type). Opens
+  (CreateFile,         the volume (\\.\C:) read-only with the kernel32.dll
+  Add-Type)            CreateFile API and reads $MFT, $LogFile and
+                       $UsnJrnl:$J from the NTFS structures directly.
 
 
 ## Credits and Acknowledgments
@@ -812,9 +896,10 @@ are downloaded, bundled, or required.
                        live RAM capture when placed in the tools\ directory.
                        https://github.com/Velocidex/WinPmem
 
-  Magnet Forensics     DumpIt and Magnet RAM Capture are free memory
-                       acquisition tools. Optionally supported as
-                       alternatives to WinPmem in the tools\ directory.
+  Magnet Forensics     DumpIt (the preferred capture tool, with native
+                       x86/x64/ARM64 builds) and Magnet RAM Capture are free
+                       memory acquisition tools, used when placed in the
+                       tools\ directory. Not redistributed with this repo.
                        https://www.magnetforensics.com/
 
   KAPE                 The artifact collection categories and Defender
@@ -835,7 +920,8 @@ This script is read-only by design, with these minimal exceptions:
   - Creates the output directory and files (in reports\ next to the script)
   - Creates and removes a Volume Shadow Copy snapshot (for locked file access)
   - Adds and removes a temporary Windows Defender exclusion (output path only)
-  - Compiles a small Add-Type helper (registry key times); Windows PowerShell
-    writes and deletes temporary compiler files in %TEMP% for this
+  - Compiles small Add-Type helpers (registry key times, raw NTFS reader);
+    Windows PowerShell writes and deletes temporary compiler files in %TEMP%
+    for this
   - All modifications are cleaned up at script end, also when the run is
     stopped with Ctrl+C or ends with an error

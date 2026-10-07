@@ -169,29 +169,75 @@ if (-not (Test-Path "${script:TargetRoot}Windows\System32")) {
 # --- Optional tools directory ---
 $script:ToolsDir = Join-Path $PSScriptRoot "tools"
 
+# --- Memory capture tool (user-provided, in tools\) ---
+# Machine type of this OS (PE header values): 0x8664 x64, 0xAA64 ARM64, 0x14C x86
+function Get-NativeMachineType {
+    $arch = $env:PROCESSOR_ARCHITEW6432
+    if (-not $arch) { $arch = $env:PROCESSOR_ARCHITECTURE }
+    switch ($arch) {
+        "AMD64" { return 0x8664 }
+        "ARM64" { return 0xAA64 }
+        "x86"   { return 0x14C }
+        default { return 0 }
+    }
+}
+
+# Machine type from an executable's PE header, or 0 if it can't be read
+function Get-PeMachineType {
+    param([string]$Path)
+    try {
+        $bytes = New-Object byte[] 4096
+        $stream = [System.IO.File]::OpenRead($Path)
+        try { $read = $stream.Read($bytes, 0, $bytes.Length) } finally { $stream.Dispose() }
+        if ($read -lt 0x40) { return 0 }
+        $peOffset = [BitConverter]::ToInt32($bytes, 0x3C)
+        if ($peOffset -lt 0 -or $peOffset + 6 -gt $read) { return 0 }
+        return [int][BitConverter]::ToUInt16($bytes, $peOffset + 4)
+    }
+    catch {
+        Write-Verbose "Could not read PE header of ${Path}: $($_.Exception.Message)"
+        return 0
+    }
+}
+
+# First usable capture tool in tools\, preferring DumpIt (native x86, x64 and
+# ARM64 builds, extracted as tools\dumpit\<x86|x64|ARM64>\DumpIt.exe). A
+# capture tool loads a kernel driver, so on ARM64 Windows only ARM64 builds
+# can work (x64 drivers do not load there); other builds are skipped and
+# listed in $script:skippedMemTools.
+function Find-MemoryCaptureTool {
+    $native = Get-NativeMachineType
+    $archFolder = switch ($native) { 0x8664 { "x64" } 0xAA64 { "ARM64" } 0x14C { "x86" } default { "" } }
+    $candidates = @(
+        @{ Name = "DumpIt";    Paths = @("dumpit\$archFolder\DumpIt.exe", "dumpit\DumpIt.exe", "DumpIt.exe") },
+        @{ Name = "WinPmem";   Paths = @("winpmem\winpmem.exe", "winpmem.exe") },
+        @{ Name = "MagnetRAM"; Paths = @("magnetram\MagnetRAMCapture.exe", "MagnetRAMCapture.exe") }
+    )
+    $script:skippedMemTools = @()
+    foreach ($tool in $candidates) {
+        foreach ($relPath in $tool.Paths) {
+            $toolPath = Join-Path $script:ToolsDir $relPath
+            if (-not [System.IO.File]::Exists($toolPath)) { continue }
+            if ($native -eq 0xAA64 -and (Get-PeMachineType $toolPath) -ne 0xAA64) {
+                $script:skippedMemTools += "$($tool.Name) (tools\$relPath) is not an ARM64 build"
+                continue
+            }
+            return [PSCustomObject]@{ Name = $tool.Name; Path = $toolPath; RelPath = "tools\$relPath" }
+        }
+    }
+    return $null
+}
+
 # --- Interactive memory capture prompt ---
 # Only show if: live system, Memory not already in Categories, and a tool exists
 if ($script:IsLive -and ($Categories -notcontains "Memory")) {
-    $memToolFound = $false
-    $memToolInfo = ""
-    $supportedMemTools = @(
-        @{ Name = "WinPmem";    Paths = @("winpmem\winpmem.exe", "winpmem.exe") },
-        @{ Name = "DumpIt";     Paths = @("dumpit\dumpit.exe", "dumpit.exe") },
-        @{ Name = "MagnetRAM";  Paths = @("magnetram\MagnetRAMCapture.exe", "MagnetRAMCapture.exe") }
-    )
-    foreach ($tool in $supportedMemTools) {
-        foreach ($relPath in $tool.Paths) {
-            $toolPath = Join-Path $script:ToolsDir $relPath
-            if (Test-Path $toolPath) {
-                $memToolFound = $true
-                $memToolInfo = "$($tool.Name) (tools\$relPath)"
-                break
-            }
-        }
-        if ($memToolFound) { break }
+    $memCaptureTool = Find-MemoryCaptureTool
+    foreach ($skipped in $script:skippedMemTools) {
+        Write-Host "Memory capture: $skipped -- skipped (this is an ARM64 machine)." -ForegroundColor DarkGray
     }
 
-    if ($memToolFound) {
+    if ($memCaptureTool) {
+        $memToolInfo = "$($memCaptureTool.Name) ($($memCaptureTool.RelPath))"
         $ramGB = [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 0)
         Write-Host ""
         Write-Host "========================================" -ForegroundColor Cyan
@@ -397,6 +443,15 @@ function Copy-ForensicFile {
         return
     }
 
+    # Empty files hold nothing to collect (and empty copies are discarded
+    # anyway). Skipping them up front also avoids lock and shadow-copy
+    # fallbacks for files programs keep open while empty, such as the 0-byte
+    # SQLite journals Chromium browsers leave next to every database.
+    if ((Get-FileLength $SourcePath) -eq 0) {
+        Write-Verbose "Skipped empty file: $SourcePath"
+        return
+    }
+
     try {
         Ensure-Directory $DestDir
 
@@ -459,6 +514,13 @@ function Copy-ForensicFile {
         if ($relPath) {
             if (Copy-FromShadow -RelativePath $relPath -DestDir $DestDir -DestName $DestName -Quiet) {
                 Log "Collected from shadow copy (file in use): $SourcePath"
+                return
+            }
+            # SQLite journal/WAL companions (History-journal, Cookies-journal,
+            # places.sqlite-wal, ...) can be created after the shadow copy was
+            # taken: not an error
+            if ($SourcePath -match '-(journal|wal|shm)$') {
+                Log "Skipped (in use, not in the shadow copy; temporary database journal): $SourcePath"
                 return
             }
             Log-Warning "Could not copy (locked, shadow copy also failed): $SourcePath"
@@ -920,29 +982,23 @@ if ($Categories -contains "Memory") {
         Log "Skipping Memory capture (mounted image -- not applicable)"
     } else {
         # Detect available memory capture tool in tools\ directory
-        $memTool = $null
-        $memToolName = ""
-        $supportedMemTools = @(
-            @{ Name = "WinPmem";    Paths = @("winpmem\winpmem.exe", "winpmem.exe") },
-            @{ Name = "DumpIt";     Paths = @("dumpit\dumpit.exe", "dumpit.exe") },
-            @{ Name = "MagnetRAM";  Paths = @("magnetram\MagnetRAMCapture.exe", "MagnetRAMCapture.exe") }
-        )
-        foreach ($tool in $supportedMemTools) {
-            foreach ($relPath in $tool.Paths) {
-                $toolPath = Join-Path $script:ToolsDir $relPath
-                if (Test-Path $toolPath) {
-                    $memTool = $toolPath
-                    $memToolName = $tool.Name
-                    break
-                }
-            }
-            if ($memTool) { break }
+        $memCaptureTool = Find-MemoryCaptureTool
+        foreach ($skipped in $script:skippedMemTools) {
+            Log "Memory capture: $skipped -- skipped (this is an ARM64 machine)."
         }
 
-        if ($memTool) {
+        if ($memCaptureTool) {
+            $memTool = $memCaptureTool.Path
+            $memToolName = $memCaptureTool.Name
             $memDir = Join-Path $OutputPath "Memory"
             Ensure-Directory $memDir
-            $dumpFile = Join-Path $memDir "memory_dump.raw"
+            # DumpIt writes a Microsoft crash dump (.dmp: WinDbg, Volatility);
+            # WinPmem and Magnet RAM Capture write a raw image
+            if ($memToolName -eq "DumpIt") {
+                $dumpFile = Join-Path $memDir "memory_dump.dmp"
+            } else {
+                $dumpFile = Join-Path $memDir "memory_dump.raw"
+            }
             $memLogFile = Join-Path $memDir "memory_acquisition_log.txt"
 
             $ramGB = [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 0)
@@ -956,7 +1012,9 @@ if ($Categories -contains "Memory") {
                         $result = & $memTool acquire $dumpFile 2>&1
                     }
                     "DumpIt" {
-                        $result = & $memTool /output $dumpFile /quiet 2>&1
+                        # Uncompressed crash dump, no prompts (DumpIt may
+                        # otherwise compress automatically)
+                        $result = & $memTool /TYPE DMP /NOCOMPRESS /QUIET /OUTPUT $dumpFile 2>&1
                     }
                     "MagnetRAM" {
                         $result = & $memTool /accepteula /go /output $dumpFile 2>&1
@@ -982,18 +1040,17 @@ if ($Categories -contains "Memory") {
         } else {
             Log-Warning "Memory capture: no tool found in tools\ directory. Skipping."
             Log ""
-            Log "  To enable memory capture:"
-            Log "    1. Create a subfolder in tools\ for your chosen tool"
-            Log "    2. Download and place the .exe inside:"
+            Log "  To enable memory capture (see tools\dumpit\README.txt):"
             Log ""
-            Log "       WinPmem (recommended, open-source):"
+            Log "       DumpIt (Magnet Forensics, free; recommended -- x86, x64 and ARM64):"
+            Log "         https://www.magnetforensics.com/resources/magnet-dumpit-for-windows/"
+            Log "         Extract the download into tools\dumpit\ as-is"
+            Log "         (tools\dumpit\x64\DumpIt.exe, tools\dumpit\ARM64\DumpIt.exe, ...)"
+            Log ""
+            Log "       WinPmem (open-source; x64 only):"
             Log "         https://github.com/Velocidex/WinPmem/releases"
             Log "         Download winpmem_mini_x64.exe, rename to winpmem.exe"
             Log "         Place in: tools\winpmem\winpmem.exe"
-            Log ""
-            Log "       DumpIt (Magnet Forensics, free):"
-            Log "         https://www.magnetforensics.com/resources/magnet-dumpit-for-windows/"
-            Log "         Place in: tools\dumpit\dumpit.exe"
             Log ""
             Log "       Magnet RAM Capture (Magnet Forensics, free):"
             Log "         https://www.magnetforensics.com/resources/magnet-ram-capture/"
@@ -1003,6 +1060,860 @@ if ($Categories -contains "Memory") {
     }
 
     Log ""
+}
+
+# ----------------------------------------------------------
+# Helpers for the FileSystem section: built-in raw NTFS reader
+# for $MFT, $LogFile and $UsnJrnl:$J
+# ----------------------------------------------------------
+
+# NTFS metafiles cannot be opened through the file API (not even inside a
+# shadow copy), so they are read from the volume device itself: boot sector
+# -> $MFT runlist -> file record of the metafile -> runs of its $DATA stream
+# (following $ATTRIBUTE_LIST when the attribute is split across extension
+# records). Device reads are sector-aligned; data is copied in 4 MB chunks.
+# The NTFS logic works on any Stream, so it can be tested on an image file.
+# C# 5 only: Windows PowerShell 5.1 compiles Add-Type code with the old
+# compiler (no string interpolation, expression-bodied members, out var,
+# tuples or nameof). Compiled on first use only.
+$script:triageNtfsSource = @'
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Text;
+using Microsoft.Win32.SafeHandles;
+
+namespace TriageNtfs
+{
+    // One run of a non-resident attribute: Length clusters from virtual
+    // cluster Vcn on, stored from logical cluster Lcn on. Lcn -1 = sparse
+    // run (reads as zeros, nothing stored on disk).
+    public class DataRun
+    {
+        public long Vcn;
+        public long Lcn;
+        public long Length;
+    }
+
+    // One attribute record inside an MFT record
+    public class NtfsAttribute
+    {
+        public uint Type;
+        public string Name = "";
+        public ushort Id;
+        public ushort Flags;
+        public bool NonResident;
+        public long StartVcn;
+        public long LastVcn;
+        public long DataSize;
+        public long InitializedSize;
+        public byte[] ResidentData;
+        public List<DataRun> Runs = new List<DataRun>();
+    }
+
+    // An MFT (FILE) record after the update sequence fixups
+    public class MftRecord
+    {
+        public long Number;
+        public ushort Flags;
+        public long BaseRecord;
+        public List<NtfsAttribute> Attributes = new List<NtfsAttribute>();
+    }
+
+    // A whole stream: the runs of all its extents in VCN order, sizes from
+    // the first extent (later extents of a split attribute carry no sizes)
+    public class NtfsStream
+    {
+        public string Name = "";
+        public ushort Flags;
+        public bool NonResident;
+        public byte[] ResidentData;
+        public long DataSize;
+        public long InitializedSize;
+        public List<DataRun> Runs = new List<DataRun>();
+    }
+
+    internal static class NativeMethods
+    {
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        internal static extern SafeFileHandle CreateFile(string fileName, uint desiredAccess, uint shareMode,
+            IntPtr securityAttributes, uint creationDisposition, uint flagsAndAttributes, IntPtr templateFile);
+    }
+
+    // Reads NTFS metadata from a seekable Stream holding a whole volume
+    public sealed class NtfsReader : IDisposable
+    {
+        public const uint AttributeListType = 0x20;
+        public const uint FileNameType = 0x30;
+        public const uint DataType = 0x80;
+        private const uint EndMarker = 0xFFFFFFFF;
+        private const long RecordMask = 0x0000FFFFFFFFFFFFL;   // file reference -> record number
+        private const ushort FlagCompressed = 0x0001;
+        private const ushort FlagEncrypted = 0x4000;
+
+        private Stream volume;
+        private readonly bool ownsVolume;
+        private int bytesPerSector;
+        private int bytesPerCluster;
+        private int recordSize;
+        private long mftStartLcn;
+        private NtfsStream mft;
+        private int chunkSize = 4 * 1024 * 1024;
+
+        public NtfsReader(Stream volume) : this(volume, false)
+        {
+        }
+
+        public NtfsReader(Stream volume, bool ownsVolume)
+        {
+            if (volume == null) throw new ArgumentNullException("volume");
+            this.volume = volume;
+            this.ownsVolume = ownsVolume;
+            ReadBootSector();
+            LoadMft();
+        }
+
+        public int BytesPerSector { get { return bytesPerSector; } }
+        public int BytesPerCluster { get { return bytesPerCluster; } }
+        public int RecordSize { get { return recordSize; } }
+        public long MftStartLcn { get { return mftStartLcn; } }
+        public long MftSize { get { return mft.DataSize; } }
+        public long RecordCount { get { return mft.DataSize / recordSize; } }
+
+        // Bytes per read when copying or scanning (rounded down to whole
+        // clusters / records, at least one)
+        public int ChunkSize
+        {
+            get { return chunkSize; }
+            set
+            {
+                if (value < 1) throw new ArgumentOutOfRangeException("value");
+                chunkSize = value;
+            }
+        }
+
+        // Opens a volume device such as \\.\C: read-only. Read/write/delete
+        // sharing keeps the mounted file system usable meanwhile.
+        public static NtfsReader OpenVolume(string devicePath)
+        {
+            // GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, OPEN_EXISTING
+            SafeFileHandle handle = NativeMethods.CreateFile(devicePath, 0x80000000, 0x7, IntPtr.Zero, 3, 0, IntPtr.Zero);
+            if (handle.IsInvalid)
+            {
+                int error = Marshal.GetLastWin32Error();
+                handle.Dispose();
+                throw new IOException("cannot open " + devicePath + " (" + new Win32Exception(error).Message.TrimEnd('.') + ", Win32 error " + error + ")");
+            }
+            FileStream stream = null;
+            try
+            {
+                // Buffer size 1 = unbuffered: each read goes to the device with
+                // the (sector-aligned) offset and length it was given
+                stream = new FileStream(handle, FileAccess.Read, 1);
+                return new NtfsReader(stream, true);
+            }
+            catch
+            {
+                if (stream != null) stream.Dispose(); else handle.Dispose();
+                throw;
+            }
+        }
+
+        public void Dispose()
+        {
+            if (volume != null && ownsVolume) volume.Dispose();
+            volume = null;
+        }
+
+        private static bool IsPowerOfTwo(long value)
+        {
+            return value > 0 && (value & (value - 1)) == 0;
+        }
+
+        private void ReadBootSector()
+        {
+            // 4096 bytes = whole sectors on 512-byte and 4K-sector volumes
+            byte[] boot = new byte[4096];
+            ReadExact(0, boot, 0, boot.Length);
+            if (Encoding.ASCII.GetString(boot, 3, 8) != "NTFS    ")
+                throw new InvalidDataException("not an NTFS volume (no NTFS signature in the boot sector)");
+            bytesPerSector = BitConverter.ToUInt16(boot, 0x0B);
+            if (bytesPerSector < 256 || bytesPerSector > 4096 || !IsPowerOfTwo(bytesPerSector))
+                throw new InvalidDataException("invalid bytes per sector in the boot sector: " + bytesPerSector);
+            // Sectors per cluster: above 0x80 the value means 2^(256 - value)
+            int spc = boot[0x0D];
+            long sectorsPerCluster = spc;
+            if (spc > 0x80)
+            {
+                if (256 - spc > 20) throw new InvalidDataException("invalid sectors per cluster in the boot sector: 0x" + spc.ToString("X2"));
+                sectorsPerCluster = 1L << (256 - spc);
+            }
+            long clusterSize = sectorsPerCluster * bytesPerSector;
+            if (!IsPowerOfTwo(clusterSize) || clusterSize > 2 * 1024 * 1024)
+                throw new InvalidDataException("invalid cluster size in the boot sector: " + clusterSize);
+            bytesPerCluster = (int)clusterSize;
+            mftStartLcn = BitConverter.ToInt64(boot, 0x30);
+            // Clusters per MFT record: a negative value n means 2^-n bytes
+            int clustersPerRecord = unchecked((sbyte)boot[0x40]);
+            long size = 0;
+            if (clustersPerRecord > 0) size = (long)clustersPerRecord * bytesPerCluster;
+            else if (clustersPerRecord > -32) size = 1L << (-clustersPerRecord);
+            if (size < 256 || size > 65536 || !IsPowerOfTwo(size))
+                throw new InvalidDataException("invalid MFT record size in the boot sector: " + size);
+            recordSize = (int)size;
+            if (mftStartLcn <= 0)
+                throw new InvalidDataException("invalid $MFT cluster in the boot sector: " + mftStartLcn);
+        }
+
+        // Record 0 ($MFT itself) sits at the cluster named in the boot sector.
+        // Its own $DATA extent (VCN 0) maps the start of $MFT; extension
+        // records holding further extents are read through what is mapped so far.
+        private void LoadMft()
+        {
+            byte[] buffer = new byte[recordSize];
+            ReadVolume(mftStartLcn * bytesPerCluster, buffer, 0, recordSize);
+            if (!ApplyFixups(buffer, 0, recordSize))
+                throw new InvalidDataException("MFT record 0 (cluster " + mftStartLcn + ") has no valid FILE header or update sequence");
+            MftRecord record0 = ParseRecord(buffer, 0, 0);
+            NtfsAttribute first = null;
+            foreach (NtfsAttribute a in record0.Attributes)
+            {
+                if (a.Type == DataType && a.Name.Length == 0 && a.NonResident && a.StartVcn == 0) { first = a; break; }
+            }
+            if (first == null) throw new InvalidDataException("MFT record 0 has no non-resident $DATA attribute");
+            List<NtfsAttribute> extents = new List<NtfsAttribute>();
+            extents.Add(first);
+            mft = BuildStream(extents, "");
+            mft = GetStream(record0, DataType, "", true);
+        }
+
+        // The whole $DATA stream (unnamed: "") of an MFT record, or null if
+        // the record has no such stream
+        public NtfsStream GetDataStream(long recordNumber, string streamName)
+        {
+            if (streamName == null) streamName = "";
+            return GetStream(ReadRecord(recordNumber), DataType, streamName, false);
+        }
+
+        // Fixed-up and parsed MFT record (must be in use)
+        public MftRecord ReadRecord(long number)
+        {
+            if (number < 0 || number >= RecordCount)
+                throw new InvalidDataException("MFT record " + number + " is outside $MFT (" + RecordCount + " records)");
+            byte[] buffer = new byte[recordSize];
+            ReadStreamBytes(mft, number * recordSize, buffer, 0, recordSize);
+            if (!ApplyFixups(buffer, 0, recordSize))
+                throw new InvalidDataException("MFT record " + number + " has no valid FILE header or update sequence");
+            MftRecord record = ParseRecord(buffer, 0, number);
+            if ((record.Flags & 1) == 0) throw new InvalidDataException("MFT record " + number + " is not in use");
+            return record;
+        }
+
+        // Number of the first in-use base record that has a $FILE_NAME called
+        // name (case-insensitive) in directory parentRecord, or -1. Scans
+        // $MFT from the start in chunks; unused or damaged records are skipped.
+        public long FindRecordByName(long parentRecord, string name)
+        {
+            long total = RecordCount;
+            int perChunk = Math.Max(1, chunkSize / recordSize);
+            byte[] chunk = new byte[perChunk * recordSize];
+            for (long first = 0; first < total; first += perChunk)
+            {
+                int count = (int)Math.Min(perChunk, total - first);
+                ReadStreamBytes(mft, first * recordSize, chunk, 0, count * recordSize);
+                for (int i = 0; i < count; i++)
+                {
+                    int off = i * recordSize;
+                    // In use (flag 1) and a base record (base reference 0; an
+                    // extension record of $MFT refers to record 0 with a
+                    // sequence number, so the whole reference is checked)
+                    if ((BitConverter.ToUInt16(chunk, off + 0x16) & 1) == 0) continue;
+                    if (BitConverter.ToInt64(chunk, off + 0x20) != 0) continue;
+                    if (!ApplyFixups(chunk, off, recordSize)) continue;
+                    MftRecord record;
+                    try
+                    {
+                        record = ParseRecord(chunk, off, first + i);
+                    }
+                    catch (InvalidDataException)
+                    {
+                        continue;
+                    }
+                    foreach (NtfsAttribute a in record.Attributes)
+                    {
+                        // $FILE_NAME: parent reference at 0, name length at 0x40, name at 0x42
+                        if (a.Type != FileNameType || a.NonResident || a.ResidentData.Length < 0x42) continue;
+                        byte[] value = a.ResidentData;
+                        int nameLength = value[0x40];
+                        if (0x42 + nameLength * 2 > value.Length) continue;
+                        if ((BitConverter.ToInt64(value, 0) & RecordMask) != parentRecord) continue;
+                        if (string.Equals(Encoding.Unicode.GetString(value, 0x42, nameLength * 2), name, StringComparison.OrdinalIgnoreCase))
+                            return first + i;
+                    }
+                }
+            }
+            return -1;
+        }
+
+        public long CopyStreamToFile(NtfsStream stream, string path, bool allocatedOnly)
+        {
+            using (FileStream output = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.Read))
+            {
+                return CopyStream(stream, output, allocatedOnly);
+            }
+        }
+
+        // Writes a stream to output in chunks of whole clusters. allocatedOnly:
+        // only the runs stored on disk, in VCN order (sparse runs left out);
+        // otherwise sparse runs are written as zeros. Output ends at the real
+        // size (DataSize); bytes past the initialized size are written as
+        // zeros. Returns the number of bytes written.
+        public long CopyStream(NtfsStream stream, Stream output, bool allocatedOnly)
+        {
+            if (stream == null) throw new ArgumentNullException("stream");
+            if (!stream.NonResident)
+            {
+                output.Write(stream.ResidentData, 0, stream.ResidentData.Length);
+                return stream.ResidentData.Length;
+            }
+            if ((stream.Flags & FlagCompressed) != 0) throw new NotSupportedException("stream '" + stream.Name + "' is compressed");
+            if ((stream.Flags & FlagEncrypted) != 0) throw new NotSupportedException("stream '" + stream.Name + "' is encrypted");
+            int chunkClusters = Math.Max(1, chunkSize / bytesPerCluster);
+            byte[] buffer = new byte[chunkClusters * bytesPerCluster];
+            long written = 0;
+            long mapped = 0;
+            foreach (DataRun run in stream.Runs)
+            {
+                long runStart = run.Vcn * bytesPerCluster;
+                if (runStart >= stream.DataSize) break;
+                long runEnd = Math.Min((run.Vcn + run.Length) * bytesPerCluster, stream.DataSize);
+                mapped = runEnd;
+                if (run.Lcn < 0 && allocatedOnly) continue;
+                for (long position = runStart; position < runEnd; )
+                {
+                    int length = (int)Math.Min(buffer.Length, runEnd - position);
+                    if (run.Lcn < 0)
+                    {
+                        Array.Clear(buffer, 0, length);
+                    }
+                    else
+                    {
+                        // Whole clusters, so the device read stays aligned
+                        int readLength = (length + bytesPerCluster - 1) / bytesPerCluster * bytesPerCluster;
+                        long lcn = run.Lcn + (position - runStart) / bytesPerCluster;
+                        ReadVolume(lcn * bytesPerCluster, buffer, 0, readLength);
+                    }
+                    if (position + length > stream.InitializedSize)
+                    {
+                        int keep = (int)Math.Max(0, stream.InitializedSize - position);
+                        Array.Clear(buffer, keep, length - keep);
+                    }
+                    output.Write(buffer, 0, length);
+                    written += length;
+                    position += length;
+                }
+            }
+            if (mapped < stream.DataSize)
+                throw new InvalidDataException("the runlist of stream '" + stream.Name + "' maps only " + mapped + " of " + stream.DataSize + " bytes");
+            return written;
+        }
+
+        // All extents of the attribute (type, name) of a file. Without an
+        // $ATTRIBUTE_LIST they are all in the base record; with one, each
+        // entry names the record (base or extension) holding an extent.
+        // updateMft: the stream is $MFT itself; re-map $MFT after each extent
+        // so that later extension records can be read.
+        private NtfsStream GetStream(MftRecord baseRecord, uint type, string name, bool updateMft)
+        {
+            List<NtfsAttribute> extents = new List<NtfsAttribute>();
+            NtfsAttribute list = null;
+            foreach (NtfsAttribute a in baseRecord.Attributes)
+            {
+                if (a.Type == AttributeListType) { list = a; break; }
+            }
+            if (list == null)
+            {
+                foreach (NtfsAttribute a in baseRecord.Attributes)
+                {
+                    if (a.Type == type && a.Name == name) extents.Add(a);
+                }
+                if (extents.Count == 0) return null;
+                return BuildStream(extents, name);
+            }
+
+            // Entry: type (0), length (4), name length (6), name offset (7),
+            // starting VCN (8), file reference of the holding record (0x10),
+            // attribute id (0x18). Entries are sorted by type, name and VCN.
+            byte[] entries = ReadAttributeValue(list);
+            Dictionary<long, MftRecord> records = new Dictionary<long, MftRecord>();
+            records[baseRecord.Number] = baseRecord;
+            int pos = 0;
+            while (pos + 0x1A <= entries.Length)
+            {
+                uint entryType = BitConverter.ToUInt32(entries, pos);
+                int entryLength = BitConverter.ToUInt16(entries, pos + 4);
+                if (entryType == EndMarker || entryLength == 0) break;
+                int nameLength = entries[pos + 6];
+                int nameOffset = entries[pos + 7];
+                if (entryLength < 0x1A || pos + entryLength > entries.Length || nameOffset + nameLength * 2 > entryLength)
+                    throw new InvalidDataException("damaged $ATTRIBUTE_LIST in MFT record " + baseRecord.Number);
+                string entryName = Encoding.Unicode.GetString(entries, pos + nameOffset, nameLength * 2);
+                if (entryType == type && entryName == name)
+                {
+                    long recordNumber = BitConverter.ToInt64(entries, pos + 0x10) & RecordMask;
+                    ushort id = BitConverter.ToUInt16(entries, pos + 0x18);
+                    MftRecord holder;
+                    if (!records.TryGetValue(recordNumber, out holder))
+                    {
+                        holder = ReadRecord(recordNumber);
+                        if (holder.BaseRecord != baseRecord.Number)
+                            throw new InvalidDataException("MFT record " + recordNumber + " is not an extension record of record " + baseRecord.Number);
+                        records[recordNumber] = holder;
+                    }
+                    NtfsAttribute found = null;
+                    foreach (NtfsAttribute a in holder.Attributes)
+                    {
+                        if (a.Type == type && a.Id == id && a.Name == name) { found = a; break; }
+                    }
+                    if (found == null)
+                        throw new InvalidDataException("attribute " + id + " listed in the $ATTRIBUTE_LIST of record " + baseRecord.Number + " is missing from record " + recordNumber);
+                    extents.Add(found);
+                    if (updateMft) mft = BuildStream(extents, name);
+                }
+                pos += entryLength;
+            }
+            if (extents.Count == 0) return null;
+            return BuildStream(extents, name);
+        }
+
+        // Joins the extents of one attribute (in VCN order, no gaps)
+        private static NtfsStream BuildStream(List<NtfsAttribute> extents, string name)
+        {
+            extents.Sort(CompareStartVcn);
+            NtfsAttribute first = extents[0];
+            NtfsStream stream = new NtfsStream();
+            stream.Name = name;
+            stream.Flags = first.Flags;
+            stream.NonResident = first.NonResident;
+            stream.DataSize = first.DataSize;
+            stream.InitializedSize = first.InitializedSize;
+            if (!first.NonResident)
+            {
+                if (extents.Count > 1) throw new InvalidDataException("stream '" + name + "' is resident but has more than one extent");
+                stream.ResidentData = first.ResidentData;
+                return stream;
+            }
+            long nextVcn = 0;
+            foreach (NtfsAttribute extent in extents)
+            {
+                if (!extent.NonResident || extent.StartVcn != nextVcn)
+                    throw new InvalidDataException("the extents of stream '" + name + "' are not contiguous at VCN " + nextVcn);
+                stream.Runs.AddRange(extent.Runs);
+                nextVcn = extent.LastVcn + 1;
+            }
+            return stream;
+        }
+
+        private static int CompareStartVcn(NtfsAttribute x, NtfsAttribute y)
+        {
+            return x.StartVcn.CompareTo(y.StartVcn);
+        }
+
+        // Value of an attribute: resident data, or read through its runs
+        private byte[] ReadAttributeValue(NtfsAttribute attribute)
+        {
+            if (!attribute.NonResident) return attribute.ResidentData;
+            if (attribute.StartVcn != 0 || attribute.DataSize < 0 || attribute.DataSize > 64 * 1024 * 1024)
+                throw new InvalidDataException("unexpected non-resident attribute 0x" + attribute.Type.ToString("X") + " of " + attribute.DataSize + " bytes");
+            List<NtfsAttribute> extents = new List<NtfsAttribute>();
+            extents.Add(attribute);
+            byte[] value = new byte[attribute.DataSize];
+            ReadStreamBytes(BuildStream(extents, attribute.Name), 0, value, 0, value.Length);
+            return value;
+        }
+
+        // Checks the "FILE" signature and undoes the update sequence: on disk
+        // the last two bytes of every stride (512 bytes) hold the update
+        // sequence number; the original bytes are kept in the update sequence
+        // array. False = not a valid record (unused, torn write or damaged).
+        private static bool ApplyFixups(byte[] b, int off, int length)
+        {
+            if (b[off] != 0x46 || b[off + 1] != 0x49 || b[off + 2] != 0x4C || b[off + 3] != 0x45) return false;
+            int usaOffset = BitConverter.ToUInt16(b, off + 4);
+            int usaCount = BitConverter.ToUInt16(b, off + 6);
+            if (usaCount < 2 || usaOffset < 0x28 || usaOffset + usaCount * 2 > length) return false;
+            int stride = length / (usaCount - 1);
+            if (stride * (usaCount - 1) != length || stride < 256) return false;
+            for (int i = 1; i < usaCount; i++)
+            {
+                int p = off + i * stride - 2;
+                if (b[p] != b[off + usaOffset] || b[p + 1] != b[off + usaOffset + 1]) return false;
+            }
+            for (int i = 1; i < usaCount; i++)
+            {
+                int p = off + i * stride - 2;
+                b[p] = b[off + usaOffset + 2 * i];
+                b[p + 1] = b[off + usaOffset + 2 * i + 1];
+            }
+            return true;
+        }
+
+        // Header: first attribute offset (0x14), flags (0x16, 1 = in use),
+        // bytes in use (0x18), base record reference (0x20)
+        private MftRecord ParseRecord(byte[] b, int off, long number)
+        {
+            MftRecord record = new MftRecord();
+            record.Number = number;
+            record.Flags = BitConverter.ToUInt16(b, off + 0x16);
+            record.BaseRecord = BitConverter.ToInt64(b, off + 0x20) & RecordMask;
+            int used = (int)Math.Min(BitConverter.ToUInt32(b, off + 0x18), (uint)recordSize);
+            int pos = BitConverter.ToUInt16(b, off + 0x14);
+            while (pos + 4 <= used)
+            {
+                uint type = BitConverter.ToUInt32(b, off + pos);
+                if (type == EndMarker) break;
+                int length = pos + 0x10 <= used ? (int)BitConverter.ToUInt32(b, off + pos + 4) : 0;
+                if (length < 0x10 || length > used - pos)
+                    throw new InvalidDataException("MFT record " + number + ": damaged attribute at offset " + pos);
+                record.Attributes.Add(ParseAttribute(b, off + pos, length, number));
+                pos += length;
+            }
+            return record;
+        }
+
+        // Attribute header: type (0), length (4), non-resident (8), name
+        // length (9), name offset (0x0A), flags (0x0C), id (0x0E). Resident:
+        // value length (0x10), value offset (0x14). Non-resident: first and
+        // last VCN (0x10, 0x18), runlist offset (0x20), allocated, real and
+        // initialized size (0x28, 0x30, 0x38).
+        private static NtfsAttribute ParseAttribute(byte[] b, int p, int length, long number)
+        {
+            NtfsAttribute a = new NtfsAttribute();
+            a.Type = BitConverter.ToUInt32(b, p);
+            a.NonResident = b[p + 8] != 0;
+            int nameLength = b[p + 9];
+            int nameOffset = BitConverter.ToUInt16(b, p + 0x0A);
+            a.Flags = BitConverter.ToUInt16(b, p + 0x0C);
+            a.Id = BitConverter.ToUInt16(b, p + 0x0E);
+            if (nameLength > 0)
+            {
+                if (nameOffset + nameLength * 2 > length)
+                    throw new InvalidDataException("MFT record " + number + ": damaged attribute name");
+                a.Name = Encoding.Unicode.GetString(b, p + nameOffset, nameLength * 2);
+            }
+            if (!a.NonResident)
+            {
+                if (length < 0x18) throw new InvalidDataException("MFT record " + number + ": damaged resident attribute");
+                long valueLength = BitConverter.ToUInt32(b, p + 0x10);
+                int valueOffset = BitConverter.ToUInt16(b, p + 0x14);
+                if (valueOffset + valueLength > length)
+                    throw new InvalidDataException("MFT record " + number + ": damaged resident attribute");
+                a.ResidentData = new byte[valueLength];
+                Buffer.BlockCopy(b, p + valueOffset, a.ResidentData, 0, (int)valueLength);
+                a.DataSize = valueLength;
+                a.InitializedSize = valueLength;
+            }
+            else
+            {
+                if (length < 0x40) throw new InvalidDataException("MFT record " + number + ": damaged non-resident attribute");
+                a.StartVcn = BitConverter.ToInt64(b, p + 0x10);
+                a.LastVcn = BitConverter.ToInt64(b, p + 0x18);
+                int runsOffset = BitConverter.ToUInt16(b, p + 0x20);
+                a.DataSize = BitConverter.ToInt64(b, p + 0x30);
+                a.InitializedSize = BitConverter.ToInt64(b, p + 0x38);
+                if (runsOffset < 0x40 || runsOffset > length)
+                    throw new InvalidDataException("MFT record " + number + ": damaged runlist offset");
+                a.Runs = DecodeRuns(b, p + runsOffset, p + length, a.StartVcn, number);
+                long nextVcn = a.StartVcn;
+                foreach (DataRun run in a.Runs) nextVcn += run.Length;
+                if (nextVcn != a.LastVcn + 1)
+                    throw new InvalidDataException("MFT record " + number + ": runlist ends at VCN " + nextVcn + ", attribute at " + (a.LastVcn + 1));
+            }
+            return a;
+        }
+
+        // Runlist (mapping pairs): a header byte (low nibble = size of the
+        // length field, high nibble = size of the offset field), the run
+        // length, then the run's LCN as a signed offset from the previous
+        // run's LCN. No offset field = sparse run. A 0 header ends the list.
+        private static List<DataRun> DecodeRuns(byte[] b, int pos, int end, long startVcn, long number)
+        {
+            List<DataRun> runs = new List<DataRun>();
+            long vcn = startVcn;
+            long lcn = 0;
+            while (pos < end && b[pos] != 0)
+            {
+                int lengthSize = b[pos] & 0x0F;
+                int offsetSize = (b[pos] >> 4) & 0x0F;
+                if (lengthSize == 0 || lengthSize > 8 || offsetSize > 8 || pos + 1 + lengthSize + offsetSize > end)
+                    throw new InvalidDataException("MFT record " + number + ": damaged runlist");
+                DataRun run = new DataRun();
+                run.Vcn = vcn;
+                run.Length = ReadLittleEndian(b, pos + 1, lengthSize, false);
+                if (run.Length <= 0) throw new InvalidDataException("MFT record " + number + ": damaged runlist (run length)");
+                if (offsetSize == 0)
+                {
+                    run.Lcn = -1;
+                }
+                else
+                {
+                    lcn += ReadLittleEndian(b, pos + 1 + lengthSize, offsetSize, true);
+                    if (lcn < 0) throw new InvalidDataException("MFT record " + number + ": damaged runlist (negative LCN)");
+                    run.Lcn = lcn;
+                }
+                runs.Add(run);
+                vcn += run.Length;
+                pos += 1 + lengthSize + offsetSize;
+            }
+            return runs;
+        }
+
+        private static long ReadLittleEndian(byte[] b, int pos, int size, bool signed)
+        {
+            long value = 0;
+            for (int i = size - 1; i >= 0; i--) value = (value << 8) | b[pos + i];
+            if (signed && size < 8 && (b[pos + size - 1] & 0x80) != 0) value |= -1L << (size * 8);
+            return value;
+        }
+
+        // Reads bytes of a stream by virtual offset (sparse parts read as zeros)
+        private void ReadStreamBytes(NtfsStream stream, long offset, byte[] buffer, int index, int count)
+        {
+            if (!stream.NonResident)
+            {
+                if (offset < 0 || offset + count > stream.ResidentData.Length)
+                    throw new EndOfStreamException("read past the end of resident stream '" + stream.Name + "'");
+                Buffer.BlockCopy(stream.ResidentData, (int)offset, buffer, index, count);
+                return;
+            }
+            while (count > 0)
+            {
+                long vcn = offset / bytesPerCluster;
+                DataRun run = FindRun(stream.Runs, vcn);
+                if (run == null)
+                    throw new InvalidDataException("offset " + offset + " of stream '" + stream.Name + "' is not mapped by its runlist");
+                int length = (int)Math.Min(count, (run.Vcn + run.Length) * bytesPerCluster - offset);
+                if (run.Lcn < 0)
+                    Array.Clear(buffer, index, length);
+                else
+                    ReadVolume((run.Lcn + vcn - run.Vcn) * bytesPerCluster + offset % bytesPerCluster, buffer, index, length);
+                offset += length;
+                index += length;
+                count -= length;
+            }
+        }
+
+        private static DataRun FindRun(List<DataRun> runs, long vcn)
+        {
+            int low = 0;
+            int high = runs.Count - 1;
+            while (low <= high)
+            {
+                int middle = low + (high - low) / 2;
+                DataRun run = runs[middle];
+                if (vcn < run.Vcn) high = middle - 1;
+                else if (vcn >= run.Vcn + run.Length) low = middle + 1;
+                else return run;
+            }
+            return null;
+        }
+
+        // Volume reads: offset and length are widened to whole sectors (a
+        // volume device rejects anything else)
+        private void ReadVolume(long offset, byte[] buffer, int index, int count)
+        {
+            long start = offset - offset % bytesPerSector;
+            long end = offset + count;
+            long alignedEnd = (end + bytesPerSector - 1) / bytesPerSector * bytesPerSector;
+            if (start == offset && alignedEnd == end)
+            {
+                ReadExact(offset, buffer, index, count);
+                return;
+            }
+            byte[] aligned = new byte[alignedEnd - start];
+            ReadExact(start, aligned, 0, aligned.Length);
+            Buffer.BlockCopy(aligned, (int)(offset - start), buffer, index, count);
+        }
+
+        private void ReadExact(long offset, byte[] buffer, int index, int count)
+        {
+            volume.Position = offset;
+            int done = 0;
+            while (done < count)
+            {
+                int read = volume.Read(buffer, index + done, count - done);
+                if (read <= 0) throw new EndOfStreamException("read past the end of the volume at offset " + (offset + done));
+                done += read;
+            }
+        }
+    }
+}
+'@
+
+$script:ntfsReaderReady = $null
+function Initialize-TriageNtfsReader {
+    if ($null -ne $script:ntfsReaderReady) { return $script:ntfsReaderReady }
+    if ('TriageNtfs.NtfsReader' -as [type]) {
+        $script:ntfsReaderReady = $true
+        return $true
+    }
+    try {
+        Add-Type -TypeDefinition $script:triageNtfsSource -ErrorAction Stop
+        $script:ntfsReaderReady = $true
+    } catch {
+        Log-Warning "Raw NTFS reader could not be compiled (raw `$MFT, `$LogFile and `$UsnJrnl:`$J not collected): $($_.Exception.Message)"
+        $script:errorCount++
+        $script:ntfsReaderReady = $false
+    }
+    return $script:ntfsReaderReady
+}
+
+# Message of the exception behind an error record (.NET method calls wrap
+# it in a MethodInvocationException)
+function Get-TriageErrorMessage {
+    param($ErrorRecord)
+    $innerError = $ErrorRecord.Exception
+    while ($innerError.InnerException -and $innerError -is [System.Management.Automation.MethodInvocationException]) {
+        $innerError = $innerError.InnerException
+    }
+    return $innerError.Message
+}
+
+# Copy one $DATA stream of an MFT record to DestPath and record it in the
+# manifest. -AllocatedOnly leaves out sparse runs ($UsnJrnl:$J).
+# -Signature: expected first bytes of the copy (discarded if different).
+function Copy-TriageRawNtfsStream {
+    [OutputType([void])]
+    param(
+        [object]$Reader,
+        [long]$RecordNumber,
+        [string]$StreamName,
+        [string]$Label,
+        [string]$DestPath,
+        [string]$SourcePath,
+        [string]$Signature = "",
+        [switch]$AllocatedOnly
+    )
+    $stream = $null
+    $written = 0
+    try {
+        $stream = $Reader.GetDataStream($RecordNumber, $StreamName)
+        if ($null -eq $stream) {
+            Log-Warning "Could not collect $Label (raw NTFS): MFT record $RecordNumber has no such data stream"
+            $script:errorCount++
+            return
+        }
+        $written = $Reader.CopyStreamToFile($stream, $DestPath, $AllocatedOnly.IsPresent)
+    } catch {
+        Log-Warning "Could not collect $Label (raw NTFS): $(Get-TriageErrorMessage $_)"
+        $script:errorCount++
+        Remove-Item -LiteralPath $DestPath -Force -ErrorAction SilentlyContinue
+        return
+    }
+
+    if ($written -le 0) {
+        Log "$Label (raw NTFS): no allocated data -- nothing to copy"
+        Remove-Item -LiteralPath $DestPath -Force -ErrorAction SilentlyContinue
+        return
+    }
+
+    if ($Signature) {
+        $head = ""
+        try {
+            $headStream = [System.IO.File]::OpenRead($DestPath)
+            try {
+                $headBytes = New-Object byte[] $Signature.Length
+                $headRead = $headStream.Read($headBytes, 0, $headBytes.Length)
+                $head = [System.Text.Encoding]::ASCII.GetString($headBytes, 0, $headRead)
+            } finally {
+                $headStream.Dispose()
+            }
+        } catch { Write-Verbose "Reading the start of ${DestPath}: $($_.Exception.Message)" }
+        if ($head -cne $Signature) {
+            Log-Warning "Raw NTFS copy of $Label does not start with '$Signature' -- discarded"
+            Remove-Item -LiteralPath $DestPath -Force -ErrorAction SilentlyContinue
+            $script:errorCount++
+            return
+        }
+    }
+
+    Record-Manifest -SourcePath $SourcePath -DestPath $DestPath
+    $sizeText = "$([math]::Round($written / 1MB, 2)) MB ($written bytes)"
+    if ($AllocatedOnly) {
+        Log-Success "Collected $Label (raw NTFS, allocated part only): $sizeText; stream size $([math]::Round($stream.DataSize / 1MB, 2)) MB"
+    } else {
+        Log-Success "Collected $Label (raw NTFS): $sizeText"
+    }
+}
+
+# Raw $MFT, $LogFile and $UsnJrnl:$J (allocated part) of the target volume
+# into DestDir. Live system: the system volume. Mounted image: its drive,
+# but only when the Windows root is the root of that drive and the volume
+# is NTFS (a nested layout such as G:\C\ is a folder, not a volume).
+# Never throws: failures are logged as warnings and the collection goes on.
+function Save-TriageRawNtfsFiles {
+    [OutputType([void])]
+    param([string]$DestDir)
+
+    if (-not $script:IsLive) {
+        if ($script:TargetRoot.TrimEnd('\') -ne "${TargetDrive}:") {
+            Log "Raw `$MFT, `$LogFile, `$UsnJrnl:`$J skipped: the Windows root $($script:TargetRoot) is a folder on ${TargetDrive}:, not the root of a volume"
+            return
+        }
+        $fileSystem = ""
+        try {
+            $fileSystem = (New-Object System.IO.DriveInfo($TargetDrive)).DriveFormat
+        } catch { Write-Verbose "Reading the file system of ${TargetDrive}: $($_.Exception.Message)" }
+        if ($fileSystem -ne "NTFS") {
+            if (-not $fileSystem) { $fileSystem = "unknown" }
+            Log "Raw `$MFT, `$LogFile, `$UsnJrnl:`$J skipped: ${TargetDrive}: is not an NTFS volume (file system: $fileSystem)"
+            return
+        }
+    }
+    if (-not (Initialize-TriageNtfsReader)) { return }
+
+    $volumePath = "\\.\${TargetDrive}:"
+    Log "Reading NTFS metafiles from $volumePath (built-in raw NTFS reader)..."
+    $reader = $null
+    try {
+        $reader = [TriageNtfs.NtfsReader]::OpenVolume($volumePath)
+    } catch {
+        Log-Warning "Raw `$MFT, `$LogFile and `$UsnJrnl:`$J not collected: $(Get-TriageErrorMessage $_)"
+        $script:errorCount++
+        return
+    }
+    try {
+        Log "  $($reader.BytesPerCluster)-byte clusters, $($reader.RecordSize)-byte MFT records, `$MFT $([math]::Round($reader.MftSize / 1MB, 2)) MB"
+
+        # $MFT = unnamed $DATA of record 0, $LogFile = unnamed $DATA of record 2
+        Copy-TriageRawNtfsStream -Reader $reader -RecordNumber 0 -StreamName "" -Label '$MFT' `
+            -DestPath (Join-Path $DestDir '$MFT') -SourcePath "(raw NTFS $volumePath `$MFT)" -Signature "FILE"
+        Copy-TriageRawNtfsStream -Reader $reader -RecordNumber 2 -StreamName "" -Label '$LogFile' `
+            -DestPath (Join-Path $DestDir '$LogFile') -SourcePath "(raw NTFS $volumePath `$LogFile)"
+
+        # $UsnJrnl:$J = the $J stream of the entry named $UsnJrnl in $Extend
+        # (record 11). $J is sparse: the journal's old, freed part reads as
+        # zeros, so only the allocated runs are copied.
+        $usnRecord = -1
+        $searchFailed = $false
+        try {
+            $usnRecord = $reader.FindRecordByName(11, '$UsnJrnl')
+        } catch {
+            Log-Warning "Could not collect `$UsnJrnl:`$J (raw NTFS): searching the MFT failed -- $(Get-TriageErrorMessage $_)"
+            $script:errorCount++
+            $searchFailed = $true
+        }
+        if ($usnRecord -ge 0) {
+            Copy-TriageRawNtfsStream -Reader $reader -RecordNumber $usnRecord -StreamName '$J' -Label '$UsnJrnl:$J' `
+                -DestPath (Join-Path $DestDir '$UsnJrnl_$J') -SourcePath "(raw NTFS $volumePath `$UsnJrnl:`$J)" -AllocatedOnly
+        } elseif (-not $searchFailed) {
+            Log-Warning "No `$UsnJrnl in `$Extend on ${TargetDrive}: (USN journal not active?) -- raw `$UsnJrnl:`$J not collected"
+        }
+    } finally {
+        $reader.Dispose()
+    }
 }
 
 # =============================================================
@@ -1016,20 +1927,31 @@ if ($Categories -contains "FileSystem") {
     Ensure-Directory $fsDir
 
     if ($SkipLargeFiles) {
-        Log "SkipLargeFiles is set -- skipping the USN journal export (`$UsnJrnl:`$J)"
+        Log "SkipLargeFiles is set -- skipping the raw NTFS copies (`$MFT, `$LogFile, `$UsnJrnl:`$J) and the USN journal export"
     } else {
-        # NTFS metafiles ($MFT, $LogFile, $Extend\$UsnJrnl:$J) cannot be opened
-        # through the file API, not even inside a shadow copy, so copy attempts
-        # always failed. They need a raw-disk reader; the USN journal is exported
-        # as text with fsutil instead.
-        Log "Note: raw `$MFT, `$LogFile and `$UsnJrnl:`$J need a raw-disk reader (not built in) -- not collected. Exporting the USN journal with fsutil instead."
+        # Raw $MFT, $LogFile and $UsnJrnl:$J (allocated part) with the built-in
+        # NTFS reader. Failures are logged; the fsutil export below runs anyway.
+        try {
+            Save-TriageRawNtfsFiles -DestDir $fsDir
+        } catch {
+            Log-Warning "Raw NTFS copies failed: $(Get-TriageErrorMessage $_)"
+            $script:errorCount++
+        }
 
-        # $UsnJrnl:$J
+        # $UsnJrnl:$J as text (the timeline builder parses this export)
         Log "Collecting `$UsnJrnl:`$J via fsutil usn readjournal..."
         try {
             $ujDest = Join-Path $fsDir '$UsnJrnl_$J.txt'
             fsutil usn readjournal ${TargetDrive}: csv 2>&1 | Out-File -LiteralPath $ujDest -Encoding utf8
-            if ((Get-FileLength $ujDest) -gt 0) {
+            # fsutil writes its error message (e.g. "Error:  Access is denied.")
+            # instead of a journal when it fails: a real export has a "Usn," header
+            $ujHead = @(Get-Content -LiteralPath $ujDest -TotalCount 20 -ErrorAction SilentlyContinue)
+            if ((Get-FileLength $ujDest) -gt 0 -and -not ($ujHead -match '^Usn,')) {
+                Log-Warning "fsutil could not export the USN journal: $((($ujHead | Where-Object { $_ }) -join ' ').Trim())"
+                Remove-Item -LiteralPath $ujDest -Force -ErrorAction SilentlyContinue
+                $script:errorCount++
+            }
+            elseif ((Get-FileLength $ujDest) -gt 0) {
                 Record-Manifest -SourcePath "(fsutil usn readjournal)" -DestPath $ujDest
                 Log-Success "Collected USN Journal via fsutil (CSV format)"
             } else {
@@ -1841,7 +2763,9 @@ if ($Categories -contains "Execution") {
     $prefetchSource = "${script:TargetRoot}Windows\Prefetch"
     if (Test-Path $prefetchSource) {
         Log "Collecting Prefetch files..."
-        $pfFiles = Get-ChildItem -Path $prefetchSource -Filter "*.pf" -ErrorAction SilentlyContinue
+        # -Force here and at the other artifact listings: without it
+        # Get-ChildItem silently skips hidden/system files
+        $pfFiles = Get-ChildItem -Path $prefetchSource -Filter "*.pf" -Force -ErrorAction SilentlyContinue
         $pfCount = 0
         foreach ($pf in $pfFiles) {
             Copy-ForensicFile -SourcePath $pf.FullName -DestDir $prefetchDir
@@ -1966,10 +2890,13 @@ if ($Categories -contains "Network") {
     Save-CommandOutput -Description "firewall_rules" `
         -DestPath (Join-Path $netDir "firewall_rules.txt") `
         -Command {
+            # Out-String with a wide width: Out-File cuts a table to the
+            # console width, which dropped the Direction/Action/Profile columns
             Get-NetFirewallRule -Enabled True -ErrorAction SilentlyContinue |
                 Select-Object DisplayName, Direction, Action, Profile |
                 Sort-Object Direction, DisplayName |
-                Format-Table -AutoSize -Wrap
+                Format-Table -AutoSize |
+                Out-String -Width 4096
         }
 
     Log "Collecting Wi-Fi profiles..."
@@ -2012,7 +2939,7 @@ if ($Categories -contains "UserActivity") {
         if (Test-Path $recentSource) {
             $recentDest = Join-Path $uaDir "$userName\RecentFiles"
             Ensure-Directory $recentDest
-            $lnkFiles = Get-ChildItem -Path $recentSource -Filter "*.lnk" -ErrorAction SilentlyContinue
+            $lnkFiles = Get-ChildItem -Path $recentSource -Filter "*.lnk" -Force -ErrorAction SilentlyContinue
             $lnkCount = 0
             foreach ($lnk in $lnkFiles) {
                 Copy-ForensicFile -SourcePath $lnk.FullName -DestDir $recentDest
@@ -2027,7 +2954,7 @@ if ($Categories -contains "UserActivity") {
         if (Test-Path $autoJumpSource) {
             $autoJumpDest = Join-Path $uaDir "$userName\JumpLists\AutomaticDestinations"
             Ensure-Directory $autoJumpDest
-            $jlFiles = Get-ChildItem -Path $autoJumpSource -ErrorAction SilentlyContinue
+            $jlFiles = Get-ChildItem -Path $autoJumpSource -File -Force -ErrorAction SilentlyContinue
             $jlCount = 0
             foreach ($jl in $jlFiles) {
                 Copy-ForensicFile -SourcePath $jl.FullName -DestDir $autoJumpDest
@@ -2042,7 +2969,7 @@ if ($Categories -contains "UserActivity") {
         if (Test-Path $customJumpSource) {
             $customJumpDest = Join-Path $uaDir "$userName\JumpLists\CustomDestinations"
             Ensure-Directory $customJumpDest
-            $jlFiles = Get-ChildItem -Path $customJumpSource -ErrorAction SilentlyContinue
+            $jlFiles = Get-ChildItem -Path $customJumpSource -File -Force -ErrorAction SilentlyContinue
             $jlCount = 0
             foreach ($jl in $jlFiles) {
                 Copy-ForensicFile -SourcePath $jl.FullName -DestDir $customJumpDest
@@ -2071,6 +2998,26 @@ if ($Categories -contains "UserActivity") {
     Log ""
 }
 
+# ----------------------------------------------------------
+# Helper for the Browser section: current Chromium-based browsers
+# (Chrome 96+, Edge, Brave, Vivaldi, Opera) keep cookies in
+# <profile>\Network\Cookies; the profile-root "Cookies" is the legacy
+# location. Copied (with its journal, if present) to <dest>\Network\.
+# ----------------------------------------------------------
+function Copy-TriageChromiumNetworkCookies {
+    [OutputType([void])]
+    param(
+        [string]$ProfileDir,
+        [string]$DestDir
+    )
+    foreach ($cookieFile in @("Cookies", "Cookies-journal")) {
+        $sourcePath = Join-Path $ProfileDir "Network\$cookieFile"
+        if (Test-Path -LiteralPath $sourcePath) {
+            Copy-ForensicFile -SourcePath $sourcePath -DestDir (Join-Path $DestDir "Network") -DestName $cookieFile
+        }
+    }
+}
+
 # =============================================================
 # 7. Browser Artifacts
 # =============================================================
@@ -2091,7 +3038,7 @@ if ($Categories -contains "Browser") {
         if (Test-Path -LiteralPath $chromeBase) {
             Log "Collecting Chrome data for $userName..."
             # Collect from Default and any numbered profiles
-            $chromeProfiles = Get-ChildItem -Path $chromeBase -Directory -ErrorAction SilentlyContinue |
+            $chromeProfiles = Get-ChildItem -Path $chromeBase -Directory -Force -ErrorAction SilentlyContinue |
                 Where-Object { $_.Name -eq "Default" -or $_.Name -match "^Profile \d+$" }
 
             foreach ($browserProfile in $chromeProfiles) {
@@ -2106,6 +3053,7 @@ if ($Categories -contains "Browser") {
                         Copy-ForensicFile -SourcePath $sourcePath -DestDir $destDir -DestName $cf
                     }
                 }
+                Copy-TriageChromiumNetworkCookies -ProfileDir $browserProfile.FullName -DestDir $destDir
             }
             Log-Success "Collected Chrome artifacts for $userName"
         }
@@ -2114,7 +3062,7 @@ if ($Categories -contains "Browser") {
         $edgeBase = Join-Path $userDir.FullName "AppData\Local\Microsoft\Edge\User Data"
         if (Test-Path -LiteralPath $edgeBase) {
             Log "Collecting Edge data for $userName..."
-            $edgeProfiles = Get-ChildItem -Path $edgeBase -Directory -ErrorAction SilentlyContinue |
+            $edgeProfiles = Get-ChildItem -Path $edgeBase -Directory -Force -ErrorAction SilentlyContinue |
                 Where-Object { $_.Name -eq "Default" -or $_.Name -match "^Profile \d+$" }
 
             foreach ($browserProfile in $edgeProfiles) {
@@ -2126,6 +3074,7 @@ if ($Categories -contains "Browser") {
                         Copy-ForensicFile -SourcePath $sourcePath -DestDir $destDir -DestName $ef
                     }
                 }
+                Copy-TriageChromiumNetworkCookies -ProfileDir $browserProfile.FullName -DestDir $destDir
             }
             Log-Success "Collected Edge artifacts for $userName"
         }
@@ -2134,7 +3083,7 @@ if ($Categories -contains "Browser") {
         $braveBase = Join-Path $userDir.FullName "AppData\Local\BraveSoftware\Brave-Browser\User Data"
         if (Test-Path -LiteralPath $braveBase) {
             Log "Collecting Brave data for $userName..."
-            $braveProfiles = Get-ChildItem -Path $braveBase -Directory -ErrorAction SilentlyContinue |
+            $braveProfiles = Get-ChildItem -Path $braveBase -Directory -Force -ErrorAction SilentlyContinue |
                 Where-Object { $_.Name -eq "Default" -or $_.Name -match "^Profile \d+$" }
 
             foreach ($browserProfile in $braveProfiles) {
@@ -2146,6 +3095,7 @@ if ($Categories -contains "Browser") {
                         Copy-ForensicFile -SourcePath $sourcePath -DestDir $destDir -DestName $bf
                     }
                 }
+                Copy-TriageChromiumNetworkCookies -ProfileDir $browserProfile.FullName -DestDir $destDir
             }
             Log-Success "Collected Brave artifacts for $userName"
         }
@@ -2167,6 +3117,7 @@ if ($Categories -contains "Browser") {
                         Copy-ForensicFile -SourcePath $sourcePath -DestDir $destDir -DestName $of
                     }
                 }
+                Copy-TriageChromiumNetworkCookies -ProfileDir $operaBase -DestDir $destDir
                 Log-Success "Collected $operaName artifacts for $userName"
             }
         }
@@ -2175,7 +3126,7 @@ if ($Categories -contains "Browser") {
         $vivaldiBase = Join-Path $userDir.FullName "AppData\Local\Vivaldi\User Data"
         if (Test-Path -LiteralPath $vivaldiBase) {
             Log "Collecting Vivaldi data for $userName..."
-            $vivaldiProfiles = Get-ChildItem -Path $vivaldiBase -Directory -ErrorAction SilentlyContinue |
+            $vivaldiProfiles = Get-ChildItem -Path $vivaldiBase -Directory -Force -ErrorAction SilentlyContinue |
                 Where-Object { $_.Name -eq "Default" -or $_.Name -match "^Profile \d+$" }
 
             foreach ($browserProfile in $vivaldiProfiles) {
@@ -2187,6 +3138,7 @@ if ($Categories -contains "Browser") {
                         Copy-ForensicFile -SourcePath $sourcePath -DestDir $destDir -DestName $vf
                     }
                 }
+                Copy-TriageChromiumNetworkCookies -ProfileDir $browserProfile.FullName -DestDir $destDir
             }
             Log-Success "Collected Vivaldi artifacts for $userName"
         }
@@ -2195,7 +3147,7 @@ if ($Categories -contains "Browser") {
         $firefoxBase = Join-Path $userDir.FullName "AppData\Roaming\Mozilla\Firefox\Profiles"
         if (Test-Path -LiteralPath $firefoxBase) {
             Log "Collecting Firefox data for $userName..."
-            $ffProfiles = Get-ChildItem -Path $firefoxBase -Directory -ErrorAction SilentlyContinue
+            $ffProfiles = Get-ChildItem -Path $firefoxBase -Directory -Force -ErrorAction SilentlyContinue
 
             foreach ($browserProfile in $ffProfiles) {
                 $destDir = Join-Path $browserDir "$userName\Firefox\$($browserProfile.Name)"
@@ -2433,7 +3385,8 @@ if ($Categories -contains "Persistence") {
             Log "Collecting scheduled task XML files..."
             $taskDestDir = Join-Path $persDir "ScheduledTasks_XML"
             Ensure-Directory $taskDestDir
-            $taskFiles = Get-ChildItem -Path $taskSourceDir -File -Recurse -ErrorAction SilentlyContinue |
+            # -Recurse -Force is safe here: the Tasks folder has no junctions
+            $taskFiles = Get-ChildItem -Path $taskSourceDir -File -Recurse -Force -ErrorAction SilentlyContinue |
                 Where-Object { $_.Length -gt 0 } | Select-Object -First 200
             $taskCount = 0
             foreach ($tf in $taskFiles) {
@@ -2546,13 +3499,17 @@ if ($Categories -contains "AntiVirus") {
         Log "Skipping AV live queries (mounted image -- WMI/Defender cmdlets not applicable)"
     }
 
-    # Defender support logs directory
+    # Defender support logs and the third-party AV logs below are listed with
+    # -Force (hidden/system log files too). The -Recurse walks start inside the
+    # vendor's own folder, so they never reach the "Application Data"-style
+    # junctions of ProgramData or user profiles (which Windows PowerShell 5.1
+    # would follow with -Force, looping)
     $defenderSupportDir = "${script:TargetRoot}ProgramData\Microsoft\Windows Defender\Support"
     if (Test-Path $defenderSupportDir) {
         Log "Collecting Defender support logs..."
         $defenderDestDir = Join-Path $avDir "Defender"
         Ensure-Directory $defenderDestDir
-        $defenderLogs = Get-ChildItem -Path $defenderSupportDir -File -ErrorAction SilentlyContinue |
+        $defenderLogs = Get-ChildItem -Path $defenderSupportDir -File -Force -ErrorAction SilentlyContinue |
             Where-Object { $_.Extension -in ".log", ".txt", ".etl" -and $_.Length -gt 0 } |
             Sort-Object LastWriteTime -Descending | Select-Object -First 10
         foreach ($dl in $defenderLogs) {
@@ -2562,18 +3519,27 @@ if ($Categories -contains "AntiVirus") {
     }
 
     # --- Symantec Endpoint Protection ---
-    $sepLogDir = "${script:TargetRoot}ProgramData\Symantec\Symantec Endpoint Protection\CurrentVersion\Data\Logs"
-    if (Test-Path $sepLogDir) {
+    # SEP 12+ (CurrentVersion\Data\Logs) and SEP 11 (Logs). The daily AV scan
+    # logs (AV\*.Log, parsed by the timeline builder) are always collected;
+    # the other logs: newest 20.
+    $sepLogDirs = @(
+        "${script:TargetRoot}ProgramData\Symantec\Symantec Endpoint Protection\CurrentVersion\Data\Logs",
+        "${script:TargetRoot}ProgramData\Symantec\Symantec Endpoint Protection\Logs"
+    ) | Where-Object { Test-Path -LiteralPath $_ }
+    if ($sepLogDirs) {
         Log "Detected Symantec Endpoint Protection -- collecting logs..."
         $sepDestDir = Join-Path $avDir "Symantec_SEP"
         Ensure-Directory $sepDestDir
-        $sepLogs = Get-ChildItem -Path $sepLogDir -File -Recurse -ErrorAction SilentlyContinue |
-            Where-Object { $_.Length -gt 0 } |
-            Sort-Object LastWriteTime -Descending | Select-Object -First 20
+        $sepAll = @(Get-ChildItem -LiteralPath $sepLogDirs -File -Recurse -Force -ErrorAction SilentlyContinue |
+            Where-Object { $_.Length -gt 0 })
+        $sepAvLogs = @($sepAll | Where-Object { $_.Directory.Name -eq "AV" -and $_.Extension -eq ".log" })
+        $sepOther = @($sepAll | Where-Object { -not ($_.Directory.Name -eq "AV" -and $_.Extension -eq ".log") } |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 20)
+        $sepLogs = @($sepAvLogs) + @($sepOther)
         foreach ($sl in $sepLogs) {
             Copy-ForensicFile -SourcePath $sl.FullName -DestDir $sepDestDir
         }
-        Log-Success "Collected $($sepLogs.Count) Symantec SEP log(s)."
+        Log-Success "Collected $($sepLogs.Count) Symantec SEP log(s) ($($sepAvLogs.Count) daily AV log(s))."
     }
 
     # Symantec event logs
@@ -2606,7 +3572,7 @@ if ($Categories -contains "AntiVirus") {
         Ensure-Directory $csDestDir
         foreach ($csDir in @($csLogDir, $csDataDir)) {
             if (Test-Path $csDir) {
-                $csLogs = Get-ChildItem -Path $csDir -File -Recurse -ErrorAction SilentlyContinue |
+                $csLogs = Get-ChildItem -Path $csDir -File -Recurse -Force -ErrorAction SilentlyContinue |
                     Where-Object { $_.Extension -in ".log", ".txt", ".etl", ".csv" -and $_.Length -gt 0 } |
                     Sort-Object LastWriteTime -Descending | Select-Object -First 20
                 foreach ($cl in $csLogs) {
@@ -2644,7 +3610,7 @@ if ($Categories -contains "AntiVirus") {
         Log "Detected SentinelOne -- collecting logs..."
         $s1DestDir = Join-Path $avDir "SentinelOne"
         Ensure-Directory $s1DestDir
-        $s1Logs = Get-ChildItem -Path $s1LogDir -File -Recurse -ErrorAction SilentlyContinue |
+        $s1Logs = Get-ChildItem -Path $s1LogDir -File -Recurse -Force -ErrorAction SilentlyContinue |
             Where-Object { $_.Length -gt 0 } |
             Sort-Object LastWriteTime -Descending | Select-Object -First 20
         foreach ($sl in $s1Logs) {
@@ -2659,7 +3625,7 @@ if ($Categories -contains "AntiVirus") {
         Log "Detected Carbon Black -- collecting logs..."
         $cbDestDir = Join-Path $avDir "CarbonBlack"
         Ensure-Directory $cbDestDir
-        $cbLogs = Get-ChildItem -Path $cbLogDir -File -Recurse -ErrorAction SilentlyContinue |
+        $cbLogs = Get-ChildItem -Path $cbLogDir -File -Recurse -Force -ErrorAction SilentlyContinue |
             Where-Object { $_.Length -gt 0 } |
             Sort-Object LastWriteTime -Descending | Select-Object -First 20
         foreach ($cl in $cbLogs) {
@@ -2674,7 +3640,7 @@ if ($Categories -contains "AntiVirus") {
         Log "Detected Malwarebytes -- collecting logs..."
         $mbDestDir = Join-Path $avDir "Malwarebytes"
         Ensure-Directory $mbDestDir
-        $mbLogs = Get-ChildItem -Path $mbLogDir -File -Recurse -ErrorAction SilentlyContinue |
+        $mbLogs = Get-ChildItem -Path $mbLogDir -File -Recurse -Force -ErrorAction SilentlyContinue |
             Where-Object { $_.Length -gt 0 } |
             Sort-Object LastWriteTime -Descending | Select-Object -First 20
         foreach ($ml in $mbLogs) {
@@ -2689,9 +3655,14 @@ if ($Categories -contains "AntiVirus") {
         Log "Detected Sophos -- collecting logs..."
         $sophosDestDir = Join-Path $avDir "Sophos"
         Ensure-Directory $sophosDestDir
-        $sophosLogs = Get-ChildItem -Path $sophosLogDir -File -Recurse -ErrorAction SilentlyContinue |
-            Where-Object { $_.Extension -in ".log", ".txt", ".xml", ".csv" -and $_.Length -gt 0 } |
-            Sort-Object LastWriteTime -Descending | Select-Object -First 20
+        $sophosAll = @(Get-ChildItem -Path $sophosLogDir -File -Recurse -Force -ErrorAction SilentlyContinue |
+            Where-Object { $_.Extension -in ".log", ".txt", ".xml", ".csv" -and $_.Length -gt 0 })
+        # Sophos Anti-Virus detection log (SAV.txt, parsed by the timeline
+        # builder) always; everything else: newest 20
+        $sophosKey = @($sophosAll | Where-Object { $_.Name -like "SAV*.txt" })
+        $sophosOther = @($sophosAll | Where-Object { $_.Name -notlike "SAV*.txt" } |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 20)
+        $sophosLogs = @($sophosKey) + @($sophosOther)
         foreach ($sl in $sophosLogs) {
             Copy-ForensicFile -SourcePath $sl.FullName -DestDir $sophosDestDir
         }
@@ -2699,21 +3670,29 @@ if ($Categories -contains "AntiVirus") {
     }
 
     # --- ESET ---
-    $esetLogDir = "${script:TargetRoot}ProgramData\ESET\ESET Security\Logs"
-    if (-not (Test-Path $esetLogDir)) {
-        $esetLogDir = "${script:TargetRoot}ProgramData\ESET\ESET NOD32 Antivirus\Logs"
-    }
-    if (Test-Path $esetLogDir) {
-        Log "Detected ESET -- collecting logs..."
-        $esetDestDir = Join-Path $avDir "ESET"
-        Ensure-Directory $esetDestDir
-        $esetLogs = Get-ChildItem -Path $esetLogDir -File -Recurse -ErrorAction SilentlyContinue |
-            Where-Object { $_.Length -gt 0 } |
-            Sort-Object LastWriteTime -Descending | Select-Object -First 20
-        foreach ($el in $esetLogs) {
-            Copy-ForensicFile -SourcePath $el.FullName -DestDir $esetDestDir
+    # Every ESET product keeps its logs in ProgramData\ESET\<product>\Logs
+    # (ESET Security, NOD32 Antivirus, Smart/Internet Security, Endpoint
+    # Antivirus/Security, File/Server Security, ...). Each product goes to its
+    # own subfolder; virlog.dat (detections) is always collected.
+    $esetProductDirs = @(Get-ChildItem -LiteralPath "${script:TargetRoot}ProgramData\ESET" -Directory -Force -ErrorAction SilentlyContinue |
+        Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName "Logs") })
+    if ($esetProductDirs.Count -gt 0) {
+        Log "Detected ESET ($(($esetProductDirs | ForEach-Object { $_.Name }) -join ', ')) -- collecting logs..."
+        $esetCount = 0
+        foreach ($esetProduct in $esetProductDirs) {
+            $esetDestDir = Join-Path $avDir "ESET\$($esetProduct.Name)"
+            Ensure-Directory $esetDestDir
+            $esetAll = @(Get-ChildItem -LiteralPath (Join-Path $esetProduct.FullName "Logs") -File -Recurse -Force -ErrorAction SilentlyContinue |
+                Where-Object { $_.Length -gt 0 })
+            $esetKey = @($esetAll | Where-Object { $_.Name -like "virlog*.dat" })
+            $esetOther = @($esetAll | Where-Object { $_.Name -notlike "virlog*.dat" } |
+                Sort-Object LastWriteTime -Descending | Select-Object -First 20)
+            foreach ($el in (@($esetKey) + @($esetOther))) {
+                Copy-ForensicFile -SourcePath $el.FullName -DestDir $esetDestDir
+                $esetCount++
+            }
         }
-        Log-Success "Collected $($esetLogs.Count) ESET log(s)."
+        Log-Success "Collected $esetCount ESET log(s)."
     }
 
     # --- Kaspersky ---
@@ -2722,7 +3701,7 @@ if ($Categories -contains "AntiVirus") {
         Log "Detected Kaspersky -- collecting logs..."
         $kaspDestDir = Join-Path $avDir "Kaspersky"
         Ensure-Directory $kaspDestDir
-        $kaspLogs = Get-ChildItem -Path $kaspLogDir -File -Recurse -ErrorAction SilentlyContinue |
+        $kaspLogs = Get-ChildItem -Path $kaspLogDir -File -Recurse -Force -ErrorAction SilentlyContinue |
             Where-Object { $_.Extension -in ".log", ".txt", ".rpt", ".csv" -and $_.Length -gt 0 } |
             Sort-Object LastWriteTime -Descending | Select-Object -First 20
         foreach ($kl in $kaspLogs) {
@@ -2732,17 +3711,24 @@ if ($Categories -contains "AntiVirus") {
     }
 
     # --- McAfee / Trellix ---
-    $mcafeeLogDir = "${script:TargetRoot}ProgramData\McAfee"
-    if (-not (Test-Path $mcafeeLogDir)) {
-        $mcafeeLogDir = "${script:TargetRoot}ProgramData\Trellix"
-    }
-    if (Test-Path $mcafeeLogDir) {
+    # Both folders are checked (Trellix-branded products can sit next to
+    # older McAfee ones). VirusScan logs in DesktopProtection\ (incl.
+    # AccessProtectionLog.txt, parsed by the timeline builder) always;
+    # everything else: newest 20.
+    $mcafeeLogDirs = @(
+        "${script:TargetRoot}ProgramData\McAfee",
+        "${script:TargetRoot}ProgramData\Trellix"
+    ) | Where-Object { Test-Path -LiteralPath $_ }
+    if ($mcafeeLogDirs) {
         Log "Detected McAfee/Trellix -- collecting logs..."
         $mcafeeDestDir = Join-Path $avDir "McAfee_Trellix"
         Ensure-Directory $mcafeeDestDir
-        $mcafeeLogs = Get-ChildItem -Path $mcafeeLogDir -File -Recurse -ErrorAction SilentlyContinue |
-            Where-Object { $_.Extension -in ".log", ".txt", ".csv" -and $_.Length -gt 0 } |
-            Sort-Object LastWriteTime -Descending | Select-Object -First 20
+        $mcafeeAll = @(Get-ChildItem -LiteralPath $mcafeeLogDirs -File -Recurse -Force -ErrorAction SilentlyContinue |
+            Where-Object { $_.Extension -in ".log", ".txt", ".csv" -and $_.Length -gt 0 })
+        $mcafeeKey = @($mcafeeAll | Where-Object { $_.Directory.Name -eq "DesktopProtection" })
+        $mcafeeOther = @($mcafeeAll | Where-Object { $_.Directory.Name -ne "DesktopProtection" } |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 20)
+        $mcafeeLogs = @($mcafeeKey) + @($mcafeeOther)
         foreach ($ml in $mcafeeLogs) {
             Copy-ForensicFile -SourcePath $ml.FullName -DestDir $mcafeeDestDir
         }
@@ -2755,7 +3741,7 @@ if ($Categories -contains "AntiVirus") {
         Log "Detected Bitdefender -- collecting logs..."
         $bdDestDir = Join-Path $avDir "Bitdefender"
         Ensure-Directory $bdDestDir
-        $bdLogs = Get-ChildItem -Path $bdLogDir -File -Recurse -ErrorAction SilentlyContinue |
+        $bdLogs = Get-ChildItem -Path $bdLogDir -File -Recurse -Force -ErrorAction SilentlyContinue |
             Where-Object { $_.Extension -in ".log", ".txt", ".xml", ".csv" -and $_.Length -gt 0 } |
             Sort-Object LastWriteTime -Descending | Select-Object -First 20
         foreach ($bl in $bdLogs) {
@@ -2770,7 +3756,7 @@ if ($Categories -contains "AntiVirus") {
         Log "Detected Trend Micro -- collecting logs..."
         $tmDestDir = Join-Path $avDir "TrendMicro"
         Ensure-Directory $tmDestDir
-        $tmLogs = Get-ChildItem -Path $tmLogDir -File -Recurse -ErrorAction SilentlyContinue |
+        $tmLogs = Get-ChildItem -Path $tmLogDir -File -Recurse -Force -ErrorAction SilentlyContinue |
             Where-Object { $_.Extension -in ".log", ".txt", ".csv" -and $_.Length -gt 0 } |
             Sort-Object LastWriteTime -Descending | Select-Object -First 20
         foreach ($tl in $tmLogs) {
@@ -2785,7 +3771,7 @@ if ($Categories -contains "AntiVirus") {
         Log "Detected Webroot -- collecting logs..."
         $wrDestDir = Join-Path $avDir "Webroot"
         Ensure-Directory $wrDestDir
-        $wrLogs = Get-ChildItem -Path $wrLogDir -File -Recurse -ErrorAction SilentlyContinue |
+        $wrLogs = Get-ChildItem -Path $wrLogDir -File -Recurse -Force -ErrorAction SilentlyContinue |
             Where-Object { $_.Extension -in ".log", ".txt", ".csv" -and $_.Length -gt 0 } |
             Sort-Object LastWriteTime -Descending | Select-Object -First 20
         foreach ($wl in $wrLogs) {
@@ -2803,7 +3789,7 @@ if ($Categories -contains "AntiVirus") {
         Log "Detected Norton -- collecting logs..."
         $nortonDestDir = Join-Path $avDir "Norton"
         Ensure-Directory $nortonDestDir
-        $nortonLogs = Get-ChildItem -Path $nortonLogDir -File -Recurse -ErrorAction SilentlyContinue |
+        $nortonLogs = Get-ChildItem -Path $nortonLogDir -File -Recurse -Force -ErrorAction SilentlyContinue |
             Where-Object { $_.Extension -in ".log", ".txt", ".csv" -and $_.Length -gt 0 } |
             Sort-Object LastWriteTime -Descending | Select-Object -First 20
         foreach ($nl in $nortonLogs) {
@@ -2818,7 +3804,7 @@ if ($Categories -contains "AntiVirus") {
         Log "Detected Cylance -- collecting logs..."
         $cylDestDir = Join-Path $avDir "Cylance"
         Ensure-Directory $cylDestDir
-        $cylLogs = Get-ChildItem -Path $cylLogDir -File -Recurse -ErrorAction SilentlyContinue |
+        $cylLogs = Get-ChildItem -Path $cylLogDir -File -Recurse -Force -ErrorAction SilentlyContinue |
             Where-Object { $_.Length -gt 0 } |
             Sort-Object LastWriteTime -Descending | Select-Object -First 20
         foreach ($cl in $cylLogs) {
@@ -2847,10 +3833,10 @@ $script:collectionCompleted = $true
 }
 
 # =============================================================
-# Collected copies keep the attributes of their source. Compress-Archive
-# in Windows PowerShell 5.1 silently leaves out hidden files (NTUSER.DAT,
-# UsrClass.dat, hive .LOG1/.LOG2, ...), so clear Hidden/System on
-# everything in the collection folder.
+# Collected copies keep the attributes of their source. Clear Hidden/System
+# on everything in the collection folder so nothing in the zip (NTUSER.DAT,
+# UsrClass.dat, hive .LOG1/.LOG2, ...) extracts as hidden, and older
+# zip tools that skip hidden files still include them.
 # =============================================================
 try {
     $hiddenMask = [int][System.IO.FileAttributes]::Hidden -bor [int][System.IO.FileAttributes]::System
@@ -2877,7 +3863,12 @@ try {
 $endTime = Get-Date
 $duration = $endTime - $script:startTime
 $zipPath = "$OutputPath.zip"
-$memDumpFile = Join-Path $OutputPath "Memory\memory_dump.raw"
+# Memory dump, if captured: memory_dump.dmp (DumpIt) or memory_dump.raw
+$memDumpFile = $null
+foreach ($dumpExt in @("dmp", "raw")) {
+    $dumpCandidate = Join-Path $OutputPath "Memory\memory_dump.$dumpExt"
+    if ((Get-FileLength $dumpCandidate) -ge 0) { $memDumpFile = $dumpCandidate; break }
+}
 $memDumpMovedTo = $null
 
 $summaryLines = @(
@@ -2897,8 +3888,8 @@ if ($NoCompress) {
     $summaryLines += "  Output:         $OutputPath"
 } else {
     $summaryLines += "  Output:         $zipPath"
-    if ((Get-FileLength $memDumpFile) -ge 0) {
-        $summaryLines += "  Memory dump:    ${OutputPath}_memory_dump.raw (kept outside the zip)"
+    if ($memDumpFile) {
+        $summaryLines += "  Memory dump:    ${OutputPath}_$(Split-Path $memDumpFile -Leaf) (kept outside the zip)"
     }
 }
 $summaryLines += "  Manifest:       collection_manifest.csv (inside collection)"
@@ -2917,12 +3908,13 @@ if (-not $NoCompress) {
     Log "  COMPRESSING OUTPUT"
     Log "============================================================="
 
-    # Check for memory dump -- too large for Compress-Archive (>2 GB limit)
-    if ((Get-FileLength $memDumpFile) -ge 0) {
+    # Memory dump: kept next to the zip, not inside it (as large as RAM, slow
+    # to compress, and analysis tools need the file itself)
+    if ($memDumpFile) {
         $dumpSizeGB = [math]::Round((Get-FileLength $memDumpFile) / 1GB, 2)
-        Log "Memory dump detected ($dumpSizeGB GB) -- excluding from zip (too large)."
+        Log "Memory dump detected ($dumpSizeGB GB) -- keeping it next to the zip."
         # Move dump out of the collection folder temporarily
-        $memDumpMovedTo = "${OutputPath}_memory_dump.raw"
+        $memDumpMovedTo = "${OutputPath}_$(Split-Path $memDumpFile -Leaf)"
         Move-Item -LiteralPath $memDumpFile -Destination $memDumpMovedTo -Force
         # Remove empty Memory folder if only the dump was in it
         $memDir = Join-Path $OutputPath "Memory"
@@ -2934,7 +3926,12 @@ if (-not $NoCompress) {
 
     Log "Compressing to: $zipPath"
     try {
-        Compress-Archive -LiteralPath $OutputPath -DestinationPath $zipPath -Force -ErrorAction Stop
+        # ZipFile instead of Compress-Archive: Compress-Archive in Windows
+        # PowerShell 5.1 fails on files over 2 GB (a large raw $MFT) and skips
+        # hidden files; ZipFile writes Zip64 and includes everything
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        if ([System.IO.File]::Exists($zipPath)) { [System.IO.File]::Delete($zipPath) }
+        [System.IO.Compression.ZipFile]::CreateFromDirectory($OutputPath, $zipPath, [System.IO.Compression.CompressionLevel]::Optimal, $true)
         $zipSize = [math]::Round((Get-FileLength $zipPath) / 1MB, 2)
         Log-Success "Compressed to $zipPath ($zipSize MB)"
 
@@ -2957,7 +3954,7 @@ if (-not $NoCompress) {
         if ($memDumpMovedTo -and (Test-Path -LiteralPath $memDumpMovedTo)) {
             $memDir = Join-Path $OutputPath "Memory"
             Ensure-Directory $memDir
-            Move-Item -LiteralPath $memDumpMovedTo -Destination (Join-Path $memDir "memory_dump.raw") -Force
+            Move-Item -LiteralPath $memDumpMovedTo -Destination $memDumpFile -Force
         }
     }
 }

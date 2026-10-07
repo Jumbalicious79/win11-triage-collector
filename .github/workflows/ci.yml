@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  parse:
+    # The .bat launchers run the scripts in Windows PowerShell 5.1, so both
+    # editions must parse every script
+    name: Parse (${{ matrix.shell }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shell: [powershell, pwsh]
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parse all scripts
+        run: |
+          $root = (Get-Location).Path
+          $failed = $false
+          foreach ($file in Get-ChildItem -Path . -Filter *.ps1 -Recurse) {
+              $errors = $null
+              [void][System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$null, [ref]$errors)
+              $relPath = $file.FullName.Substring($root.Length + 1).Replace('\', '/')
+              foreach ($e in $errors) {
+                  Write-Host "::error file=$relPath,line=$($e.Extent.StartLineNumber)::$($e.Message)"
+                  $failed = $true
+              }
+          }
+          if ($failed) { exit 1 }
+          Write-Host "All scripts parse in PowerShell $($PSVersionTable.PSVersion)"
+
+  analyze:
+    name: PSScriptAnalyzer
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run PSScriptAnalyzer (errors only)
+        run: |
+          if (-not (Get-Module -ListAvailable -Name PSScriptAnalyzer)) {
+              Install-Module -Name PSScriptAnalyzer -Scope CurrentUser -Force
+          }
+          $version = (Get-Module -ListAvailable -Name PSScriptAnalyzer | Sort-Object Version -Descending | Select-Object -First 1).Version
+          $files = @(Get-ChildItem -Path . -Filter *.ps1 -Recurse)
+          if ($files.Count -eq 0) { Write-Host "::error::No .ps1 files found to analyze"; exit 1 }
+          Write-Host "PSScriptAnalyzer $version -- analyzing $($files.Count) script(s): $($files.Name -join ', ')"
+
+          # Run all rules so the log shows the full picture; only errors fail the build
+          $results = @(foreach ($f in $files) { Invoke-ScriptAnalyzer -Path $f.FullName })
+          foreach ($group in ($results | Group-Object Severity)) {
+              Write-Host "  $($group.Name): $($group.Count)"
+          }
+          $failing = @($results | Where-Object { "$($_.Severity)" -in @('Error', 'ParseError') })
+          foreach ($r in $failing) {
+              Write-Host "::error file=$($r.ScriptName),line=$($r.Line)::$($r.RuleName): $($r.Message)"
+          }
+          if ($failing.Count -gt 0) { exit 1 }
+          Write-Host "PSScriptAnalyzer: $($results.Count) finding(s), none at error level"

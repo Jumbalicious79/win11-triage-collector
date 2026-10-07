@@ -8,7 +8,7 @@ Designed to be used with win11-timeline-builder, which parses this script's
 output into a unified chronological timeline and auto-opens it in Timeline
 Explorer. Both tools are available as separate repos for independent use.
 
-  Companion project: https://github.com/<your-org>/win11-timeline-builder
+  Companion project: https://github.com/Jumbalicious79/win11-timeline-builder
 
 Tested on Windows 11 Home Build 26200. Collects ~600 files in ~90 seconds,
 compresses to ~65 MB. Supports live system collection and mounted forensic
@@ -43,8 +43,8 @@ Required directory structure:
 
 To set up:
 
-  git clone https://github.com/<your-org>/win11-triage-collector
-  git clone https://github.com/<your-org>/win11-timeline-builder
+  git clone https://github.com/Jumbalicious79/win11-triage-collector
+  git clone https://github.com/Jumbalicious79/win11-timeline-builder
 
 Or download both repos and extract them into the same parent folder. The parent
 folder can be anywhere -- your desktop, a USB drive, a network share, etc.
@@ -101,13 +101,17 @@ is not the live system drive and switches to MOUNTED IMAGE mode:
     - Event logs (from Windows\System32\winevt\Logs\)
     - Prefetch files, browser data, user activity artifacts
     - Scheduled task XML definitions (from Windows\System32\Tasks\)
+    - Startup folder listings (all-users folder + every user profile)
     - AV log files (Defender support logs, third-party AV logs)
-    - USB setupapi.dev.log
-    - Amcache.hve
+    - USB setupapi.dev.log and rotated setupapi.dev.<date>.log files
+    - Amcache.hve (+ .LOG1/.LOG2 transaction logs)
 
   Skipped (requires live system):
     - Network state (DNS, ARP, TCP connections, firewall, Wi-Fi)
-    - Live registry queries (Run keys, BAM, USB registry, mounted devices)
+    - Live registry queries (Run keys, BAM, RecentApps, USB registry,
+      mounted devices) -- the same data is in the collected hives
+    - USB PnP device timestamps (usb_storage_devices.csv)
+    - Scheduled task run times (scheduled_tasks.csv)
     - WMI queries (services, startup commands, drivers, WMI subscriptions)
     - Defender cmdlets (detections, status, preferences)
     - Shadow copies (not needed -- files are not locked)
@@ -142,10 +146,13 @@ needed -- plug in, double-click, collect, analyze.
 ### Double-click (recommended)
 
   Run-TriageCollector.bat              -- collect from C: (live system)
-  Run-TriageCollector.bat fast         -- skip large files ($MFT, hives)
+  Run-TriageCollector.bat fast         -- skip the USN journal export
   Run-TriageCollector.bat nozip        -- don't compress output
   Run-TriageCollector.bat E            -- collect from E: (mounted image)
-  Run-TriageCollector.bat E fast       -- collect from E:, skip large files
+  Run-TriageCollector.bat E fast       -- collect from E:, skip the USN journal
+
+  Note: "fast" skips the USN journal, which is the timeline builder's largest
+  source of file activity. Registry hives are always collected.
 
   For memory capture: place winpmem.exe in tools\winpmem\ directory.
   The script prompts on live system runs when a capture tool is detected.
@@ -168,7 +175,8 @@ tools do. This script handles it automatically:
 
   1. Adds a temporary Defender exclusion for the output folder at script start
   2. Collects all 4 hives (SYSTEM, SOFTWARE, SAM, SECURITY) via "reg save"
-  3. Removes the exclusion at script end
+  3. Removes the exclusion at script end -- also when the run is stopped
+     with Ctrl+C or ends with an error
 
 This is the same approach KAPE uses. The script runs as Administrator, so it has
 the privileges to manage Defender exclusions. You do NOT need to manually disable
@@ -201,14 +209,16 @@ Use -NoCompress to keep the uncompressed folder instead.
 Inside the zip:
 
   TriageCollection_2026-04-08_08-04\
+    collection_info.json              -- host, mode, start time, time zones
     collection_log.txt                -- full run log
-    collection_manifest.csv           -- SHA256 hash, source, dest, size per file
+    collection_manifest.csv           -- SHA256, source, dest, size, source file
+                                         times per file (see Output File Formats)
     systeminfo.txt                    -- system info snapshot
     Memory\                               -- only if memory capture was selected
       memory_dump.raw                 -- full RAM dump (saved separately, not in zip)
       memory_acquisition_log.txt      -- capture tool output log
     FileSystem\
-      $UsnJrnl_$J.csv                -- USN Journal (file change log)
+      $UsnJrnl_$J.txt                 -- USN Journal (fsutil CSV-style text)
     Registry\
       SYSTEM                          -- hardware, services, USB history, timezone
       SOFTWARE                        -- installed apps, network profiles, Run keys
@@ -228,8 +238,10 @@ Inside the zip:
       (Sysmon, Task Scheduler -- if present on the system)
     Execution\
       Prefetch\                       -- all .pf files (program execution evidence)
-      RecentApps.txt                  -- recently launched apps with timestamps
-      bam_entries.txt                 -- Background Activity Moderator data
+      RecentApps\<user>\RecentApps.reg  -- per logged-in user, only if the key
+                                         exists (absent on Windows 11)
+      bam_entries.csv                 -- BAM: per-user program paths with
+                                         decoded last-execution times (UTC)
       appcompat_cache.reg             -- ShimCache execution artifacts
     Network\
       dns_cache.txt                   -- recently resolved domains
@@ -252,16 +264,30 @@ Inside the zip:
       (Firefox -- if installed)
     USB\
       setupapi.dev.log                -- device installation log (first-connect times)
+      setupapi.dev.<yyyymmdd_hhmmss>.log  -- older logs rotated by Windows
+                                         (all present are collected)
+      usb_storage_devices.csv         -- USB storage devices (incl. disconnected)
+                                         with first install / arrival / removal
+                                         times (UTC)
       usb_storage_devices.txt         -- USB storage device registry entries
       usb_devices.txt                 -- all USB device entries
       mounted_devices.txt             -- volume GUID to drive letter mapping
     Persistence\
-      scheduled_tasks.csv             -- all scheduled tasks with actions/triggers
-      services.csv                    -- all services with binary paths
+      scheduled_tasks.csv             -- all scheduled tasks (incl. disabled) with
+                                         run-as account, actions, triggers,
+                                         registration/last/next run times
+      services.csv                    -- all services with binary paths and
+                                         registry key last-write time
       startup_entries.csv             -- startup programs
-      run_keys.txt                    -- Run/RunOnce registry keys
+      run_keys.csv                    -- Run/RunOnce values for HKLM and every
+                                         logged-in user, with key last-write time
+      run_keys.txt                    -- same keys (plus Shell Folders) as text
+      startup_folders.csv             -- Startup folder items for all users and
+                                         every profile, with file times (UTC)
+      startup_folders.txt             -- same folders as text
       wmi_subscriptions.csv           -- WMI event consumers (persistence)
-      drivers.csv                     -- loaded kernel drivers
+      drivers.csv                     -- kernel drivers with registry key
+                                         last-write time
       loaded_dlls_suspicious.txt      -- DLLs loaded from non-standard paths
     AntiVirus\
       installed_av_products.txt       -- all AV products detected via WMI
@@ -300,10 +326,13 @@ Inside the zip:
 ### FileSystem
 
   $UsnJrnl:$J   File change journal -- every create, modify, delete, rename.
-                Critical for timeline building. Collected via fsutil in CSV.
+                Critical for timeline building. Collected via "fsutil usn
+                readjournal ... csv" into FileSystem\$UsnJrnl_$J.txt.
   $MFT          Master File Table with all file records including deleted.
-                Requires VSS shadow copy -- may not succeed on all systems.
-  $LogFile      NTFS transaction log. Requires VSS.
+                NTFS metafile -- needs a raw-disk reader (see Known
+                Limitations); normally not collected.
+  $LogFile      NTFS transaction log. Same limitation as $MFT.
+  -SkipLargeFiles ("fast") skips the USN journal export.
 
 ### Registry Hives
 
@@ -332,9 +361,14 @@ Inside the zip:
 ### Execution Artifacts
 
   Prefetch (.pf)             Last 8 execution times per program.
-  BAM                        Background Activity Moderator execution times.
+  BAM                        Background Activity Moderator: last execution
+                             time per program per user (all user SIDs, decoded
+                             to UTC in bam_entries.csv). Live system only.
   AppCompatCache             ShimCache -- program presence/execution evidence.
-  RecentApps                 Recently launched apps with run counts.
+  RecentApps                 Recently launched apps with run counts, for every
+                             logged-in user. The key does not exist on Windows
+                             11 and recent Windows 10 builds; nothing is written
+                             then.
 
 ### Network
 
@@ -360,18 +394,35 @@ Inside the zip:
 
 ### USB
 
-  setupapi.dev.log           Device install timestamps (first USB connect).
+  setupapi.dev*.log          Device install timestamps (first USB connect).
+                             Windows rotates setupapi.dev.log into
+                             setupapi.dev.<yyyymmdd_hhmmss>.log files; all of
+                             them are collected with their original names.
+  USB storage PnP times      usb_storage_devices.csv: every USB storage disk
+                             known to Plug and Play, including devices that are
+                             not connected, with first install, install, last
+                             arrival and last removal times. Live system only.
   USB storage/device registry  Serial numbers, vendor IDs, mount points.
   Mounted devices            Volume GUID to drive letter mapping.
 
 ### Persistence
 
-  Scheduled tasks            Common persistence mechanism with actions.
-  Services                   Service binary paths and startup types.
+  Scheduled tasks            All tasks, including disabled ones, with run-as
+                             account, actions, triggers, registration date and
+                             last/next run time and last result.
+  Services                   Service binary paths, startup types, accounts, and
+                             last-write time of each service's registry key.
   Startup entries            Registry and folder-based autostart.
-  Run/RunOnce keys           Registry autostart keys.
+  Run/RunOnce keys           Registry autostart keys for HKLM and for every
+                             logged-in user (not just the account running the
+                             collector), with key last-write times.
+  Startup folders            All-users Startup folder and every user profile's
+                             Startup folder (live system and mounted images),
+                             with created/modified times. Hidden items are
+                             listed; desktop.ini is skipped.
   WMI subscriptions          Event-driven persistence.
-  Drivers                    Kernel and filesystem drivers.
+  Drivers                    Kernel and filesystem drivers, with last-write
+                             time of each driver's registry key.
   Loaded DLLs               DLLs from non-standard paths (sideloading).
 
 ### AntiVirus / Endpoint Security
@@ -386,6 +437,129 @@ Inside the zip:
                              Webroot, Norton, Cylance.
   AV event logs              Windows event logs from AV products (Symantec,
                              CrowdStrike) collected via wevtutil if present.
+
+
+## Output File Formats
+
+All times in the JSON and CSV files below are UTC in ISO 8601 round-trip
+format, e.g. 2026-10-07T01:52:50.0000000Z. A blank field means the time is
+unknown or does not apply. CSV files are UTF-8 with a header row and standard
+quoting (Import-Csv, Excel and Timeline Explorer read them directly). A CSV
+with only a header row means the query ran and found nothing.
+
+### collection_info.json
+
+Written at the start of the run, at the root of the collection:
+
+  SchemaVersion        1
+  ComputerName         Machine running the collector
+  CollectorUser        Account that ran the collector
+  Mode                 "Live" or "MountedImage"
+  TargetDrive          Drive letter collected from, e.g. "C"
+  TargetRoot           Windows root on that drive, e.g. "C:\"
+  CollectionStartUtc   Start of the run
+  CollectorTimeZoneId  Time zone of the collecting machine
+  CollectorCulture     Culture (locale) of the collecting machine, e.g. "en-US"
+  TargetTimeZoneId     Time zone of the examined Windows install. Live: same
+                       as CollectorTimeZoneId. Mounted image: TimeZoneKeyName
+                       from the image's SYSTEM hive, or null if unreadable.
+
+The timeline builder uses these to convert local-time text (USN journal,
+setupapi logs) correctly even when the analysis machine uses a different
+time zone or locale.
+
+### collection_manifest.csv
+
+  SHA256               Hash of the collected copy
+  SourcePath           Original path; "HKLM\..." / "HKU\..." for reg save,
+                       "(shadow)..." for shadow copies, "(command: ...)" for
+                       command output
+  DestPath             Full path of the copy at collection time
+  SizeBytes            Size of the copy
+  CollectedAt          Collector's local time when the file was recorded
+  RelativePath         Path inside the collection, e.g.
+                       Execution\Prefetch\CMD.EXE-0BD30981.pf
+  SourceCreatedUtc     Created / modified / accessed times of the ORIGINAL
+  SourceModifiedUtc    file (the copies in the collection get new times).
+  SourceAccessedUtc    Blank for command output, reg save exports, or unknown.
+
+The first five columns are unchanged from earlier versions; the last four are
+appended.
+
+### Execution\bam_entries.csv  (live system only)
+
+  Sid                  SID of the user the BAM entry belongs to
+  User                 Account name (profile folder name), blank if unknown
+  Path                 Program path as recorded by BAM
+                       (\Device\HarddiskVolumeN\...) or app ID
+  LastExecutionUtc     Last execution time
+
+Replaces bam_entries.txt from earlier versions, which lost the times (only the
+first 4 of the 8 FILETIME bytes were written).
+
+### Persistence\scheduled_tasks.csv  (live system only)
+
+  TaskName, TaskPath, State, Author
+  UserId               Account the task runs as (group name for group tasks)
+  Actions              Command lines; COM handler actions as
+                       "ComHandler {CLSID} <data>"
+  Triggers             Trigger types
+  RegistrationDateUtc  Task registration date (RegistrationInfo Date,
+                       recorded in the system's local time); blank if not set
+  LastRunTimeUtc       Blank if the task never ran
+  NextRunTimeUtc       Blank if nothing is scheduled
+  LastTaskResult       Result code of the last run (decimal; 0 = success,
+                       267011 = has not run yet)
+
+Disabled tasks are included (State = Disabled). On mounted images the task
+XML files are collected instead (Persistence\ScheduledTasks_XML\).
+
+### Persistence\services.csv and drivers.csv  (live system only)
+
+Same columns as before plus KeyLastWriteUtc: last-write time of
+HKLM\SYSTEM\CurrentControlSet\Services\<Name>. A recent time can point to a
+newly installed or changed service or driver, but Windows also updates these
+keys during normal operation (updates, start type changes), so treat it as a
+lead, not proof.
+
+### Persistence\run_keys.csv  (live system only)
+
+  Hive                 "HKLM" or "HKU\<SID>"
+  User                 Account name for HKU rows (blank for HKLM)
+  KeyPath              Path relative to the hive, e.g.
+                       SOFTWARE\Microsoft\Windows\CurrentVersion\Run
+  ValueName            Value name ("(Default)" for the default value)
+  Command              Value data as stored (environment variables such as
+                       %USERPROFILE% are not expanded)
+  KeyLastWriteUtc      Last-write time of the key (the whole key, not the
+                       single value)
+
+Keys covered, for HKLM and for every loaded user hive (local and Entra ID
+accounts): Run, RunOnce, WOW6432Node Run/RunOnce, Policies\Explorer\Run.
+run_keys.txt lists the same keys plus Shell Folders / User Shell Folders.
+
+### Persistence\startup_folders.csv  (live system and mounted images)
+
+  Scope                "AllUsers" or "User"
+  User                 Profile folder name (blank for AllUsers)
+  Folder               Full path of the Startup folder
+  Name                 File or folder name (desktop.ini skipped)
+  CreatedUtc           Created time of the item
+  ModifiedUtc          Modified time of the item
+
+### USB\usb_storage_devices.csv  (live system only)
+
+  FriendlyName         e.g. "PNY USB 3.1 FD USB Device"
+  InstanceId           USBSTOR\DISK&VEN_...&PROD_...&REV_...\<serial>&0
+  Serial               Last part of the instance ID without the "&0" suffix
+                       (if its second character is "&", Windows generated it
+                       because the device reports no serial number)
+  FirstInstallUtc      First time the device was installed on this system
+  InstallUtc           Last (re)install time
+  LastArrivalUtc       Last time the device was connected
+  LastRemovalUtc       Last time the device was removed
+
+Devices that are no longer connected are included.
 
 
 ## Analyzing the Output
@@ -407,7 +581,7 @@ The fastest path from collection to analysis:
   The timeline builder produces both CSV (full data) and Excel (color-coded).
   It parses only the triage collection data -- never queries the local system.
 
-  Companion project: https://github.com/<your-org>/win11-timeline-builder
+  Companion project: https://github.com/Jumbalicious79/win11-timeline-builder
 
 ### With Eric Zimmerman's Tools (manual deep-dive)
 
@@ -435,11 +609,21 @@ The fastest path from collection to analysis:
 
 ## Known Limitations and Expected Warnings
 
-  - $MFT and $LogFile require Volume Shadow Copy. On some systems (Windows 11
-    Home, certain storage configs), VSS may not produce usable copies. The USN
-    Journal is collected via fsutil as a reliable alternative.
-    Warning: "Shadow copy of $MFT did not produce output file"
-    Warning: "$MFT collection requires Volume Shadow Copy or a raw disk reader"
+  - $MFT and $LogFile are NTFS metafiles. They cannot be read through normal
+    file copy APIs, not even from a Volume Shadow Copy, so this script does
+    not get them. Collecting them needs a raw-disk reader (e.g., FTK Imager)
+    or a full disk image. The USN Journal is collected via fsutil instead and
+    is the timeline builder's main source of file activity.
+
+  - Per-user live registry data (Run/RunOnce keys, RecentApps) covers every
+    user whose hive is loaded, i.e. users logged in at collection time, not
+    only the account running the collector. For users who are not logged in,
+    the same keys are in their NTUSER.DAT under Registry\<user>\.
+
+  - The temporary Defender exclusion and the shadow copy are removed even if
+    the run is stopped with Ctrl+C or ends with an error. If the console
+    window is closed or the machine loses power mid-run, cleanup may not get
+    to run: check Windows Security exclusions and "vssadmin list shadows".
 
   - NTUSER.DAT and UsrClass.dat for the active user are locked. The script
     tries reg save via HKU\SID (works for logged-in users), then VSS shadow
@@ -450,8 +634,11 @@ The fastest path from collection to analysis:
     these are not real user accounts and contain minimal forensic data.
     Warning: "Shadow copy of Users\WsiAccount\NTUSER.DAT did not produce output"
 
-  - Amcache.hve transaction logs (.LOG1/.LOG2) may fail to collect if locked.
-    If the hive is dirty without logs, the timeline builder skips Amcache
+  - Hidden files are collected, including the Amcache.hve transaction logs
+    (.LOG1/.LOG2) and the hidden NTUSER.DAT / UsrClass.dat of users who are
+    not logged in. (Earlier versions copied hidden files and then deleted
+    them as "empty".) The Amcache logs can still fail to collect if locked;
+    if the hive is dirty without logs, the timeline builder skips Amcache
     parsing for that collection.
     Warning: "Could not copy (locked): ...Amcache.hve.LOG1"
 
@@ -494,7 +681,10 @@ the mounted image for a non-invasive collection.
                    collection methods accordingly.
   -OutputPath      Where to save collected artifacts.
                    Default: reports\TriageCollection_<timestamp>
-  -SkipLargeFiles  Skip $MFT and large file collection for faster runs.
+  -SkipLargeFiles  Skip the USN journal export ($UsnJrnl:$J) for faster
+                   runs ("fast" in the .bat). The USN journal is the
+                   timeline builder's largest source. Registry hives are
+                   still collected.
   -NoCompress      Keep uncompressed folder (don't zip and delete).
   -Categories      Specific categories to collect. Default: all (except Memory).
                    Valid: Memory, FileSystem, Registry, EventLogs, Execution,
@@ -589,9 +779,16 @@ are downloaded, bundled, or required.
                        not available on Windows 11 Home.
 
   PowerShell cmdlets   Get-CimInstance (WMI queries), Get-ScheduledTask,
+                       Get-ScheduledTaskInfo (task run times),
+                       Get-PnpDevice / Get-PnpDeviceProperty (USB device
+                       install/arrival/removal times),
                        Get-NetTCPConnection, Get-DnsClientCache,
                        Get-NetFirewallRule, Add/Remove-MpPreference
                        (Defender exclusion management).
+
+  RegQueryInfoKey      Windows API (advapi32.dll), called through a small
+  (Add-Type)           Add-Type definition to read registry key last-write
+                       times (services, drivers, Run keys).
 
 
 ## Credits and Acknowledgments
@@ -638,4 +835,7 @@ This script is read-only by design, with these minimal exceptions:
   - Creates the output directory and files (in reports\ next to the script)
   - Creates and removes a Volume Shadow Copy snapshot (for locked file access)
   - Adds and removes a temporary Windows Defender exclusion (output path only)
-  - All modifications are cleaned up at script end
+  - Compiles a small Add-Type helper (registry key times); Windows PowerShell
+    writes and deletes temporary compiler files in %TEMP% for this
+  - All modifications are cleaned up at script end, also when the run is
+    stopped with Ctrl+C or ends with an error

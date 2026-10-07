@@ -516,6 +516,12 @@ function Copy-ForensicFile {
                 Log "Collected from shadow copy (file in use): $SourcePath"
                 return
             }
+            # Not in the shadow copy (created after it was taken) or no shadow
+            # copy possible: read the file straight from the volume
+            if (Copy-TriageRawFile -SourcePath $SourcePath -DestPath $destPath -SourceTimes $srcTimes) {
+                Log "Collected by raw NTFS read (file in use, not available from a shadow copy): $SourcePath"
+                return
+            }
             # SQLite journal/WAL companions (History-journal, Cookies-journal,
             # places.sqlite-wal, ...) can be created after the shadow copy was
             # taken: not an error
@@ -523,7 +529,7 @@ function Copy-ForensicFile {
                 Log "Skipped (in use, not in the shadow copy; temporary database journal): $SourcePath"
                 return
             }
-            Log-Warning "Could not copy (locked, shadow copy also failed): $SourcePath"
+            Log-Warning "Could not copy (locked; shadow copy and raw NTFS read also failed): $SourcePath"
             $script:errorCount++
             return
         }
@@ -770,6 +776,11 @@ function Invoke-CollectionCleanup {
         Remove-ShadowCopy
     } catch {
         Log-Warning "Could not remove shadow copy: $($_.Exception.Message)"
+    }
+    # Volume handle of the raw NTFS read fallback (opened on first use)
+    if ($script:rawFileReader) {
+        try { $script:rawFileReader.Dispose() } catch { Write-Verbose "Closing the raw NTFS reader: $($_.Exception.Message)" }
+        $script:rawFileReader = $null
     }
     if ($script:defenderExclusionAdded) {
         Log "Removing temporary Defender exclusion..."
@@ -1357,6 +1368,78 @@ namespace TriageNtfs
             return -1;
         }
 
+        // Directory index for path lookups: "parent record|UPPER-CASE NAME" ->
+        // record. Built once, on the first ResolvePath call, from the
+        // $FILE_NAME attributes of all in-use records (an extension record's
+        // names belong to its base record). Win32, DOS (8.3) and POSIX names
+        // and hard links all get their own entry.
+        private Dictionary<string, long> nameIndex;
+
+        public int IndexedNames { get { return nameIndex == null ? 0 : nameIndex.Count; } }
+
+        private static string IndexKey(long parentRecord, string name)
+        {
+            return parentRecord.ToString(System.Globalization.CultureInfo.InvariantCulture) + "|" + name.ToUpperInvariant();
+        }
+
+        private void BuildNameIndex()
+        {
+            Dictionary<string, long> index = new Dictionary<string, long>(StringComparer.Ordinal);
+            long total = RecordCount;
+            int perChunk = Math.Max(1, chunkSize / recordSize);
+            byte[] chunk = new byte[perChunk * recordSize];
+            for (long first = 0; first < total; first += perChunk)
+            {
+                int count = (int)Math.Min(perChunk, total - first);
+                ReadStreamBytes(mft, first * recordSize, chunk, 0, count * recordSize);
+                for (int i = 0; i < count; i++)
+                {
+                    int off = i * recordSize;
+                    if ((BitConverter.ToUInt16(chunk, off + 0x16) & 1) == 0) continue;
+                    if (!ApplyFixups(chunk, off, recordSize)) continue;
+                    MftRecord record;
+                    try
+                    {
+                        record = ParseRecord(chunk, off, first + i);
+                    }
+                    catch (InvalidDataException)
+                    {
+                        continue;
+                    }
+                    long owner = record.BaseRecord != 0 ? record.BaseRecord : record.Number;
+                    foreach (NtfsAttribute a in record.Attributes)
+                    {
+                        // $FILE_NAME: parent reference at 0, name length at 0x40, name at 0x42
+                        if (a.Type != FileNameType || a.NonResident || a.ResidentData == null || a.ResidentData.Length < 0x42) continue;
+                        byte[] value = a.ResidentData;
+                        int nameLength = value[0x40];
+                        if (0x42 + nameLength * 2 > value.Length) continue;
+                        long parent = BitConverter.ToInt64(value, 0) & RecordMask;
+                        string key = IndexKey(parent, Encoding.Unicode.GetString(value, 0x42, nameLength * 2));
+                        if (!index.ContainsKey(key)) index[key] = owner;
+                    }
+                }
+            }
+            nameIndex = index;
+        }
+
+        // MFT record of a file or folder from its path relative to the volume
+        // root (e.g. "Users\bob\NTUSER.DAT"), or -1 when a component is not
+        // found. Names compare case-insensitively, like NTFS on Windows.
+        public long ResolvePath(string relativePath)
+        {
+            if (relativePath == null) throw new ArgumentNullException("relativePath");
+            if (nameIndex == null) BuildNameIndex();
+            long current = 5;   // record 5 = root directory
+            foreach (string part in relativePath.Split(new char[] { '\\', '/' }, StringSplitOptions.RemoveEmptyEntries))
+            {
+                long next;
+                if (!nameIndex.TryGetValue(IndexKey(current, part), out next)) return -1;
+                current = next;
+            }
+            return current;
+        }
+
         public long CopyStreamToFile(NtfsStream stream, string path, bool allocatedOnly)
         {
             using (FileStream output = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.Read))
@@ -1846,6 +1929,65 @@ function Copy-TriageRawNtfsStream {
     } else {
         Log-Success "Collected $Label (raw NTFS): $sizeText"
     }
+}
+
+# Last-resort copy of a locked file straight from the volume (live system
+# only), used by Copy-ForensicFile when both a normal copy and the shadow
+# copy fail -- e.g. a file created after the shadow copy was taken, or a
+# machine where no shadow copy can be made. The raw NTFS reader looks the
+# path up in the $MFT (a name index built on first use, a few seconds) and
+# copies the file's data, which file locks don't prevent. Unlike a shadow
+# copy this is not a point-in-time snapshot: a file being written during the
+# read can come out inconsistent. NTFS-compressed and EFS-encrypted files
+# are not supported. Returns $true when the copy was made and recorded.
+$script:rawFileReader = $null
+$script:rawFileReaderUnavailable = $false
+
+function Copy-TriageRawFile {
+    param(
+        [string]$SourcePath,
+        [string]$DestPath,
+        $SourceTimes = $null
+    )
+    if (-not $script:IsLive -or $script:rawFileReaderUnavailable) { return $false }
+    $relPath = Get-TargetRelativePath $SourcePath
+    if (-not $relPath) { return $false }
+    if (-not (Initialize-TriageNtfsReader)) {
+        $script:rawFileReaderUnavailable = $true
+        return $false
+    }
+    if ($null -eq $script:rawFileReader) {
+        try {
+            $script:rawFileReader = [TriageNtfs.NtfsReader]::OpenVolume("\\.\${TargetDrive}:")
+        } catch {
+            Log-Warning "Raw NTFS read fallback for locked files unavailable: $(Get-TriageErrorMessage $_)"
+            $script:rawFileReaderUnavailable = $true
+            return $false
+        }
+    }
+    try {
+        $record = $script:rawFileReader.ResolvePath($relPath)
+        if ($record -lt 0) {
+            Write-Verbose "Raw NTFS read: $relPath not found in the MFT"
+            return $false
+        }
+        $stream = $script:rawFileReader.GetDataStream($record, "")
+        if ($null -eq $stream) {
+            Write-Verbose "Raw NTFS read: MFT record $record ($relPath) has no data stream"
+            return $false
+        }
+        $null = $script:rawFileReader.CopyStreamToFile($stream, $DestPath, $false)
+    } catch {
+        Log-Warning "Raw NTFS read of $SourcePath failed: $(Get-TriageErrorMessage $_)"
+        Remove-Item -LiteralPath $DestPath -Force -ErrorAction SilentlyContinue
+        return $false
+    }
+    if ((Get-FileLength $DestPath) -le 0) {
+        Remove-Item -LiteralPath $DestPath -Force -ErrorAction SilentlyContinue
+        return $false
+    }
+    Record-Manifest -SourcePath $SourcePath -DestPath $DestPath -SourceTimes $SourceTimes
+    return $true
 }
 
 # Raw $MFT, $LogFile and $UsnJrnl:$J (allocated part) of the target volume

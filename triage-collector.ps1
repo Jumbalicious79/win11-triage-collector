@@ -228,6 +228,9 @@ if ($script:IsLive -and ($Categories -notcontains "Memory")) {
 if (-not $OutputPath) {
     $OutputPath = Join-Path $PSScriptRoot "reports\TriageCollection_$timestamp"
 }
+# Use an absolute path: .NET file APIs resolve relative paths against the
+# process directory, not the PowerShell location
+$OutputPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputPath)
 
 # Create output directory structure
 New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null
@@ -235,31 +238,30 @@ New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null
 $logFile = Join-Path $OutputPath "collection_log.txt"
 $manifestFile = Join-Path $OutputPath "collection_manifest.csv"
 
-# Initialize manifest CSV
-"SHA256,SourcePath,DestPath,SizeBytes,CollectedAt" | Out-File -FilePath $manifestFile -Encoding utf8
+# Initialize manifest CSV (see Record-Manifest for the columns after CollectedAt).
+# UTF-8 with BOM on both 5.1 and 7, so Import-Csv in 5.1 reads it as UTF-8.
+[System.IO.File]::WriteAllText($manifestFile, "SHA256,SourcePath,DestPath,SizeBytes,CollectedAt,RelativePath,SourceCreatedUtc,SourceModifiedUtc,SourceAccessedUtc`r`n", (New-Object System.Text.UTF8Encoding($true)))
 
 # ----------------------------------------------------------
 # Defender Exclusion: add a temporary exclusion for the output
 # path so collecting SAM/SECURITY hives doesn't trigger the
-# Trojan:Win32/SAMDumpz detection. Removed at script end.
+# Trojan:Win32/SAMDumpz detection. Added as the first step of
+# the collection try block (below the helpers) and removed in
+# its finally block, so it is also removed on errors/Ctrl+C.
 # ----------------------------------------------------------
 $script:defenderExclusionAdded = $false
-if ($script:IsLive) {
-    try {
-        Add-MpPreference -ExclusionPath $OutputPath -ErrorAction Stop
-        $script:defenderExclusionAdded = $true
-    } catch {
-        # Will warn later when logging is available
-    }
-}
 
 function Remove-DefenderExclusion {
+    # Returns $true if the exclusion was removed (or none was added)
     if ($script:defenderExclusionAdded) {
         try {
             Remove-MpPreference -ExclusionPath $OutputPath -ErrorAction Stop
-        } catch {}
+        } catch {
+            return $false
+        }
         $script:defenderExclusionAdded = $false
     }
+    return $true
 }
 
 # ----------------------------------------------------------
@@ -271,28 +273,28 @@ function Log {
     param([string]$Message)
     $entry = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] $Message"
     Write-Host $entry
-    if ($script:logToFile) { Add-Content -Path $logFile -Value $entry -ErrorAction SilentlyContinue }
+    if ($script:logToFile) { Add-Content -LiteralPath $logFile -Value $entry -ErrorAction SilentlyContinue }
 }
 
 function Log-Warning {
     param([string]$Message)
     $entry = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] WARNING: $Message"
     Write-Host $entry -ForegroundColor Yellow
-    if ($script:logToFile) { Add-Content -Path $logFile -Value $entry -ErrorAction SilentlyContinue }
+    if ($script:logToFile) { Add-Content -LiteralPath $logFile -Value $entry -ErrorAction SilentlyContinue }
 }
 
 function Log-Error {
     param([string]$Message)
     $entry = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] ERROR: $Message"
     Write-Host $entry -ForegroundColor Red
-    if ($script:logToFile) { Add-Content -Path $logFile -Value $entry -ErrorAction SilentlyContinue }
+    if ($script:logToFile) { Add-Content -LiteralPath $logFile -Value $entry -ErrorAction SilentlyContinue }
 }
 
 function Log-Success {
     param([string]$Message)
     $entry = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] OK: $Message"
     Write-Host $entry -ForegroundColor Green
-    if ($script:logToFile) { Add-Content -Path $logFile -Value $entry -ErrorAction SilentlyContinue }
+    if ($script:logToFile) { Add-Content -LiteralPath $logFile -Value $entry -ErrorAction SilentlyContinue }
 }
 
 # ----------------------------------------------------------
@@ -300,9 +302,79 @@ function Log-Success {
 # ----------------------------------------------------------
 function Ensure-Directory {
     param([string]$Path)
-    if (-not (Test-Path $Path)) {
+    if (-not (Test-Path -LiteralPath $Path)) {
         New-Item -ItemType Directory -Path $Path -Force | Out-Null
     }
+}
+
+# ----------------------------------------------------------
+# Helpers: file size, original file times, manifest fields
+# ----------------------------------------------------------
+# Size of a file in bytes, or -1 if it does not exist. Uses FileInfo, which
+# sees hidden/system files (Get-Item without -Force does not) and does not
+# treat [ ] in the path as wildcards.
+function Get-FileLength {
+    param([string]$Path)
+    try {
+        $fi = New-Object System.IO.FileInfo($Path)
+        if ($fi.Exists) { return $fi.Length }
+    } catch {}
+    return -1
+}
+
+# Original Created/Modified/Accessed times (UTC) of a file, or $null if the
+# path is not an existing file (command output, registry paths, ...).
+# Read these BEFORE copying so the copy cannot change the access time.
+function Get-SourceFileTimesUtc {
+    param([string]$Path)
+    try {
+        if (-not $Path -or -not [System.IO.Path]::IsPathRooted($Path)) { return $null }
+        if (-not [System.IO.File]::Exists($Path)) { return $null }
+        return [PSCustomObject]@{
+            Created  = [System.IO.File]::GetCreationTimeUtc($Path)
+            Modified = [System.IO.File]::GetLastWriteTimeUtc($Path)
+            Accessed = [System.IO.File]::GetLastAccessTimeUtc($Path)
+        }
+    } catch {
+        return $null
+    }
+}
+
+# UTC time as ISO 8601 round-trip text; blank when unknown/unset
+function Format-UtcTime {
+    param($Value)
+    if ($null -eq $Value -or $Value -isnot [datetime]) { return "" }
+    if ($Value.Year -le 1601) { return "" }
+    return $Value.ToUniversalTime().ToString("o")
+}
+
+# Path relative to the collection root (no leading '\'), or "" if outside it
+function Get-CollectionRelativePath {
+    param([string]$Path)
+    try {
+        $root = [System.IO.Path]::GetFullPath($OutputPath).TrimEnd('\')
+        $full = [System.IO.Path]::GetFullPath($Path)
+        if ($full.StartsWith($root + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+            return $full.Substring($root.Length + 1)
+        }
+    } catch {}
+    return ""
+}
+
+# One CSV field, always quoted, embedded quotes doubled (same as Export-Csv)
+function ConvertTo-CsvField {
+    param($Value)
+    if ($null -eq $Value) { $Value = "" }
+    return '"' + ([string]$Value).Replace('"', '""') + '"'
+}
+
+# Relative path of a file under TargetRoot (for shadow copy access), or ""
+function Get-TargetRelativePath {
+    param([string]$Path)
+    if ($Path -and $script:TargetRoot -and $Path.StartsWith($script:TargetRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+        return $Path.Substring($script:TargetRoot.Length).TrimStart('\')
+    }
+    return ""
 }
 
 # ----------------------------------------------------------
@@ -320,56 +392,144 @@ function Copy-ForensicFile {
         [string]$DestName = ""
     )
 
-    if (-not (Test-Path $SourcePath)) {
+    # -LiteralPath: paths can contain [ ], which -Path treats as wildcards
+    if (-not $SourcePath -or -not (Test-Path -LiteralPath $SourcePath)) {
         return
     }
-
-    Ensure-Directory $DestDir
-
-    if (-not $DestName) {
-        $DestName = Split-Path $SourcePath -Leaf
-    }
-    $destPath = Join-Path $DestDir $DestName
 
     try {
-        # Try direct copy first
+        Ensure-Directory $DestDir
+
+        if (-not $DestName) {
+            $DestName = [System.IO.Path]::GetFileName($SourcePath)
+        }
+        $destPath = Join-Path $DestDir $DestName
+
+        # Keep destination paths under MAX_PATH: Windows PowerShell 5.1 cannot
+        # create longer ones. Long names (e.g. Recent .lnk files named after web
+        # searches) are shortened with a hash suffix; the full original path is
+        # kept in the manifest's SourcePath column. Names are also capped at
+        # 100 characters so the zip still extracts under a deeper folder
+        # (the timeline builder extracts into %TEMP%).
+        if ($DestName.Length -gt 100 -or $destPath.Length -gt 250) {
+            $ext = [System.IO.Path]::GetExtension($DestName)
+            $sha1 = New-Object System.Security.Cryptography.SHA1Managed
+            $nameHash = [System.BitConverter]::ToString($sha1.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($DestName))).Replace("-", "").Substring(0, 8)
+            $keep = [Math]::Min(100 - $ext.Length - 9, 250 - $DestDir.TrimEnd('\').Length - 1 - $ext.Length - 9)
+            if ($keep -lt 8) { $keep = 8 }
+            $baseName = [System.IO.Path]::GetFileNameWithoutExtension($DestName)
+            if ($baseName.Length -gt $keep) { $baseName = $baseName.Substring(0, $keep) }
+            $DestName = "$baseName~$nameHash$ext"
+            $destPath = Join-Path $DestDir $DestName
+        }
+
+        # Original file times, read before the copy can update the access time
+        $srcTimes = Get-SourceFileTimesUtc $SourcePath
+    } catch {
+        Log-Warning "Could not copy: $SourcePath -- $($_.Exception.Message)"
+        $script:errorCount++
+        return
+    }
+
+    $copyError = $null
+    try {
+        # Try direct copy first (also reads hidden/system files)
         [System.IO.File]::Copy($SourcePath, $destPath, $true)
-        Record-Manifest -SourcePath $SourcePath -DestPath $destPath
+        Record-Manifest -SourcePath $SourcePath -DestPath $destPath -SourceTimes $srcTimes
         return
     } catch {
-        # File is locked, try standard Copy-Item as fallback
-        try {
-            Copy-Item -Path $SourcePath -Destination $destPath -Force -ErrorAction Stop
-            Record-Manifest -SourcePath $SourcePath -DestPath $destPath
-            return
-        } catch {
-            Log-Warning "Could not copy (locked): $SourcePath"
+        $copyError = $_.Exception
+        while ($copyError.InnerException -and $copyError -is [System.Management.Automation.MethodInvocationException]) {
+            $copyError = $copyError.InnerException
+        }
+    }
+
+    # Try standard Copy-Item as fallback
+    try {
+        Copy-Item -LiteralPath $SourcePath -Destination $destPath -Force -ErrorAction Stop
+        Record-Manifest -SourcePath $SourcePath -DestPath $destPath -SourceTimes $srcTimes
+        return
+    } catch {}
+
+    # File is in use (sharing/lock violation) on a live system, e.g. a browser
+    # database: read it from the Volume Shadow Copy instead
+    $inUse = $copyError -and (($copyError.HResult -eq -2147024864) -or ($copyError.HResult -eq -2147024863))
+    if ($script:IsLive -and $inUse) {
+        $relPath = Get-TargetRelativePath $SourcePath
+        if ($relPath) {
+            if (Copy-FromShadow -RelativePath $relPath -DestDir $DestDir -DestName $DestName -Quiet) {
+                Log "Collected from shadow copy (file in use): $SourcePath"
+                return
+            }
+            Log-Warning "Could not copy (locked, shadow copy also failed): $SourcePath"
             $script:errorCount++
             return
         }
     }
+
+    $reason = "unknown error"
+    if ($copyError) { $reason = $copyError.Message }
+    if ($inUse) {
+        Log-Warning "Could not copy (locked): $SourcePath"
+    } else {
+        Log-Warning "Could not copy: $SourcePath -- $reason"
+    }
+    $script:errorCount++
 }
 
+# Manifest columns:
+#   SHA256, SourcePath, DestPath, SizeBytes, CollectedAt (collector local time),
+#   RelativePath (DestPath relative to the collection root),
+#   SourceCreatedUtc, SourceModifiedUtc, SourceAccessedUtc (ISO 8601 UTC times
+#   of the ORIGINAL file; blank for command output, reg save and unknown).
+# -SourceTimes: times captured before the copy (object with Created/Modified/
+# Accessed); when not passed they are read from SourcePath if it is a file.
 function Record-Manifest {
     param(
         [string]$SourcePath,
-        [string]$DestPath
+        [string]$DestPath,
+        [object]$SourceTimes = $null
     )
-    if (-not (Test-Path $DestPath)) { return }
-    $fileSize = (Get-Item $DestPath -ErrorAction SilentlyContinue).Length
-    if ($fileSize -eq 0) {
-        # Remove empty files (failed shadow copies that produced 0-byte output)
-        Remove-Item $DestPath -Force -ErrorAction SilentlyContinue
-        return
-    }
     try {
-        $hash = (Get-FileHash -Path $DestPath -Algorithm SHA256 -ErrorAction Stop).Hash
+        # FileInfo sees hidden/system files; Get-Item without -Force returned
+        # nothing for them and the copy was deleted as "empty"
+        $fileSize = Get-FileLength $DestPath
+        if ($fileSize -lt 0) { return }
+        if ($fileSize -eq 0) {
+            # Remove empty files (failed copies that produced 0-byte output)
+            Remove-Item -LiteralPath $DestPath -Force -ErrorAction SilentlyContinue
+            return
+        }
+
+        if (-not $PSBoundParameters.ContainsKey('SourceTimes')) {
+            $SourceTimes = Get-SourceFileTimesUtc $SourcePath
+        }
+        $created = ""; $modified = ""; $accessed = ""
+        if ($SourceTimes) {
+            $created  = Format-UtcTime $SourceTimes.Created
+            $modified = Format-UtcTime $SourceTimes.Modified
+            $accessed = Format-UtcTime $SourceTimes.Accessed
+        }
+
+        $hash = (Get-FileHash -LiteralPath $DestPath -Algorithm SHA256 -ErrorAction Stop).Hash
+        $fields = @(
+            $hash,
+            $SourcePath,
+            $DestPath,
+            $fileSize,
+            (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'),
+            (Get-CollectionRelativePath $DestPath),
+            $created,
+            $modified,
+            $accessed
+        )
+        $line = ($fields | ForEach-Object { ConvertTo-CsvField $_ }) -join ','
+        # Explicit UTF-8 (the header is UTF-8); Add-Content in 5.1 writes ANSI
+        [System.IO.File]::AppendAllText($manifestFile, $line + "`r`n", (New-Object System.Text.UTF8Encoding($false)))
         $script:fileCount++
         $script:totalBytes += $fileSize
-        $line = "$hash,`"$SourcePath`",`"$DestPath`",$fileSize,$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
-        Add-Content -Path $manifestFile -Value $line
     } catch {
-        Log-Warning "Could not hash/record: $DestPath"
+        Log-Warning "Could not hash/record: $DestPath -- $($_.Exception.Message)"
     }
 }
 
@@ -386,7 +546,7 @@ function Save-CommandOutput {
     try {
         $output = & $Command 2>&1
         Ensure-Directory (Split-Path $DestPath -Parent)
-        $output | Out-File -FilePath $DestPath -Encoding utf8 -Force
+        $output | Out-File -LiteralPath $DestPath -Encoding utf8 -Force
         Record-Manifest -SourcePath "(command: $Description)" -DestPath $DestPath
     } catch {
         Log-Error "Failed to collect $Description -- $($_.Exception.Message)"
@@ -399,11 +559,15 @@ function Save-CommandOutput {
 # ----------------------------------------------------------
 $script:shadowId = $null
 $script:shadowPath = $null
+$script:shadowUnavailable = $false
 
 function Initialize-ShadowCopy {
     if ($script:shadowPath) { return $true }
+    # Do not retry (and re-log) on every call after a failure / in image mode
+    if ($script:shadowUnavailable) { return $false }
     if (-not $script:IsLive) {
         Log "Skipping shadow copy (mounted image mode -- files are not locked)"
+        $script:shadowUnavailable = $true
         return $false
     }
 
@@ -411,27 +575,38 @@ function Initialize-ShadowCopy {
     try {
         $shadow = (Get-WmiObject -List Win32_ShadowCopy).Create($script:TargetRoot, "ClientAccessible")
         if ($shadow.ReturnValue -eq 0) {
+            # Remember the ID first so cleanup can delete it even if the lookup below fails
             $script:shadowId = $shadow.ShadowID
             $shadowObj = Get-WmiObject Win32_ShadowCopy | Where-Object { $_.ID -eq $script:shadowId }
             $script:shadowPath = $shadowObj.DeviceObject
+            if (-not $script:shadowPath) {
+                Log-Warning "Shadow copy created but its device path could not be read."
+                $script:shadowUnavailable = $true
+                return $false
+            }
             Log-Success "Shadow copy created: $($script:shadowPath)"
             return $true
         } else {
             Log-Warning "Shadow copy creation returned code: $($shadow.ReturnValue)"
+            $script:shadowUnavailable = $true
             return $false
         }
     } catch {
         Log-Warning "Could not create shadow copy: $($_.Exception.Message)"
-        Log-Warning "Locked files ($('$')MFT, registry hives) may be incomplete."
+        Log-Warning "Locked files (registry hives, browser databases) may be incomplete."
+        $script:shadowUnavailable = $true
         return $false
     }
 }
 
+# Copy a file (path relative to TargetRoot) out of the shadow copy.
+# -Quiet: the caller reports failures (no warning / error count here).
 function Copy-FromShadow {
     param(
         [string]$RelativePath,
         [string]$DestDir,
-        [string]$DestName = ""
+        [string]$DestName = "",
+        [switch]$Quiet
     )
 
     if (-not $script:shadowPath) {
@@ -442,28 +617,58 @@ function Copy-FromShadow {
 
     $shadowFile = "$($script:shadowPath)\$RelativePath"
     if (-not $DestName) {
-        $DestName = Split-Path $RelativePath -Leaf
+        $DestName = [System.IO.Path]::GetFileName($RelativePath)
     }
     $destPath = Join-Path $DestDir $DestName
 
-    Ensure-Directory $DestDir
-
     try {
-        # Use cmd /c copy to access the shadow device path
-        $result = cmd /c "copy `"$shadowFile`" `"$destPath`"" 2>&1
-        if ((Test-Path $destPath) -and (Get-Item $destPath).Length -gt 0) {
-            Record-Manifest -SourcePath "(shadow)$RelativePath" -DestPath $destPath
-            return $true
-        } else {
-            # Remove empty/corrupt shadow copy output
-            Remove-Item $destPath -Force -ErrorAction SilentlyContinue
-            Log-Warning "Shadow copy of $RelativePath did not produce output file"
-            $script:errorCount++
-            return $false
+        Ensure-Directory $DestDir
+
+        # Original file times: from the snapshot itself, else from the live file
+        $srcTimes = Get-SourceFileTimesUtc $shadowFile
+        if (-not $srcTimes) {
+            $srcTimes = Get-SourceFileTimesUtc ($script:TargetRoot.TrimEnd('\') + '\' + $RelativePath)
         }
+
+        # .NET copy accepts the \\?\GLOBALROOT\Device\... shadow path and reads
+        # hidden/system files (NTUSER.DAT, UsrClass.dat, hive .LOG1/.LOG2),
+        # which "cmd /c copy" reports as not found. cmd copy stays as fallback.
+        $notFound = $false
+        try {
+            [System.IO.File]::Copy($shadowFile, $destPath, $true)
+        } catch {
+            $copyError = $_.Exception
+            if ($copyError.InnerException) { $copyError = $copyError.InnerException }
+            if ($copyError -is [System.IO.FileNotFoundException] -or $copyError -is [System.IO.DirectoryNotFoundException]) {
+                $notFound = $true
+            } else {
+                $null = cmd /c "copy /Y `"$shadowFile`" `"$destPath`"" 2>&1
+            }
+        }
+
+        if ((Get-FileLength $destPath) -gt 0) {
+            Record-Manifest -SourcePath "(shadow)$RelativePath" -DestPath $destPath -SourceTimes $srcTimes
+            return $true
+        }
+
+        # Remove empty/corrupt shadow copy output
+        if ((Get-FileLength $destPath) -ge 0) {
+            Remove-Item -LiteralPath $destPath -Force -ErrorAction SilentlyContinue
+        }
+        if (-not $Quiet) {
+            if ($notFound) {
+                Log "Not present in shadow copy: $RelativePath"
+            } else {
+                Log-Warning "Shadow copy of $RelativePath did not produce output file"
+                $script:errorCount++
+            }
+        }
+        return $false
     } catch {
-        Log-Warning "Could not copy from shadow: $RelativePath -- $($_.Exception.Message)"
-        $script:errorCount++
+        if (-not $Quiet) {
+            Log-Warning "Could not copy from shadow: $RelativePath -- $($_.Exception.Message)"
+            $script:errorCount++
+        }
         return $false
     }
 }
@@ -479,13 +684,186 @@ function Remove-ShadowCopy {
             }
         } catch {
             Log-Warning "Could not remove shadow copy: $($_.Exception.Message)"
+            Log-Warning "Remove it manually: vssadmin delete shadows /shadow=$($script:shadowId)"
         }
         $script:shadowId = $null
         $script:shadowPath = $null
     }
 }
 
+# ----------------------------------------------------------
+# Cleanup on every exit path (called from the finally block at
+# the "Cleanup" banner): shadow copy and Defender exclusion
+# ----------------------------------------------------------
+$script:cleanupDone = $false
+$script:collectionCompleted = $false
+
+function Invoke-CollectionCleanup {
+    if ($script:cleanupDone) { return }
+    $script:cleanupDone = $true
+    if (-not $script:collectionCompleted) {
+        Log-Warning "Collection did not finish (interrupted or stopped by an error). Partial output: $OutputPath"
+    }
+    try {
+        Remove-ShadowCopy
+    } catch {
+        Log-Warning "Could not remove shadow copy: $($_.Exception.Message)"
+    }
+    if ($script:defenderExclusionAdded) {
+        Log "Removing temporary Defender exclusion..."
+        if (Remove-DefenderExclusion) {
+            Log-Success "Defender exclusion removed."
+        } else {
+            Log-Warning "Could not remove the temporary Defender exclusion. Remove it manually:"
+            Log-Warning "  Remove-MpPreference -ExclusionPath `"$OutputPath`""
+        }
+    }
+}
+
+# ----------------------------------------------------------
+# Helper: collection_info.json (metadata for the timeline
+# builder: mode, start time, time zones, culture)
+# ----------------------------------------------------------
+# TimeZoneKeyName from the mounted image's SYSTEM hive, or $null.
+# A temporary COPY of the hive (and its .LOG1/.LOG2) is loaded under
+# HKLM: loading a hive can write to it, so the evidence file itself is
+# never loaded (and read-only mounts could not be loaded at all).
+function Get-ImageTimeZoneId {
+    $configDir = "${script:TargetRoot}Windows\System32\config"
+    $hiveSrc = Join-Path $configDir "SYSTEM"
+    if (-not [System.IO.File]::Exists($hiveSrc)) { return $null }
+
+    $tempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("TriageTZ_" + [guid]::NewGuid().ToString("N"))
+    $mountName = "TriageTZ_" + [guid]::NewGuid().ToString("N").Substring(0, 8)
+    $loaded = $false
+    $tzId = $null
+    $current = $null
+    $tzName = $null
+    try {
+        New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
+        $hiveCopy = Join-Path $tempDir "SYSTEM"
+        [System.IO.File]::Copy($hiveSrc, $hiveCopy, $true)
+        foreach ($logExt in @(".LOG1", ".LOG2")) {
+            if ([System.IO.File]::Exists($hiveSrc + $logExt)) {
+                try { [System.IO.File]::Copy($hiveSrc + $logExt, $hiveCopy + $logExt, $true) } catch {}
+            }
+        }
+
+        $null = reg load "HKLM\$mountName" "$hiveCopy" 2>&1
+        if ($LASTEXITCODE -ne 0) { return $null }
+        $loaded = $true
+
+        # Select\Current = number of the active ControlSet00N
+        $selectKey = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey("$mountName\Select")
+        if ($selectKey) {
+            try { $current = $selectKey.GetValue("Current") } finally { $selectKey.Close() }
+        }
+        if ($null -eq $current) { return $null }
+
+        $tzPath = "{0}\ControlSet{1:D3}\Control\TimeZoneInformation" -f $mountName, [int]$current
+        $tzKey = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($tzPath)
+        if ($tzKey) {
+            try { $tzName = $tzKey.GetValue("TimeZoneKeyName") } finally { $tzKey.Close() }
+        }
+        if ($tzName) {
+            # The stored string can carry leftover characters after its NUL
+            $tzName = ([string]$tzName).Split([char]0)[0].Trim()
+            if ($tzName) { $tzId = $tzName }
+        }
+    } catch {
+        $tzId = $null
+    } finally {
+        if ($loaded) {
+            [GC]::Collect()
+            [GC]::WaitForPendingFinalizers()
+            $null = reg unload "HKLM\$mountName" 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                Start-Sleep -Seconds 1
+                $null = reg unload "HKLM\$mountName" 2>&1
+                if ($LASTEXITCODE -ne 0) {
+                    Log-Warning "Could not unload temporary hive HKLM\$mountName -- run: reg unload HKLM\$mountName"
+                }
+            }
+        }
+        Remove-Item -LiteralPath $tempDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    return $tzId
+}
+
+# Write collection_info.json at the collection root and record it in the manifest
+function Write-CollectionInfo {
+    $infoPath = Join-Path $OutputPath "collection_info.json"
+    try {
+        $collectorTz = [System.TimeZoneInfo]::Local.Id
+        if ($script:IsLive) {
+            $mode = "Live"
+            $targetTz = $collectorTz
+        } else {
+            $mode = "MountedImage"
+            $targetTz = Get-ImageTimeZoneId
+        }
+        $info = [PSCustomObject][ordered]@{
+            SchemaVersion       = 1
+            ComputerName        = $env:COMPUTERNAME
+            CollectorUser       = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+            Mode                = $mode
+            TargetDrive         = $TargetDrive
+            TargetRoot          = $script:TargetRoot
+            CollectionStartUtc  = $script:startTime.ToUniversalTime().ToString("o")
+            CollectorTimeZoneId = $collectorTz
+            CollectorCulture    = (Get-Culture).Name
+            TargetTimeZoneId    = $targetTz
+        }
+        $json = $info | ConvertTo-Json
+        # UTF-8 with BOM so Get-Content in Windows PowerShell 5.1 reads it as UTF-8
+        [System.IO.File]::WriteAllText($infoPath, $json, (New-Object System.Text.UTF8Encoding($true)))
+        Record-Manifest -SourcePath "(collection metadata)" -DestPath $infoPath
+        if ($targetTz) {
+            Log "Collection info written (target time zone: $targetTz)"
+        } else {
+            Log-Warning "Collection info written, but the target time zone could not be read from the image."
+        }
+    } catch {
+        Log-Warning "Could not write collection_info.json -- $($_.Exception.Message)"
+    }
+}
+
 # =============================================================
+# Collection body. Everything from here down to the "Cleanup"
+# banner runs inside this try block. Its finally block (at the
+# Cleanup banner) removes the shadow copy and the Defender
+# exclusion on every exit path: normal end, Ctrl+C, exit and
+# terminating errors. The body is intentionally NOT re-indented
+# so the diff stays small. (Closing the console window kills the
+# process outright; that cannot be caught.)
+# =============================================================
+try {
+
+# Inside a try block, a statement-terminating error (a .NET exception
+# or a method call on $null outside an inner try/catch) would skip the
+# whole rest of the collection. Log it and go on with the next step
+# instead. Ctrl+C (PipelineStoppedException) is passed on, so the run
+# stops and the finally block cleans up.
+trap {
+    if ($_.Exception -is [System.Management.Automation.PipelineStoppedException]) { break }
+    Log-Error "Unexpected error at line $($_.InvocationInfo.ScriptLineNumber) (rest of this step skipped): $($_.Exception.Message)"
+    $script:errorCount++
+    continue
+}
+
+# Defender exclusion (see Remove-DefenderExclusion). The flag is set
+# before the call so that an interrupt while Add-MpPreference is still
+# running also leads to its removal.
+if ($script:IsLive) {
+    $script:defenderExclusionAdded = $true
+    try {
+        Add-MpPreference -ExclusionPath $OutputPath -ErrorAction Stop
+    } catch {
+        # Warned below, with the start-of-run logging
+        $script:defenderExclusionAdded = $false
+    }
+}
+
 Log "=== Windows Forensic Triage Collection Started ==="
 Log "Output directory: $OutputPath"
 Log "Target drive: ${TargetDrive}:"
@@ -514,6 +892,7 @@ if ($script:IsLive) {
     Log "OS: (mounted image -- OS info reflects collector host, not target)"
 }
 Log "Time zone: $((Get-TimeZone).DisplayName)"
+Write-CollectionInfo
 Log ""
 
 # =============================================================
@@ -587,9 +966,9 @@ if ($Categories -contains "Memory") {
                 # Save tool output as acquisition log
                 $result | Out-File $memLogFile -Encoding utf8
 
-                if ((Test-Path $dumpFile) -and (Get-Item $dumpFile).Length -gt 0) {
-                    $dumpSizeMB = [math]::Round((Get-Item $dumpFile).Length / 1MB, 0)
-                    $dumpSizeGB = [math]::Round((Get-Item $dumpFile).Length / 1GB, 2)
+                if ((Get-FileLength $dumpFile) -gt 0) {
+                    $dumpSizeMB = [math]::Round((Get-FileLength $dumpFile) / 1MB, 0)
+                    $dumpSizeGB = [math]::Round((Get-FileLength $dumpFile) / 1GB, 2)
                     Record-Manifest -SourcePath "(memory dump via $memToolName)" -DestPath $dumpFile
                     Log-Success "Memory dump captured: $dumpFile ($dumpSizeGB GB)"
                 } else {
@@ -638,56 +1017,28 @@ if ($Categories -contains "FileSystem") {
     Ensure-Directory $fsDir
 
     if ($SkipLargeFiles) {
-        Log "SkipLargeFiles is set -- skipping `$MFT, `$LogFile, `$UsnJrnl"
+        Log "SkipLargeFiles is set -- skipping the USN journal export (`$UsnJrnl:`$J)"
     } else {
-        # $MFT - Master File Table
-        Log "Collecting `$MFT (via shadow copy)..."
-        $mftResult = Copy-FromShadow -RelativePath '$MFT' -DestDir $fsDir -DestName '$MFT'
-        if (-not $mftResult) {
-            # Try fsutil as alternative
-            Log "Trying fsutil for `$MFT..."
-            try {
-                $mftDest = Join-Path $fsDir '$MFT'
-                $fsutilOutput = fsutil file queryextents ${script:TargetRoot}`$MFT 2>&1
-                Log "fsutil query: $fsutilOutput"
-                # fsutil cannot directly extract $MFT, shadow copy is the primary method
-                if (-not (Test-Path $mftDest)) {
-                    Log-Warning "`$MFT collection requires Volume Shadow Copy or a raw disk reader."
-                }
-            } catch {
-                Log-Warning "Could not collect `$MFT: $($_.Exception.Message)"
-            }
-        } else {
-            Log-Success "Collected `$MFT"
-        }
-
-        # $LogFile
-        Log "Collecting `$LogFile..."
-        $logfileResult = Copy-FromShadow -RelativePath '$LogFile' -DestDir $fsDir -DestName '$LogFile'
-        if ($logfileResult) { Log-Success "Collected `$LogFile" }
-        else { Log-Warning "Could not collect `$LogFile" }
+        # NTFS metafiles ($MFT, $LogFile, $Extend\$UsnJrnl:$J) cannot be opened
+        # through the file API, not even inside a shadow copy, so copy attempts
+        # always failed. They need a raw-disk reader; the USN journal is exported
+        # as text with fsutil instead.
+        Log "Note: raw `$MFT, `$LogFile and `$UsnJrnl:`$J need a raw-disk reader (not built in) -- not collected. Exporting the USN journal with fsutil instead."
 
         # $UsnJrnl:$J
-        Log "Collecting `$UsnJrnl:`$J..."
-        $usnjrnlResult = Copy-FromShadow -RelativePath '$Extend\$UsnJrnl' -DestDir $fsDir -DestName '$UsnJrnl_$J'
-        if (-not $usnjrnlResult) {
-            # Try fsutil to read the USN journal
-            Log "Trying fsutil usn readjournal..."
-            try {
-                $ujDest = Join-Path $fsDir '$UsnJrnl_$J.txt'
-                fsutil usn readjournal ${TargetDrive}: csv 2>&1 | Out-File -FilePath $ujDest -Encoding utf8
-                if ((Test-Path $ujDest) -and (Get-Item $ujDest).Length -gt 0) {
-                    Record-Manifest -SourcePath "(fsutil usn readjournal)" -DestPath $ujDest
-                    Log-Success "Collected USN Journal via fsutil (CSV format)"
-                } else {
-                    Remove-Item $ujDest -Force -ErrorAction SilentlyContinue
-                    Log-Warning "Could not collect `$UsnJrnl"
-                }
-            } catch {
-                Log-Warning "Could not collect `$UsnJrnl: $($_.Exception.Message)"
+        Log "Collecting `$UsnJrnl:`$J via fsutil usn readjournal..."
+        try {
+            $ujDest = Join-Path $fsDir '$UsnJrnl_$J.txt'
+            fsutil usn readjournal ${TargetDrive}: csv 2>&1 | Out-File -LiteralPath $ujDest -Encoding utf8
+            if ((Get-FileLength $ujDest) -gt 0) {
+                Record-Manifest -SourcePath "(fsutil usn readjournal)" -DestPath $ujDest
+                Log-Success "Collected USN Journal via fsutil (CSV format)"
+            } else {
+                Remove-Item -LiteralPath $ujDest -Force -ErrorAction SilentlyContinue
+                Log-Warning "Could not collect `$UsnJrnl"
             }
-        } else {
-            Log-Success "Collected `$UsnJrnl"
+        } catch {
+            Log-Warning "Could not collect `$UsnJrnl: $($_.Exception.Message)"
         }
     }
 
@@ -717,7 +1068,7 @@ if ($Categories -contains "Registry") {
             try {
                 $destFile = Join-Path $regDir $hiveName
                 reg save "HKLM\$hiveName" $destFile /y 2>&1 | Out-Null
-                if (Test-Path $destFile) {
+                if ((Get-FileLength $destFile) -gt 0) {
                     Record-Manifest -SourcePath "HKLM\$hiveName" -DestPath $destFile
                     Log-Success "Collected $hiveName via reg save"
                 } else {
@@ -733,9 +1084,9 @@ if ($Categories -contains "Registry") {
         foreach ($hiveName in $systemHives) {
             Log "Collecting $hiveName hive (file copy from mounted image)..."
             $hiveSrc = Join-Path $hiveSourceDir $hiveName
-            if (Test-Path $hiveSrc) {
+            if (Test-Path -LiteralPath $hiveSrc) {
                 Copy-ForensicFile -SourcePath $hiveSrc -DestDir $regDir -DestName $hiveName
-                if (Test-Path (Join-Path $regDir $hiveName)) {
+                if ((Get-FileLength (Join-Path $regDir $hiveName)) -gt 0) {
                     Log-Success "Collected $hiveName (file copy)"
                 } else {
                     Log-Warning "Could not collect $hiveName"
@@ -754,23 +1105,23 @@ if ($Categories -contains "Registry") {
     if (-not $result) {
         Copy-ForensicFile -SourcePath $amcacheSrc -DestDir $regDir
     }
-    if (Test-Path (Join-Path $regDir "Amcache.hve")) {
+    if ((Get-FileLength (Join-Path $regDir "Amcache.hve")) -gt 0) {
         Log-Success "Collected Amcache.hve"
     } else {
         Log-Warning "Could not collect Amcache.hve"
     }
-    # Collect transaction logs for dirty hive recovery (locked, need shadow copy)
+    # Collect transaction logs for dirty hive recovery (locked + hidden, need shadow copy)
     foreach ($logExt in @(".LOG1", ".LOG2")) {
         $logRelPath = "Windows\AppCompat\Programs\Amcache.hve${logExt}"
         $logResult = Copy-FromShadow -RelativePath $logRelPath -DestDir $regDir -DestName "Amcache.hve${logExt}"
         if (-not $logResult) {
             # Fallback to direct copy
             $logSrc = "${amcacheSrc}${logExt}"
-            if (Test-Path $logSrc) {
+            if (Test-Path -LiteralPath $logSrc) {
                 Copy-ForensicFile -SourcePath $logSrc -DestDir $regDir
             }
         }
-        if (Test-Path (Join-Path $regDir "Amcache.hve${logExt}")) {
+        if ((Get-FileLength (Join-Path $regDir "Amcache.hve${logExt}")) -gt 0) {
             Log-Success "Collected Amcache.hve${logExt}"
         }
     }
@@ -780,20 +1131,33 @@ if ($Categories -contains "Registry") {
     $userProfiles = Get-ChildItem "${script:TargetRoot}Users" -Directory -ErrorAction SilentlyContinue |
         Where-Object { $_.Name -notin @("Public", "Default", "Default User", "All Users") }
 
-    # Build a map of loaded HKU SIDs to usernames for reg save (live system only)
+    # Build a map of loaded HKU SIDs to profile folder names for reg save (live
+    # system only). Local/domain accounts are S-1-5-21-..., Entra ID (Azure AD)
+    # accounts S-1-12-1-...; *_Classes keys do not match (anchored at the end).
     $sidToUser = @{}
     if ($script:IsLive) {
         try {
             $hkuKeys = reg query HKU 2>&1
             foreach ($line in $hkuKeys) {
-                if ($line -match '(S-1-5-21-[\d-]+)$') {
+                if ("$line" -match '(S-1-5-21-[\d-]+|S-1-12-1-[\d-]+)$') {
                     $sid = $Matches[1]
+                    $profileName = $null
+                    # Profile folder from ProfileList (Entra ID folder names often
+                    # differ from the account name)
                     try {
-                        $objSID = New-Object System.Security.Principal.SecurityIdentifier($sid)
-                        $objUser = $objSID.Translate([System.Security.Principal.NTAccount])
-                        $resolvedName = $objUser.Value -replace '^.*\\', ''
-                        $sidToUser[$resolvedName] = $sid
+                        $profileKey = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$sid"
+                        $profileImage = (Get-ItemProperty -LiteralPath $profileKey -Name ProfileImagePath -ErrorAction Stop).ProfileImagePath
+                        if ($profileImage) { $profileName = [System.IO.Path]::GetFileName($profileImage.TrimEnd('\')) }
                     } catch {}
+                    # Fallback: account name
+                    if (-not $profileName) {
+                        try {
+                            $objSID = New-Object System.Security.Principal.SecurityIdentifier($sid)
+                            $objUser = $objSID.Translate([System.Security.Principal.NTAccount])
+                            $profileName = $objUser.Value -replace '^.*\\', ''
+                        } catch {}
+                    }
+                    if ($profileName) { $sidToUser[$profileName] = $sid }
                 }
             }
         } catch {}
@@ -809,7 +1173,7 @@ if ($Categories -contains "Registry") {
 
         # NTUSER.DAT
         $ntuser = Join-Path $userDir.FullName "NTUSER.DAT"
-        if (Test-Path $ntuser) {
+        if (Test-Path -LiteralPath $ntuser) {
             Log "Collecting NTUSER.DAT for $userName..."
             $collected = $false
 
@@ -818,7 +1182,7 @@ if ($Categories -contains "Registry") {
                 $destFile = Join-Path $userRegDir "NTUSER.DAT"
                 try {
                     reg save "HKU\$userSid" $destFile /y 2>&1 | Out-Null
-                    if ((Test-Path $destFile) -and (Get-Item $destFile).Length -gt 0) {
+                    if ((Get-FileLength $destFile) -gt 0) {
                         Record-Manifest -SourcePath "HKU\$userSid" -DestPath $destFile
                         Log-Success "Collected NTUSER.DAT for $userName via reg save"
                         $collected = $true
@@ -841,7 +1205,7 @@ if ($Categories -contains "Registry") {
 
         # UsrClass.dat
         $usrclass = Join-Path $userDir.FullName "AppData\Local\Microsoft\Windows\UsrClass.dat"
-        if (Test-Path $usrclass) {
+        if (Test-Path -LiteralPath $usrclass) {
             Log "Collecting UsrClass.dat for $userName..."
             $collected = $false
 
@@ -850,7 +1214,7 @@ if ($Categories -contains "Registry") {
                 $destFile = Join-Path $userRegDir "UsrClass.dat"
                 try {
                     reg save "HKU\${userSid}_Classes" $destFile /y 2>&1 | Out-Null
-                    if ((Test-Path $destFile) -and (Get-Item $destFile).Length -gt 0) {
+                    if ((Get-FileLength $destFile) -gt 0) {
                         Record-Manifest -SourcePath "HKU\${userSid}_Classes" -DestPath $destFile
                         Log-Success "Collected UsrClass.dat for $userName via reg save"
                         $collected = $true
@@ -942,6 +1306,497 @@ if ($Categories -contains "EventLogs") {
     Log ""
 }
 
+# ----------------------------------------------------------
+# Helpers for the Execution, USB and Persistence sections:
+# registry key times, loaded user hives, SID names, CSV output
+# ----------------------------------------------------------
+
+# RegQueryInfoKey P/Invoke (key last-write time is not exposed by
+# Microsoft.Win32.RegistryKey). Compiled on first use only.
+$script:regLastWriteReady = $null
+function Initialize-TriageRegLastWrite {
+    if ($null -ne $script:regLastWriteReady) { return $script:regLastWriteReady }
+    if ('TriageNative.RegKeyInfo' -as [type]) {
+        $script:regLastWriteReady = $true
+        return $true
+    }
+    try {
+        Add-Type -Namespace TriageNative -Name RegKeyInfo -ErrorAction Stop -MemberDefinition @'
+[DllImport("advapi32.dll", CharSet = CharSet.Unicode)]
+public static extern int RegQueryInfoKey(
+    Microsoft.Win32.SafeHandles.SafeRegistryHandle hKey,
+    IntPtr lpClass, IntPtr lpcchClass, IntPtr lpReserved,
+    IntPtr lpcSubKeys, IntPtr lpcbMaxSubKeyLen, IntPtr lpcbMaxClassLen,
+    IntPtr lpcValues, IntPtr lpcbMaxValueNameLen, IntPtr lpcbMaxValueLen,
+    IntPtr lpcbSecurityDescriptor, out long lpftLastWriteTime);
+'@
+        $script:regLastWriteReady = $true
+    } catch {
+        Log-Warning "Registry key last-write times unavailable: $($_.Exception.Message)"
+        $script:regLastWriteReady = $false
+    }
+    return $script:regLastWriteReady
+}
+
+# Open a registry key read-only in the 64-bit view. Hive is "HKLM" or "HKU".
+# Returns $null if the key is missing or access is denied.
+function Open-TriageRegKey {
+    param(
+        [string]$Hive,
+        [string]$SubKey
+    )
+    try {
+        $hiveId = [Microsoft.Win32.RegistryHive]::LocalMachine
+        if ($Hive -eq "HKU") { $hiveId = [Microsoft.Win32.RegistryHive]::Users }
+        $baseKey = [Microsoft.Win32.RegistryKey]::OpenBaseKey($hiveId, [Microsoft.Win32.RegistryView]::Registry64)
+        return $baseKey.OpenSubKey($SubKey, $false)
+    } catch {
+        return $null
+    }
+}
+
+# Last-write time of an open registry key as UTC ISO 8601 ("o"); "" if unknown
+function Get-TriageRegLastWriteUtc {
+    param([Microsoft.Win32.RegistryKey]$Key)
+    if ($null -eq $Key) { return "" }
+    if (-not (Initialize-TriageRegLastWrite)) { return "" }
+    try {
+        $fileTime = [long]0
+        $z = [IntPtr]::Zero
+        $rc = [TriageNative.RegKeyInfo]::RegQueryInfoKey($Key.Handle, $z, $z, $z, $z, $z, $z, $z, $z, $z, $z, [ref]$fileTime)
+        if ($rc -eq 0 -and $fileTime -gt 0) {
+            return [DateTime]::FromFileTimeUtc($fileTime).ToString("o")
+        }
+    } catch {}
+    return ""
+}
+
+# Last-write time of HKLM\SYSTEM\CurrentControlSet\Services\<Name>
+function Get-TriageServiceKeyLastWriteUtc {
+    param([string]$Name)
+    if (-not $Name) { return "" }
+    $key = Open-TriageRegKey -Hive "HKLM" -SubKey "SYSTEM\CurrentControlSet\Services\$Name"
+    if ($null -eq $key) { return "" }
+    try {
+        return (Get-TriageRegLastWriteUtc -Key $key)
+    } finally {
+        $key.Close()
+    }
+}
+
+# Registry value data as text (multi-string joined, binary as hex)
+function Format-TriageRegValue {
+    param($Value)
+    if ($null -eq $Value) { return "" }
+    if ($Value -is [byte[]]) { return [BitConverter]::ToString($Value) }
+    if ($Value -is [array]) { return (@($Value | ForEach-Object { [string]$_ }) -join "; ") }
+    return [string]$Value
+}
+
+# SIDs of the user hives loaded under HKU: local (S-1-5-21-*) and
+# Entra ID (S-1-12-1-*) accounts, not the *_Classes hives
+function Get-TriageLoadedUserSids {
+    $sids = @()
+    try {
+        $hku = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::Users, [Microsoft.Win32.RegistryView]::Registry64)
+        foreach ($name in $hku.GetSubKeyNames()) {
+            if ($name -match '^S-1-(5-21|12-1)-[\d-]+$') { $sids += $name }
+        }
+    } catch {}
+    return $sids
+}
+
+# SID -> account name (best effort, cached). Uses the profile folder name
+# first so it matches the per-user folder names in the collection.
+$script:sidUserCache = @{}
+function Resolve-TriageSidUser {
+    param([string]$Sid)
+    if (-not $Sid) { return "" }
+    if ($script:sidUserCache.ContainsKey($Sid)) { return $script:sidUserCache[$Sid] }
+    $name = ""
+    if ($Sid -match '^S-1-(5-21|12-1)-') {
+        $profileKey = Open-TriageRegKey -Hive "HKLM" -SubKey "SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$Sid"
+        if ($null -ne $profileKey) {
+            try {
+                $profilePath = [string]$profileKey.GetValue("ProfileImagePath")
+                if ($profilePath) { $name = [IO.Path]::GetFileName($profilePath.TrimEnd('\')) }
+            } catch {
+            } finally {
+                $profileKey.Close()
+            }
+        }
+    }
+    if (-not $name) {
+        try {
+            $account = (New-Object System.Security.Principal.SecurityIdentifier($Sid)).Translate([System.Security.Principal.NTAccount]).Value
+            $name = $account -replace '^.*\\', ''
+        } catch {}
+    }
+    $script:sidUserCache[$Sid] = $name
+    return $name
+}
+
+# Write rows to a CSV (header only when there are no rows) and record it in the manifest
+function Export-TriageCsv {
+    [OutputType([void])]
+    param(
+        [string]$Description,
+        [string]$DestPath,
+        [string[]]$Columns,
+        [object[]]$Rows
+    )
+    try {
+        Ensure-Directory (Split-Path $DestPath -Parent)
+        if ($Rows -and $Rows.Count -gt 0) {
+            $Rows | Select-Object -Property $Columns |
+                Export-Csv -LiteralPath $DestPath -NoTypeInformation -Encoding UTF8 -Force
+        } else {
+            ('"' + ($Columns -join '","') + '"') | Out-File -LiteralPath $DestPath -Encoding utf8 -Force
+        }
+        Record-Manifest -SourcePath "(command: $Description)" -DestPath $DestPath
+    } catch {
+        Log-Error "Failed to collect $Description -- $($_.Exception.Message)"
+        $script:errorCount++
+    }
+}
+
+# BAM (Background Activity Moderator): one row per value whose data starts
+# with an 8-byte FILETIME (last execution, UTC)
+function Get-TriageBamRows {
+    param(
+        [string]$Hive = "HKLM",
+        [string[]]$KeyPaths = @(
+            "SYSTEM\CurrentControlSet\Services\bam\State\UserSettings",
+            "SYSTEM\CurrentControlSet\Services\bam\UserSettings"
+        )
+    )
+    $rows = @()
+    foreach ($keyPath in $KeyPaths) {
+        $rootKey = Open-TriageRegKey -Hive $Hive -SubKey $keyPath
+        if ($null -eq $rootKey) { continue }
+        try {
+            foreach ($sid in $rootKey.GetSubKeyNames()) {
+                $sidKey = $null
+                try {
+                    $sidKey = $rootKey.OpenSubKey($sid, $false)
+                    if ($null -eq $sidKey) { continue }
+                    $user = Resolve-TriageSidUser $sid
+                    foreach ($valueName in $sidKey.GetValueNames()) {
+                        if ($valueName -eq "Version" -or $valueName -eq "SequenceNumber") { continue }
+                        $data = $sidKey.GetValue($valueName)
+                        if ($data -isnot [byte[]] -or $data.Length -lt 8) { continue }
+                        $fileTime = [BitConverter]::ToInt64($data, 0)
+                        $lastExec = ""
+                        if ($fileTime -gt 0) {
+                            try { $lastExec = [DateTime]::FromFileTimeUtc($fileTime).ToString("o") } catch {}
+                        }
+                        $rows += [PSCustomObject]@{
+                            Sid              = $sid
+                            User             = $user
+                            Path             = $valueName
+                            LastExecutionUtc = $lastExec
+                        }
+                    }
+                } catch {
+                } finally {
+                    if ($null -ne $sidKey) { $sidKey.Close() }
+                }
+            }
+        } finally {
+            $rootKey.Close()
+        }
+    }
+    return $rows
+}
+
+# USB storage disks known to PnP (including devices not currently connected)
+# with install / arrival / removal times from the device properties
+function Get-TriageUsbStorageRows {
+    $rows = @()
+    $keyNames = @("DEVPKEY_Device_FirstInstallDate", "DEVPKEY_Device_InstallDate",
+        "DEVPKEY_Device_LastArrivalDate", "DEVPKEY_Device_LastRemovalDate")
+    $devices = @(Get-PnpDevice -ErrorAction SilentlyContinue |
+        Where-Object { $_.InstanceId -like 'USBSTOR\DISK*' } | Sort-Object InstanceId)
+    foreach ($device in $devices) {
+        $times = @{}
+        try {
+            $props = Get-PnpDeviceProperty -InstanceId $device.InstanceId -KeyName $keyNames -ErrorAction Stop
+            foreach ($prop in $props) {
+                if ($prop.Data -is [datetime]) {
+                    $times[$prop.KeyName] = $prop.Data.ToUniversalTime().ToString("o")
+                }
+            }
+        } catch {}
+        # Serial = last instance id segment without the "&<n>" LUN suffix
+        $serial = (($device.InstanceId -split '\\')[-1]) -replace '&\d+$', ''
+        $rows += [PSCustomObject]@{
+            FriendlyName    = [string]$device.FriendlyName
+            InstanceId      = [string]$device.InstanceId
+            Serial          = $serial
+            FirstInstallUtc = [string]$times["DEVPKEY_Device_FirstInstallDate"]
+            InstallUtc      = [string]$times["DEVPKEY_Device_InstallDate"]
+            LastArrivalUtc  = [string]$times["DEVPKEY_Device_LastArrivalDate"]
+            LastRemovalUtc  = [string]$times["DEVPKEY_Device_LastRemovalDate"]
+        }
+    }
+    return $rows
+}
+
+# Task Scheduler time -> UTC "o"; "never" (1999-11-30 or MinValue) or missing -> ""
+function Format-TriageTaskTime {
+    param($Value)
+    if ($null -eq $Value) { return "" }
+    try {
+        $time = [datetime]$Value
+        if ($time.Year -lt 2000) { return "" }
+        return $time.ToUniversalTime().ToString("o")
+    } catch {
+        return ""
+    }
+}
+
+# Local-time text of the live system (no offset = local) -> UTC "o"; "" if unparseable
+function ConvertFrom-TriageLocalTimeText {
+    param([string]$Text)
+    if (-not $Text) { return "" }
+    $parsed = [datetime]::MinValue
+    $styles = [Globalization.DateTimeStyles]"AssumeLocal, AdjustToUniversal"
+    if ([datetime]::TryParse($Text.Trim(), [Globalization.CultureInfo]::InvariantCulture, $styles, [ref]$parsed)) {
+        return $parsed.ToString("o")
+    }
+    return ""
+}
+
+# All scheduled tasks (including disabled) with run times from Get-ScheduledTaskInfo
+function Get-TriageScheduledTaskRows {
+    $rows = @()
+    $tasks = @(Get-ScheduledTask -ErrorAction SilentlyContinue)
+    foreach ($task in $tasks) {
+        $info = $null
+        try { $info = Get-ScheduledTaskInfo -InputObject $task -ErrorAction Stop } catch {}
+
+        # Account the task runs as (group name for group principals)
+        $runAs = ""
+        if ($task.Principal) {
+            if ($task.Principal.UserId) { $runAs = [string]$task.Principal.UserId }
+            elseif ($task.Principal.GroupId) { $runAs = [string]$task.Principal.GroupId }
+        }
+
+        $actionList = @()
+        foreach ($action in $task.Actions) {
+            if ($action.Execute) {
+                $actionList += ("$($action.Execute) $($action.Arguments)").Trim()
+            } elseif ($action.ClassId) {
+                $actionList += ("ComHandler $($action.ClassId) $($action.Data)" -replace '\s+', ' ').Trim()
+            }
+        }
+        $triggerList = @()
+        foreach ($trigger in $task.Triggers) {
+            if ($trigger) { $triggerList += $trigger.ToString() }
+        }
+
+        $lastRun = ""
+        $nextRun = ""
+        $lastResult = ""
+        if ($info) {
+            $lastRun = Format-TriageTaskTime $info.LastRunTime
+            $nextRun = Format-TriageTaskTime $info.NextRunTime
+            if ($null -ne $info.LastTaskResult) { $lastResult = [string]$info.LastTaskResult }
+        }
+
+        $rows += [PSCustomObject]@{
+            TaskName            = [string]$task.TaskName
+            TaskPath            = [string]$task.TaskPath
+            State               = [string]$task.State
+            Author              = [string]$task.Author
+            UserId              = $runAs
+            Actions             = $actionList -join "; "
+            Triggers            = $triggerList -join "; "
+            RegistrationDateUtc = ConvertFrom-TriageLocalTimeText ([string]$task.Date)
+            LastRunTimeUtc      = $lastRun
+            NextRunTimeUtc      = $nextRun
+            LastTaskResult      = $lastResult
+        }
+    }
+    return $rows
+}
+
+# Run-key locations, relative to HKLM and to each loaded user hive
+$script:triageRunKeyPaths = @(
+    "SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
+    "SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce",
+    "SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run",
+    "SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\RunOnce",
+    "SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer\Run"
+)
+# Listed in run_keys.txt only (not autostart entries themselves)
+$script:triageShellFolderPaths = @(
+    "SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders",
+    "SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders"
+)
+
+# HKLM plus every loaded user hive, with display name and user
+function Get-TriageRunKeyHives {
+    $hives = @([PSCustomObject]@{ Hive = "HKLM"; Base = "HKLM"; Prefix = ""; User = "" })
+    foreach ($sid in (Get-TriageLoadedUserSids)) {
+        $hives += [PSCustomObject]@{ Hive = "HKU\$sid"; Base = "HKU"; Prefix = "$sid\"; User = (Resolve-TriageSidUser $sid) }
+    }
+    return $hives
+}
+
+# One row per Run-key value (data not environment-expanded)
+function Get-TriageRunKeyRows {
+    $rows = @()
+    foreach ($hive in (Get-TriageRunKeyHives)) {
+        foreach ($keyPath in $script:triageRunKeyPaths) {
+            $key = Open-TriageRegKey -Hive $hive.Base -SubKey ($hive.Prefix + $keyPath)
+            if ($null -eq $key) { continue }
+            try {
+                $lastWrite = Get-TriageRegLastWriteUtc -Key $key
+                foreach ($valueName in $key.GetValueNames()) {
+                    $label = $valueName
+                    if (-not $label) { $label = "(Default)" }
+                    $data = $key.GetValue($valueName, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+                    $rows += [PSCustomObject]@{
+                        Hive            = $hive.Hive
+                        User            = $hive.User
+                        KeyPath         = $keyPath
+                        ValueName       = $label
+                        Command         = (Format-TriageRegValue $data)
+                        KeyLastWriteUtc = $lastWrite
+                    }
+                }
+            } catch {
+            } finally {
+                $key.Close()
+            }
+        }
+    }
+    return $rows
+}
+
+# Human-readable listing of the Run keys (and Shell Folders) for run_keys.txt
+function Get-TriageRunKeyText {
+    $keyPaths = $script:triageRunKeyPaths + $script:triageShellFolderPaths
+    foreach ($hive in (Get-TriageRunKeyHives)) {
+        foreach ($keyPath in $keyPaths) {
+            if ($hive.User) {
+                Write-Output "=== $($hive.Hive)\$keyPath ($($hive.User)) ==="
+            } else {
+                Write-Output "=== $($hive.Hive)\$keyPath ==="
+            }
+            $key = Open-TriageRegKey -Hive $hive.Base -SubKey ($hive.Prefix + $keyPath)
+            if ($null -eq $key) {
+                Write-Output "(key does not exist)"
+            } else {
+                try {
+                    Write-Output "KeyLastWriteUtc : $(Get-TriageRegLastWriteUtc -Key $key)"
+                    $valueNames = @($key.GetValueNames())
+                    if ($valueNames.Count -eq 0) { Write-Output "(no values)" }
+                    foreach ($valueName in $valueNames) {
+                        $label = $valueName
+                        if (-not $label) { $label = "(Default)" }
+                        $data = $key.GetValue($valueName, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+                        Write-Output "$label : $(Format-TriageRegValue $data)"
+                    }
+                } catch {
+                    Write-Output "(could not read key: $($_.Exception.Message))"
+                } finally {
+                    $key.Close()
+                }
+            }
+            Write-Output ""
+        }
+    }
+}
+
+# Startup folders: the all-users folder plus every profile's folder
+# (works for the live system and for mounted images)
+function Get-TriageStartupFolders {
+    $folders = @()
+    $folders += [PSCustomObject]@{
+        Scope  = "AllUsers"
+        User   = ""
+        Folder = "${script:TargetRoot}ProgramData\Microsoft\Windows\Start Menu\Programs\StartUp"
+    }
+    $startupProfiles = Get-ChildItem "${script:TargetRoot}Users" -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -notin @("Public", "Default", "Default User", "All Users") }
+    foreach ($profileDir in $startupProfiles) {
+        $folders += [PSCustomObject]@{
+            Scope  = "User"
+            User   = $profileDir.Name
+            Folder = (Join-Path $profileDir.FullName "AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup")
+        }
+    }
+    return $folders
+}
+
+# Write startup_folders.txt (for humans) and startup_folders.csv
+function Save-TriageStartupFolders {
+    [OutputType([void])]
+    param([string]$PersistenceDir)
+
+    # List each folder once (hidden items included, desktop.ini skipped)
+    $startupListing = @()
+    foreach ($startupFolder in (Get-TriageStartupFolders)) {
+        $folderExists = Test-Path -LiteralPath $startupFolder.Folder
+        $folderItems = @()
+        $listError = ""
+        if ($folderExists) {
+            $listErrors = $null
+            $folderItems = @(Get-ChildItem -LiteralPath $startupFolder.Folder -Force -ErrorAction SilentlyContinue -ErrorVariable listErrors |
+                Where-Object { $_.Name -ne "desktop.ini" })
+            if ($listErrors) {
+                $listError = $listErrors[0].Exception.Message
+                Log-Warning "Could not list startup folder $($startupFolder.Folder): $listError"
+            }
+        }
+        $startupListing += [PSCustomObject]@{
+            Info   = $startupFolder
+            Exists = $folderExists
+            Items  = $folderItems
+            Error  = $listError
+        }
+    }
+
+    Save-CommandOutput -Description "startup_folders" `
+        -DestPath (Join-Path $PersistenceDir "startup_folders.txt") `
+        -Command {
+            foreach ($listing in $startupListing) {
+                Write-Output "=== $($listing.Info.Folder) ==="
+                if (-not $listing.Exists) {
+                    Write-Output "(path does not exist)"
+                } elseif ($listing.Items.Count -gt 0) {
+                    $listing.Items | Format-Table Name, CreationTime, LastWriteTime, Length -AutoSize
+                } elseif ($listing.Error) {
+                    Write-Output "(could not list folder: $($listing.Error))"
+                } else {
+                    Write-Output "(empty)"
+                }
+                Write-Output ""
+            }
+        }
+
+    $startupRows = @()
+    foreach ($listing in $startupListing) {
+        foreach ($item in $listing.Items) {
+            $startupRows += [PSCustomObject]@{
+                Scope       = $listing.Info.Scope
+                User        = $listing.Info.User
+                Folder      = $listing.Info.Folder
+                Name        = $item.Name
+                CreatedUtc  = $item.CreationTimeUtc.ToString("o")
+                ModifiedUtc = $item.LastWriteTimeUtc.ToString("o")
+            }
+        }
+    }
+    Export-TriageCsv -Description "startup_folders csv" `
+        -DestPath (Join-Path $PersistenceDir "startup_folders.csv") `
+        -Columns @("Scope", "User", "Folder", "Name", "CreatedUtc", "ModifiedUtc") `
+        -Rows $startupRows
+    Log "Startup folders: $($startupRows.Count) item(s) found."
+}
+
 # =============================================================
 # 4. Execution Artifacts
 # =============================================================
@@ -970,30 +1825,48 @@ if ($Categories -contains "Execution") {
     }
 
     if ($script:IsLive) {
-        # Recent Apps (from NTUSER via registry -- export the key)
-        $recentAppsDir = Join-Path $execDir "RecentApps"
-        Ensure-Directory $recentAppsDir
+        # Recent Apps (per loaded user hive -- export the key where it exists)
         Log "Collecting RecentApps registry data..."
-        try {
-            $regPath = "HKCU\Software\Microsoft\Windows\CurrentVersion\Search\RecentApps"
+        $recentAppsSubKey = "Software\Microsoft\Windows\CurrentVersion\Search\RecentApps"
+        $recentAppsCount = 0
+        foreach ($userSid in (Get-TriageLoadedUserSids)) {
+            $recentAppsKey = Open-TriageRegKey -Hive "HKU" -SubKey "$userSid\$recentAppsSubKey"
+            if ($null -eq $recentAppsKey) { continue }
+            $recentAppsKey.Close()
+            $recentAppsUser = Resolve-TriageSidUser $userSid
+            if (-not $recentAppsUser) { $recentAppsUser = $userSid }
+            $recentAppsDir = Join-Path $execDir "RecentApps\$recentAppsUser"
+            Ensure-Directory $recentAppsDir
+            $regPath = "HKU\$userSid\$recentAppsSubKey"
             $destFile = Join-Path $recentAppsDir "RecentApps.reg"
             reg export $regPath $destFile /y 2>&1 | Out-Null
-            if (Test-Path $destFile) {
+            if (Test-Path -LiteralPath $destFile) {
                 Record-Manifest -SourcePath $regPath -DestPath $destFile
-                Log-Success "Collected RecentApps registry export."
+                $recentAppsCount++
+            } else {
+                # Do not leave an empty folder behind
+                try { [IO.Directory]::Delete($recentAppsDir) } catch {}
             }
-        } catch {
-            Log "RecentApps key not found (normal on some builds)."
+        }
+        if ($recentAppsCount -gt 0) {
+            Log-Success "Collected RecentApps registry export for $recentAppsCount user(s)."
+        } else {
+            try { [IO.Directory]::Delete((Join-Path $execDir "RecentApps")) } catch {}
+            Log "RecentApps key not found for any loaded user (normal on Windows 11 and recent Windows 10 builds)."
         }
 
-        # BAM (Background Activity Moderator)
+        # BAM (Background Activity Moderator): decode each value's FILETIME into a CSV
         Log "Collecting BAM data..."
-        Save-CommandOutput -Description "BAM entries" `
-            -DestPath (Join-Path $execDir "bam_entries.txt") `
-            -Command {
-                Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\bam\State\UserSettings\*" -ErrorAction SilentlyContinue |
-                    Format-List
-            }
+        $bamRows = @(Get-TriageBamRows)
+        Export-TriageCsv -Description "BAM entries" `
+            -DestPath (Join-Path $execDir "bam_entries.csv") `
+            -Columns @("Sid", "User", "Path", "LastExecutionUtc") `
+            -Rows $bamRows
+        if ($bamRows.Count -gt 0) {
+            Log-Success "Collected $($bamRows.Count) BAM entries."
+        } else {
+            Log-Warning "No BAM entries found (bam key missing or not readable)."
+        }
 
         # ShimCache / AppCompatCache
         Log "Collecting AppCompatCache..."
@@ -1186,7 +2059,7 @@ if ($Categories -contains "Browser") {
 
         # Chrome
         $chromeBase = Join-Path $userDir.FullName "AppData\Local\Google\Chrome\User Data"
-        if (Test-Path $chromeBase) {
+        if (Test-Path -LiteralPath $chromeBase) {
             Log "Collecting Chrome data for $userName..."
             # Collect from Default and any numbered profiles
             $chromeProfiles = Get-ChildItem -Path $chromeBase -Directory -ErrorAction SilentlyContinue |
@@ -1194,10 +2067,13 @@ if ($Categories -contains "Browser") {
 
             foreach ($profile in $chromeProfiles) {
                 $destDir = Join-Path $browserDir "$userName\Chrome\$($profile.Name)"
-                $chromeFiles = @("History", "Bookmarks", "Login Data", "Cookies", "Web Data", "Top Sites", "Shortcuts")
+                # History-journal: SQLite rollback journal (collected when present).
+                # Files locked by a running browser are read from the shadow copy
+                # (see Copy-ForensicFile).
+                $chromeFiles = @("History", "History-journal", "Bookmarks", "Login Data", "Cookies", "Web Data", "Top Sites", "Shortcuts")
                 foreach ($cf in $chromeFiles) {
                     $sourcePath = Join-Path $profile.FullName $cf
-                    if (Test-Path $sourcePath) {
+                    if (Test-Path -LiteralPath $sourcePath) {
                         Copy-ForensicFile -SourcePath $sourcePath -DestDir $destDir -DestName $cf
                     }
                 }
@@ -1207,17 +2083,17 @@ if ($Categories -contains "Browser") {
 
         # Edge (Chromium-based, same structure as Chrome)
         $edgeBase = Join-Path $userDir.FullName "AppData\Local\Microsoft\Edge\User Data"
-        if (Test-Path $edgeBase) {
+        if (Test-Path -LiteralPath $edgeBase) {
             Log "Collecting Edge data for $userName..."
             $edgeProfiles = Get-ChildItem -Path $edgeBase -Directory -ErrorAction SilentlyContinue |
                 Where-Object { $_.Name -eq "Default" -or $_.Name -match "^Profile \d+$" }
 
             foreach ($profile in $edgeProfiles) {
                 $destDir = Join-Path $browserDir "$userName\Edge\$($profile.Name)"
-                $edgeFiles = @("History", "Bookmarks", "Login Data", "Cookies", "Web Data", "Top Sites", "Shortcuts")
+                $edgeFiles = @("History", "History-journal", "Bookmarks", "Login Data", "Cookies", "Web Data", "Top Sites", "Shortcuts")
                 foreach ($ef in $edgeFiles) {
                     $sourcePath = Join-Path $profile.FullName $ef
-                    if (Test-Path $sourcePath) {
+                    if (Test-Path -LiteralPath $sourcePath) {
                         Copy-ForensicFile -SourcePath $sourcePath -DestDir $destDir -DestName $ef
                     }
                 }
@@ -1227,17 +2103,17 @@ if ($Categories -contains "Browser") {
 
         # Brave (Chromium-based)
         $braveBase = Join-Path $userDir.FullName "AppData\Local\BraveSoftware\Brave-Browser\User Data"
-        if (Test-Path $braveBase) {
+        if (Test-Path -LiteralPath $braveBase) {
             Log "Collecting Brave data for $userName..."
             $braveProfiles = Get-ChildItem -Path $braveBase -Directory -ErrorAction SilentlyContinue |
                 Where-Object { $_.Name -eq "Default" -or $_.Name -match "^Profile \d+$" }
 
             foreach ($profile in $braveProfiles) {
                 $destDir = Join-Path $browserDir "$userName\Brave\$($profile.Name)"
-                $braveFiles = @("History", "Bookmarks", "Login Data", "Cookies", "Web Data", "Top Sites", "Shortcuts")
+                $braveFiles = @("History", "History-journal", "Bookmarks", "Login Data", "Cookies", "Web Data", "Top Sites", "Shortcuts")
                 foreach ($bf in $braveFiles) {
                     $sourcePath = Join-Path $profile.FullName $bf
-                    if (Test-Path $sourcePath) {
+                    if (Test-Path -LiteralPath $sourcePath) {
                         Copy-ForensicFile -SourcePath $sourcePath -DestDir $destDir -DestName $bf
                     }
                 }
@@ -1251,14 +2127,14 @@ if ($Categories -contains "Browser") {
             (Join-Path $userDir.FullName "AppData\Roaming\Opera Software\Opera GX Stable")
         )
         foreach ($operaBase in $operaPaths) {
-            if (Test-Path $operaBase) {
+            if (Test-Path -LiteralPath $operaBase) {
                 $operaName = if ($operaBase -match "GX") { "OperaGX" } else { "Opera" }
                 Log "Collecting $operaName data for $userName..."
                 $destDir = Join-Path $browserDir "$userName\$operaName"
-                $operaFiles = @("History", "Bookmarks", "Login Data", "Cookies", "Web Data", "Top Sites", "Shortcuts")
+                $operaFiles = @("History", "History-journal", "Bookmarks", "Login Data", "Cookies", "Web Data", "Top Sites", "Shortcuts")
                 foreach ($of in $operaFiles) {
                     $sourcePath = Join-Path $operaBase $of
-                    if (Test-Path $sourcePath) {
+                    if (Test-Path -LiteralPath $sourcePath) {
                         Copy-ForensicFile -SourcePath $sourcePath -DestDir $destDir -DestName $of
                     }
                 }
@@ -1268,17 +2144,17 @@ if ($Categories -contains "Browser") {
 
         # Vivaldi (Chromium-based)
         $vivaldiBase = Join-Path $userDir.FullName "AppData\Local\Vivaldi\User Data"
-        if (Test-Path $vivaldiBase) {
+        if (Test-Path -LiteralPath $vivaldiBase) {
             Log "Collecting Vivaldi data for $userName..."
             $vivaldiProfiles = Get-ChildItem -Path $vivaldiBase -Directory -ErrorAction SilentlyContinue |
                 Where-Object { $_.Name -eq "Default" -or $_.Name -match "^Profile \d+$" }
 
             foreach ($profile in $vivaldiProfiles) {
                 $destDir = Join-Path $browserDir "$userName\Vivaldi\$($profile.Name)"
-                $vivaldiFiles = @("History", "Bookmarks", "Login Data", "Cookies", "Web Data", "Top Sites", "Shortcuts")
+                $vivaldiFiles = @("History", "History-journal", "Bookmarks", "Login Data", "Cookies", "Web Data", "Top Sites", "Shortcuts")
                 foreach ($vf in $vivaldiFiles) {
                     $sourcePath = Join-Path $profile.FullName $vf
-                    if (Test-Path $sourcePath) {
+                    if (Test-Path -LiteralPath $sourcePath) {
                         Copy-ForensicFile -SourcePath $sourcePath -DestDir $destDir -DestName $vf
                     }
                 }
@@ -1288,16 +2164,18 @@ if ($Categories -contains "Browser") {
 
         # Firefox
         $firefoxBase = Join-Path $userDir.FullName "AppData\Roaming\Mozilla\Firefox\Profiles"
-        if (Test-Path $firefoxBase) {
+        if (Test-Path -LiteralPath $firefoxBase) {
             Log "Collecting Firefox data for $userName..."
             $ffProfiles = Get-ChildItem -Path $firefoxBase -Directory -ErrorAction SilentlyContinue
 
             foreach ($profile in $ffProfiles) {
                 $destDir = Join-Path $browserDir "$userName\Firefox\$($profile.Name)"
-                $ffFiles = @("places.sqlite", "logins.json", "cookies.sqlite", "formhistory.sqlite", "permissions.sqlite", "key4.db")
+                # *-wal: SQLite write-ahead logs with the most recent rows (not
+                # yet merged into the database); collected when present
+                $ffFiles = @("places.sqlite", "places.sqlite-wal", "logins.json", "cookies.sqlite", "cookies.sqlite-wal", "formhistory.sqlite", "formhistory.sqlite-wal", "permissions.sqlite", "key4.db")
                 foreach ($ff in $ffFiles) {
                     $sourcePath = Join-Path $profile.FullName $ff
-                    if (Test-Path $sourcePath) {
+                    if (Test-Path -LiteralPath $sourcePath) {
                         Copy-ForensicFile -SourcePath $sourcePath -DestDir $destDir -DestName $ff
                     }
                 }
@@ -1320,14 +2198,21 @@ if ($Categories -contains "USB") {
     $usbDir = Join-Path $OutputPath "USB"
     Ensure-Directory $usbDir
 
-    # setupapi.dev.log
-    $setupapiPath = "${script:TargetRoot}Windows\inf\setupapi.dev.log"
-    if (Test-Path $setupapiPath) {
-        Log "Collecting setupapi.dev.log..."
-        Copy-ForensicFile -SourcePath $setupapiPath -DestDir $usbDir
-        Log-Success "Collected setupapi.dev.log"
+    # setupapi device logs: setupapi.dev.log plus the rotated
+    # setupapi.dev.<yyyymmdd_hhmmss>.log files (original names kept)
+    $infDir = "${script:TargetRoot}Windows\INF"
+    $setupapiLogs = @(Get-ChildItem -LiteralPath $infDir -Filter "setupapi.dev*.log" -File -Force -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -like "setupapi.dev*.log" } | Sort-Object Name)
+    if ($setupapiLogs.Count -gt 0) {
+        Log "Collecting $($setupapiLogs.Count) setupapi device log(s)..."
+        $setupapiCount = 0
+        foreach ($setupapiLog in $setupapiLogs) {
+            Copy-ForensicFile -SourcePath $setupapiLog.FullName -DestDir $usbDir
+            if (Test-Path -LiteralPath (Join-Path $usbDir $setupapiLog.Name)) { $setupapiCount++ }
+        }
+        Log-Success "Collected $setupapiCount setupapi device log(s): $(($setupapiLogs | ForEach-Object { $_.Name }) -join ', ')"
     } else {
-        Log-Warning "setupapi.dev.log not found."
+        Log-Warning "No setupapi.dev*.log found in $infDir"
     }
 
     # USB device registry entries (live system only -- queries live HKLM registry)
@@ -1340,6 +2225,20 @@ if ($Categories -contains "USB") {
                     Select-Object FriendlyName, HardwareID, Mfg, Service, ContainerID, PSChildName |
                     Format-List
             }
+
+        # USB storage disks with PnP first-install / arrival / removal times
+        # (includes devices that are not currently connected)
+        Log "Collecting USB storage device PnP timestamps..."
+        if (Get-Command Get-PnpDevice -ErrorAction SilentlyContinue) {
+            $usbStorageRows = @(Get-TriageUsbStorageRows)
+            Export-TriageCsv -Description "USB storage devices (PnP properties)" `
+                -DestPath (Join-Path $usbDir "usb_storage_devices.csv") `
+                -Columns @("FriendlyName", "InstanceId", "Serial", "FirstInstallUtc", "InstallUtc", "LastArrivalUtc", "LastRemovalUtc") `
+                -Rows $usbStorageRows
+            Log-Success "Collected PnP timestamps for $($usbStorageRows.Count) USB storage device(s)."
+        } else {
+            Log-Warning "Get-PnpDevice not available -- usb_storage_devices.csv not collected."
+        }
 
         Save-CommandOutput -Description "USB devices" `
             -DestPath (Join-Path $usbDir "usb_devices.txt") `
@@ -1374,26 +2273,24 @@ if ($Categories -contains "Persistence") {
     Ensure-Directory $persDir
 
     if ($script:IsLive) {
-        # Scheduled Tasks (live system only)
+        # Scheduled Tasks (live system only) -- all tasks, including disabled ones
         Log "Collecting scheduled tasks..."
-        Save-CommandOutput -Description "scheduled_tasks" `
+        $taskRows = @(Get-TriageScheduledTaskRows)
+        Export-TriageCsv -Description "scheduled_tasks" `
             -DestPath (Join-Path $persDir "scheduled_tasks.csv") `
-            -Command {
-                Get-ScheduledTask -ErrorAction SilentlyContinue |
-                    Where-Object { $_.State -ne "Disabled" } |
-                    Select-Object TaskName, TaskPath, State, Author,
-                        @{Name='Actions';Expression={($_.Actions | ForEach-Object { $_.Execute + " " + $_.Arguments }) -join "; "}},
-                        @{Name='Triggers';Expression={($_.Triggers | ForEach-Object { $_.ToString() }) -join "; "}} |
-                    ConvertTo-Csv -NoTypeInformation
-            }
+            -Columns @("TaskName", "TaskPath", "State", "Author", "UserId", "Actions", "Triggers",
+                "RegistrationDateUtc", "LastRunTimeUtc", "NextRunTimeUtc", "LastTaskResult") `
+            -Rows $taskRows
+        Log "Scheduled tasks: $($taskRows.Count) task(s) found."
 
-        # Services
+        # Services (KeyLastWriteUtc = last-write time of the service's registry key)
         Log "Collecting services..."
         Save-CommandOutput -Description "services" `
             -DestPath (Join-Path $persDir "services.csv") `
             -Command {
                 Get-CimInstance Win32_Service |
-                    Select-Object Name, DisplayName, State, StartMode, PathName, StartName, Description |
+                    Select-Object Name, DisplayName, State, StartMode, PathName, StartName, Description,
+                        @{Name='KeyLastWriteUtc';Expression={ Get-TriageServiceKeyLastWriteUtc $_.Name }} |
                     ConvertTo-Csv -NoTypeInformation
             }
 
@@ -1407,54 +2304,22 @@ if ($Categories -contains "Persistence") {
                     ConvertTo-Csv -NoTypeInformation
             }
 
-        # Run / RunOnce keys
+        # Run / RunOnce keys: HKLM plus every loaded user hive (not only the
+        # account running the collector)
         Log "Collecting Run/RunOnce registry keys..."
         Save-CommandOutput -Description "run_keys" `
             -DestPath (Join-Path $persDir "run_keys.txt") `
-            -Command {
-                $runKeys = @(
-                    "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
-                    "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce",
-                    "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run",
-                    "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\RunOnce",
-                    "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
-                    "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce",
-                    "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer\Run",
-                    "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer\Run",
-                    "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders",
-                    "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders",
-                    "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders",
-                    "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders"
-                )
-                foreach ($key in $runKeys) {
-                    Write-Output "=== $key ==="
-                    if (Test-Path $key) {
-                        Get-ItemProperty -Path $key -ErrorAction SilentlyContinue | Format-List
-                    } else {
-                        Write-Output "(key does not exist)"
-                    }
-                    Write-Output ""
-                }
-            }
+            -Command { Get-TriageRunKeyText }
+        $runKeyRows = @(Get-TriageRunKeyRows)
+        Export-TriageCsv -Description "run_keys csv" `
+            -DestPath (Join-Path $persDir "run_keys.csv") `
+            -Columns @("Hive", "User", "KeyPath", "ValueName", "Command", "KeyLastWriteUtc") `
+            -Rows $runKeyRows
+        Log "Run keys: $($runKeyRows.Count) value(s) in HKLM and $(@(Get-TriageLoadedUserSids).Count) loaded user hive(s)."
 
-        # Startup folder contents
-        Save-CommandOutput -Description "startup_folders" `
-            -DestPath (Join-Path $persDir "startup_folders.txt") `
-            -Command {
-                $startupPaths = @(
-                    "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup",
-                    "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\StartUp"
-                )
-                foreach ($sp in $startupPaths) {
-                    Write-Output "=== $sp ==="
-                    if (Test-Path $sp) {
-                        Get-ChildItem $sp -ErrorAction SilentlyContinue | Format-Table Name, LastWriteTime, Length -AutoSize
-                    } else {
-                        Write-Output "(path does not exist)"
-                    }
-                    Write-Output ""
-                }
-            }
+        # Startup folder contents (all-users folder + every user profile)
+        Log "Collecting startup folders..."
+        Save-TriageStartupFolders -PersistenceDir $persDir
 
         # WMI Event Subscriptions (persistence mechanism)
         Log "Collecting WMI event subscriptions..."
@@ -1503,7 +2368,8 @@ if ($Categories -contains "Persistence") {
             -DestPath (Join-Path $persDir "drivers.csv") `
             -Command {
                 Get-WmiObject Win32_SystemDriver |
-                    Select-Object Name, DisplayName, PathName, State, StartMode, ServiceType |
+                    Select-Object Name, DisplayName, PathName, State, StartMode, ServiceType,
+                        @{Name='KeyLastWriteUtc';Expression={ Get-TriageServiceKeyLastWriteUtc $_.Name }} |
                     ConvertTo-Csv -NoTypeInformation
             }
 
@@ -1542,16 +2408,9 @@ if ($Categories -contains "Persistence") {
             Log-Success "Collected $taskCount scheduled task XML file(s)."
         }
 
-        # Startup folders from mounted image
-        $startupPath = "${script:TargetRoot}ProgramData\Microsoft\Windows\Start Menu\Programs\StartUp"
-        if (Test-Path $startupPath) {
-            Save-CommandOutput -Description "startup_folders" `
-                -DestPath (Join-Path $persDir "startup_folders.txt") `
-                -Command {
-                    Write-Output "=== $startupPath ==="
-                    Get-ChildItem $startupPath -ErrorAction SilentlyContinue | Format-Table Name, LastWriteTime, Length -AutoSize
-                }
-        }
+        # Startup folders from mounted image (all-users folder + every user profile)
+        Log "Collecting startup folders..."
+        Save-TriageStartupFolders -PersistenceDir $persDir
 
         Log "Skipping live-only persistence checks (services, WMI, drivers, DLLs, Run keys)"
     }
@@ -1940,12 +2799,80 @@ if ($Categories -contains "AntiVirus") {
 # =============================================================
 # Cleanup: Remove Shadow Copy and Defender Exclusion
 # =============================================================
-if ($script:IsLive) {
-    Remove-ShadowCopy
-    Log "Removing temporary Defender exclusion..."
-    Remove-DefenderExclusion
-    Log-Success "Defender exclusion removed."
+$script:collectionCompleted = $true
+
+# End of the collection try block that starts above the "Collection
+# Started" log line (the body in between is intentionally not
+# re-indented). The finally block runs on normal completion, on
+# terminating errors, on exit and on Ctrl+C, so the shadow copy and the
+# Defender exclusion are never left behind. (Closing the console window
+# kills the process outright; that cannot be caught.)
+} finally {
+    Invoke-CollectionCleanup
 }
+
+# =============================================================
+# Collected copies keep the attributes of their source. Compress-Archive
+# in Windows PowerShell 5.1 silently leaves out hidden files (NTUSER.DAT,
+# UsrClass.dat, hive .LOG1/.LOG2, ...), so clear Hidden/System on
+# everything in the collection folder.
+# =============================================================
+try {
+    $hiddenMask = [int][System.IO.FileAttributes]::Hidden -bor [int][System.IO.FileAttributes]::System
+    Get-ChildItem -LiteralPath $OutputPath -Recurse -Force -ErrorAction SilentlyContinue |
+        Where-Object { ([int]$_.Attributes -band $hiddenMask) -ne 0 } |
+        ForEach-Object {
+            $item = $_
+            try {
+                $newAttributes = [int]$item.Attributes -band (-bnot $hiddenMask)
+                if ($newAttributes -eq 0) { $newAttributes = [int][System.IO.FileAttributes]::Normal }
+                $item.Attributes = [System.IO.FileAttributes]$newAttributes
+            } catch {
+                Log-Warning "Could not clear hidden/system attribute (may be missing from the zip): $($item.FullName)"
+            }
+        }
+} catch {
+    Log-Warning "Could not clear hidden/system attributes in the collection: $($_.Exception.Message)"
+}
+
+# =============================================================
+# Summary: written to collection_log.txt BEFORE compression so the
+# zip contains it; shown on screen again at the very end
+# =============================================================
+$endTime = Get-Date
+$duration = $endTime - $script:startTime
+$zipPath = "$OutputPath.zip"
+$memDumpFile = Join-Path $OutputPath "Memory\memory_dump.raw"
+$memDumpMovedTo = $null
+
+$summaryLines = @(
+    "============================================================="
+    "  COLLECTION SUMMARY"
+    "============================================================="
+    "  Target drive:   ${TargetDrive}: ($( if ($script:IsLive) { 'LIVE SYSTEM' } else { 'MOUNTED IMAGE' } ))"
+    "  Computer:       $env:COMPUTERNAME"
+    "  Start time:     $($script:startTime.ToString('yyyy-MM-dd HH:mm:ss'))"
+    "  End time:       $($endTime.ToString('yyyy-MM-dd HH:mm:ss')) (before compression)"
+    "  Duration:       $($duration.ToString('hh\:mm\:ss'))"
+    "  Files collected: $($script:fileCount)"
+    "  Errors:         $($script:errorCount)"
+    "  Total size:     $([math]::Round($script:totalBytes / 1MB, 2)) MB"
+)
+if ($NoCompress) {
+    $summaryLines += "  Output:         $OutputPath"
+} else {
+    $summaryLines += "  Output:         $zipPath"
+    if ((Get-FileLength $memDumpFile) -ge 0) {
+        $summaryLines += "  Memory dump:    ${OutputPath}_memory_dump.raw (kept outside the zip)"
+    }
+}
+$summaryLines += "  Manifest:       collection_manifest.csv (inside collection)"
+$summaryLines += "============================================================="
+
+Log ""
+foreach ($summaryLine in $summaryLines) { Log $summaryLine }
+Log ""
+Log "=== Windows Forensic Triage Collection Complete ==="
 
 # =============================================================
 # Compression
@@ -1954,29 +2881,26 @@ if (-not $NoCompress) {
     Log "============================================================="
     Log "  COMPRESSING OUTPUT"
     Log "============================================================="
-    $zipPath = "$OutputPath.zip"
 
     # Check for memory dump -- too large for Compress-Archive (>2 GB limit)
-    $memDumpFile = Join-Path $OutputPath "Memory\memory_dump.raw"
-    $memDumpMovedTo = $null
-    if (Test-Path $memDumpFile) {
-        $dumpSizeGB = [math]::Round((Get-Item $memDumpFile).Length / 1GB, 2)
+    if ((Get-FileLength $memDumpFile) -ge 0) {
+        $dumpSizeGB = [math]::Round((Get-FileLength $memDumpFile) / 1GB, 2)
         Log "Memory dump detected ($dumpSizeGB GB) -- excluding from zip (too large)."
         # Move dump out of the collection folder temporarily
         $memDumpMovedTo = "${OutputPath}_memory_dump.raw"
-        Move-Item -Path $memDumpFile -Destination $memDumpMovedTo -Force
+        Move-Item -LiteralPath $memDumpFile -Destination $memDumpMovedTo -Force
         # Remove empty Memory folder if only the dump was in it
         $memDir = Join-Path $OutputPath "Memory"
-        $memDirContents = Get-ChildItem $memDir -File -ErrorAction SilentlyContinue
+        $memDirContents = Get-ChildItem -LiteralPath $memDir -File -Force -ErrorAction SilentlyContinue
         if ($memDirContents.Count -eq 0) {
-            Remove-Item $memDir -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $memDir -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
 
     Log "Compressing to: $zipPath"
     try {
-        Compress-Archive -Path $OutputPath -DestinationPath $zipPath -Force -ErrorAction Stop
-        $zipSize = [math]::Round((Get-Item $zipPath).Length / 1MB, 2)
+        Compress-Archive -LiteralPath $OutputPath -DestinationPath $zipPath -Force -ErrorAction Stop
+        $zipSize = [math]::Round((Get-FileLength $zipPath) / 1MB, 2)
         Log-Success "Compressed to $zipPath ($zipSize MB)"
 
         # Stop logging to file before deleting the folder that contains it
@@ -1984,10 +2908,10 @@ if (-not $NoCompress) {
 
         # Clean up uncompressed folder after successful zip
         Log "Removing uncompressed collection folder..."
-        Remove-Item -Path $OutputPath -Recurse -Force -ErrorAction Stop
+        Remove-Item -LiteralPath $OutputPath -Recurse -Force -ErrorAction Stop
         Log-Success "Cleanup complete. Only the .zip remains."
 
-        if ($memDumpMovedTo -and (Test-Path $memDumpMovedTo)) {
+        if ($memDumpMovedTo -and (Test-Path -LiteralPath $memDumpMovedTo)) {
             Log-Success "Memory dump saved separately: $memDumpMovedTo"
             Log "  (Not included in zip due to size. Transfer separately.)"
         }
@@ -1995,45 +2919,30 @@ if (-not $NoCompress) {
         Log-Warning "Compression or cleanup issue: $($_.Exception.Message)"
         Log "Output may remain at: $OutputPath"
         # Move dump back if compression failed
-        if ($memDumpMovedTo -and (Test-Path $memDumpMovedTo)) {
+        if ($memDumpMovedTo -and (Test-Path -LiteralPath $memDumpMovedTo)) {
             $memDir = Join-Path $OutputPath "Memory"
             Ensure-Directory $memDir
-            Move-Item -Path $memDumpMovedTo -Destination (Join-Path $memDir "memory_dump.raw") -Force
+            Move-Item -LiteralPath $memDumpMovedTo -Destination (Join-Path $memDir "memory_dump.raw") -Force
         }
     }
 }
 
 # =============================================================
-# Summary
+# Summary on screen (the same text is in collection_log.txt)
 # =============================================================
-$endTime = Get-Date
-$duration = $endTime - $script:startTime
-
-Log ""
-Log "============================================================="
-Log "  COLLECTION SUMMARY"
-Log "============================================================="
-Log "  Target drive:   ${TargetDrive}: ($( if ($script:IsLive) { 'LIVE SYSTEM' } else { 'MOUNTED IMAGE' } ))"
-Log "  Computer:       $env:COMPUTERNAME"
-Log "  Start time:     $($script:startTime.ToString('yyyy-MM-dd HH:mm:ss'))"
-Log "  End time:       $($endTime.ToString('yyyy-MM-dd HH:mm:ss'))"
-Log "  Duration:       $($duration.ToString('hh\:mm\:ss'))"
-Log "  Files collected: $($script:fileCount)"
-Log "  Errors:         $($script:errorCount)"
-Log "  Total size:     $([math]::Round($script:totalBytes / 1MB, 2)) MB"
-if (-not $NoCompress -and (Test-Path "$OutputPath.zip")) {
-    Log "  Output:         $OutputPath.zip"
-} else {
-    Log "  Output:         $OutputPath"
+Write-Host ""
+foreach ($summaryLine in $summaryLines) { Write-Host $summaryLine }
+if (-not $NoCompress) {
+    if ((Get-FileLength $zipPath) -gt 0) {
+        Write-Host "  Zip created:    $zipPath ($([math]::Round((Get-FileLength $zipPath) / 1MB, 2)) MB)" -ForegroundColor Green
+    } else {
+        Write-Host "  Zip NOT created -- collection left at: $OutputPath" -ForegroundColor Yellow
+    }
 }
-if ($memDumpMovedTo -and (Test-Path $memDumpMovedTo)) {
-    $dumpGB = [math]::Round((Get-Item $memDumpMovedTo).Length / 1GB, 2)
-    Log "  Memory dump:    $memDumpMovedTo ($dumpGB GB)"
+if ($memDumpMovedTo -and (Test-Path -LiteralPath $memDumpMovedTo)) {
+    $dumpGB = [math]::Round((Get-FileLength $memDumpMovedTo) / 1GB, 2)
+    Write-Host "  Memory dump:    $memDumpMovedTo ($dumpGB GB)"
 }
-Log "  Manifest:       (inside collection)"
-Log "============================================================="
-Log ""
-Log "=== Windows Forensic Triage Collection Complete ==="
 
 Write-Host ""
 Write-Host "Press any key to exit..." -ForegroundColor Cyan

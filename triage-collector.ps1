@@ -3500,18 +3500,27 @@ if ($Categories -contains "AntiVirus") {
     }
 
     # --- Symantec Endpoint Protection ---
-    $sepLogDir = "${script:TargetRoot}ProgramData\Symantec\Symantec Endpoint Protection\CurrentVersion\Data\Logs"
-    if (Test-Path $sepLogDir) {
+    # SEP 12+ (CurrentVersion\Data\Logs) and SEP 11 (Logs). The daily AV scan
+    # logs (AV\*.Log, parsed by the timeline builder) are always collected;
+    # the other logs: newest 20.
+    $sepLogDirs = @(
+        "${script:TargetRoot}ProgramData\Symantec\Symantec Endpoint Protection\CurrentVersion\Data\Logs",
+        "${script:TargetRoot}ProgramData\Symantec\Symantec Endpoint Protection\Logs"
+    ) | Where-Object { Test-Path -LiteralPath $_ }
+    if ($sepLogDirs) {
         Log "Detected Symantec Endpoint Protection -- collecting logs..."
         $sepDestDir = Join-Path $avDir "Symantec_SEP"
         Ensure-Directory $sepDestDir
-        $sepLogs = Get-ChildItem -Path $sepLogDir -File -Recurse -Force -ErrorAction SilentlyContinue |
-            Where-Object { $_.Length -gt 0 } |
-            Sort-Object LastWriteTime -Descending | Select-Object -First 20
+        $sepAll = @(Get-ChildItem -LiteralPath $sepLogDirs -File -Recurse -Force -ErrorAction SilentlyContinue |
+            Where-Object { $_.Length -gt 0 })
+        $sepAvLogs = @($sepAll | Where-Object { $_.Directory.Name -eq "AV" -and $_.Extension -eq ".log" })
+        $sepOther = @($sepAll | Where-Object { -not ($_.Directory.Name -eq "AV" -and $_.Extension -eq ".log") } |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 20)
+        $sepLogs = @($sepAvLogs) + @($sepOther)
         foreach ($sl in $sepLogs) {
             Copy-ForensicFile -SourcePath $sl.FullName -DestDir $sepDestDir
         }
-        Log-Success "Collected $($sepLogs.Count) Symantec SEP log(s)."
+        Log-Success "Collected $($sepLogs.Count) Symantec SEP log(s) ($($sepAvLogs.Count) daily AV log(s))."
     }
 
     # Symantec event logs
@@ -3627,9 +3636,14 @@ if ($Categories -contains "AntiVirus") {
         Log "Detected Sophos -- collecting logs..."
         $sophosDestDir = Join-Path $avDir "Sophos"
         Ensure-Directory $sophosDestDir
-        $sophosLogs = Get-ChildItem -Path $sophosLogDir -File -Recurse -Force -ErrorAction SilentlyContinue |
-            Where-Object { $_.Extension -in ".log", ".txt", ".xml", ".csv" -and $_.Length -gt 0 } |
-            Sort-Object LastWriteTime -Descending | Select-Object -First 20
+        $sophosAll = @(Get-ChildItem -Path $sophosLogDir -File -Recurse -Force -ErrorAction SilentlyContinue |
+            Where-Object { $_.Extension -in ".log", ".txt", ".xml", ".csv" -and $_.Length -gt 0 })
+        # Sophos Anti-Virus detection log (SAV.txt, parsed by the timeline
+        # builder) always; everything else: newest 20
+        $sophosKey = @($sophosAll | Where-Object { $_.Name -like "SAV*.txt" })
+        $sophosOther = @($sophosAll | Where-Object { $_.Name -notlike "SAV*.txt" } |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 20)
+        $sophosLogs = @($sophosKey) + @($sophosOther)
         foreach ($sl in $sophosLogs) {
             Copy-ForensicFile -SourcePath $sl.FullName -DestDir $sophosDestDir
         }
@@ -3637,21 +3651,29 @@ if ($Categories -contains "AntiVirus") {
     }
 
     # --- ESET ---
-    $esetLogDir = "${script:TargetRoot}ProgramData\ESET\ESET Security\Logs"
-    if (-not (Test-Path $esetLogDir)) {
-        $esetLogDir = "${script:TargetRoot}ProgramData\ESET\ESET NOD32 Antivirus\Logs"
-    }
-    if (Test-Path $esetLogDir) {
-        Log "Detected ESET -- collecting logs..."
-        $esetDestDir = Join-Path $avDir "ESET"
-        Ensure-Directory $esetDestDir
-        $esetLogs = Get-ChildItem -Path $esetLogDir -File -Recurse -Force -ErrorAction SilentlyContinue |
-            Where-Object { $_.Length -gt 0 } |
-            Sort-Object LastWriteTime -Descending | Select-Object -First 20
-        foreach ($el in $esetLogs) {
-            Copy-ForensicFile -SourcePath $el.FullName -DestDir $esetDestDir
+    # Every ESET product keeps its logs in ProgramData\ESET\<product>\Logs
+    # (ESET Security, NOD32 Antivirus, Smart/Internet Security, Endpoint
+    # Antivirus/Security, File/Server Security, ...). Each product goes to its
+    # own subfolder; virlog.dat (detections) is always collected.
+    $esetProductDirs = @(Get-ChildItem -LiteralPath "${script:TargetRoot}ProgramData\ESET" -Directory -Force -ErrorAction SilentlyContinue |
+        Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName "Logs") })
+    if ($esetProductDirs.Count -gt 0) {
+        Log "Detected ESET ($(($esetProductDirs | ForEach-Object { $_.Name }) -join ', ')) -- collecting logs..."
+        $esetCount = 0
+        foreach ($esetProduct in $esetProductDirs) {
+            $esetDestDir = Join-Path $avDir "ESET\$($esetProduct.Name)"
+            Ensure-Directory $esetDestDir
+            $esetAll = @(Get-ChildItem -LiteralPath (Join-Path $esetProduct.FullName "Logs") -File -Recurse -Force -ErrorAction SilentlyContinue |
+                Where-Object { $_.Length -gt 0 })
+            $esetKey = @($esetAll | Where-Object { $_.Name -like "virlog*.dat" })
+            $esetOther = @($esetAll | Where-Object { $_.Name -notlike "virlog*.dat" } |
+                Sort-Object LastWriteTime -Descending | Select-Object -First 20)
+            foreach ($el in (@($esetKey) + @($esetOther))) {
+                Copy-ForensicFile -SourcePath $el.FullName -DestDir $esetDestDir
+                $esetCount++
+            }
         }
-        Log-Success "Collected $($esetLogs.Count) ESET log(s)."
+        Log-Success "Collected $esetCount ESET log(s)."
     }
 
     # --- Kaspersky ---
@@ -3670,17 +3692,24 @@ if ($Categories -contains "AntiVirus") {
     }
 
     # --- McAfee / Trellix ---
-    $mcafeeLogDir = "${script:TargetRoot}ProgramData\McAfee"
-    if (-not (Test-Path $mcafeeLogDir)) {
-        $mcafeeLogDir = "${script:TargetRoot}ProgramData\Trellix"
-    }
-    if (Test-Path $mcafeeLogDir) {
+    # Both folders are checked (Trellix-branded products can sit next to
+    # older McAfee ones). VirusScan logs in DesktopProtection\ (incl.
+    # AccessProtectionLog.txt, parsed by the timeline builder) always;
+    # everything else: newest 20.
+    $mcafeeLogDirs = @(
+        "${script:TargetRoot}ProgramData\McAfee",
+        "${script:TargetRoot}ProgramData\Trellix"
+    ) | Where-Object { Test-Path -LiteralPath $_ }
+    if ($mcafeeLogDirs) {
         Log "Detected McAfee/Trellix -- collecting logs..."
         $mcafeeDestDir = Join-Path $avDir "McAfee_Trellix"
         Ensure-Directory $mcafeeDestDir
-        $mcafeeLogs = Get-ChildItem -Path $mcafeeLogDir -File -Recurse -Force -ErrorAction SilentlyContinue |
-            Where-Object { $_.Extension -in ".log", ".txt", ".csv" -and $_.Length -gt 0 } |
-            Sort-Object LastWriteTime -Descending | Select-Object -First 20
+        $mcafeeAll = @(Get-ChildItem -LiteralPath $mcafeeLogDirs -File -Recurse -Force -ErrorAction SilentlyContinue |
+            Where-Object { $_.Extension -in ".log", ".txt", ".csv" -and $_.Length -gt 0 })
+        $mcafeeKey = @($mcafeeAll | Where-Object { $_.Directory.Name -eq "DesktopProtection" })
+        $mcafeeOther = @($mcafeeAll | Where-Object { $_.Directory.Name -ne "DesktopProtection" } |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 20)
+        $mcafeeLogs = @($mcafeeKey) + @($mcafeeOther)
         foreach ($ml in $mcafeeLogs) {
             Copy-ForensicFile -SourcePath $ml.FullName -DestDir $mcafeeDestDir
         }

@@ -79,7 +79,7 @@ if (-not $TargetDrive) {
             try {
                 $vol = Get-Volume -DriveLetter $drv.Name -ErrorAction SilentlyContinue
                 if ($vol.FileSystemLabel) { $volLabel = " ($($vol.FileSystemLabel))" }
-            } catch {}
+            } catch { Write-Verbose "Reading volume label of drive $($drv.Name): $($_.Exception.Message)" }
             $sizeGB = [math]::Round($drv.Used / 1GB + $drv.Free / 1GB, 0)
             $nestedNote = ""
             if ($winRoot -ne $drvRoot) {
@@ -318,7 +318,7 @@ function Get-FileLength {
     try {
         $fi = New-Object System.IO.FileInfo($Path)
         if ($fi.Exists) { return $fi.Length }
-    } catch {}
+    } catch { Write-Verbose "Reading file size of ${Path}: $($_.Exception.Message)" }
     return -1
 }
 
@@ -357,7 +357,7 @@ function Get-CollectionRelativePath {
         if ($full.StartsWith($root + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
             return $full.Substring($root.Length + 1)
         }
-    } catch {}
+    } catch { Write-Verbose "Computing collection-relative path of ${Path}: $($_.Exception.Message)" }
     return ""
 }
 
@@ -449,7 +449,7 @@ function Copy-ForensicFile {
         Copy-Item -LiteralPath $SourcePath -Destination $destPath -Force -ErrorAction Stop
         Record-Manifest -SourcePath $SourcePath -DestPath $destPath -SourceTimes $srcTimes
         return
-    } catch {}
+    } catch { Write-Verbose "Copy-Item fallback for ${SourcePath}: $($_.Exception.Message)" }
 
     # File is in use (sharing/lock violation) on a live system, e.g. a browser
     # database: read it from the Volume Shadow Copy instead
@@ -573,11 +573,11 @@ function Initialize-ShadowCopy {
 
     Log "Creating Volume Shadow Copy for locked file access..."
     try {
-        $shadow = (Get-WmiObject -List Win32_ShadowCopy).Create($script:TargetRoot, "ClientAccessible")
+        $shadow = Invoke-CimMethod -ClassName Win32_ShadowCopy -MethodName Create -Arguments @{ Volume = $script:TargetRoot; Context = "ClientAccessible" } -ErrorAction Stop
         if ($shadow.ReturnValue -eq 0) {
             # Remember the ID first so cleanup can delete it even if the lookup below fails
             $script:shadowId = $shadow.ShadowID
-            $shadowObj = Get-WmiObject Win32_ShadowCopy | Where-Object { $_.ID -eq $script:shadowId }
+            $shadowObj = Get-CimInstance -ClassName Win32_ShadowCopy -Filter "ID='$($script:shadowId)'"
             $script:shadowPath = $shadowObj.DeviceObject
             if (-not $script:shadowPath) {
                 Log-Warning "Shadow copy created but its device path could not be read."
@@ -677,9 +677,9 @@ function Remove-ShadowCopy {
     if ($script:shadowId) {
         Log "Removing shadow copy..."
         try {
-            $shadowObj = Get-WmiObject Win32_ShadowCopy | Where-Object { $_.ID -eq $script:shadowId }
+            $shadowObj = Get-CimInstance -ClassName Win32_ShadowCopy -Filter "ID='$($script:shadowId)'" -ErrorAction Stop
             if ($shadowObj) {
-                $shadowObj.Delete()
+                Remove-CimInstance -InputObject $shadowObj -ErrorAction Stop
                 Log-Success "Shadow copy removed."
             }
         } catch {
@@ -745,7 +745,7 @@ function Get-ImageTimeZoneId {
         [System.IO.File]::Copy($hiveSrc, $hiveCopy, $true)
         foreach ($logExt in @(".LOG1", ".LOG2")) {
             if ([System.IO.File]::Exists($hiveSrc + $logExt)) {
-                try { [System.IO.File]::Copy($hiveSrc + $logExt, $hiveCopy + $logExt, $true) } catch {}
+                try { [System.IO.File]::Copy($hiveSrc + $logExt, $hiveCopy + $logExt, $true) } catch { Write-Verbose "Copying SYSTEM$logExt for the time zone lookup: $($_.Exception.Message)" }
             }
         }
 
@@ -967,7 +967,6 @@ if ($Categories -contains "Memory") {
                 $result | Out-File $memLogFile -Encoding utf8
 
                 if ((Get-FileLength $dumpFile) -gt 0) {
-                    $dumpSizeMB = [math]::Round((Get-FileLength $dumpFile) / 1MB, 0)
                     $dumpSizeGB = [math]::Round((Get-FileLength $dumpFile) / 1GB, 2)
                     Record-Manifest -SourcePath "(memory dump via $memToolName)" -DestPath $dumpFile
                     Log-Success "Memory dump captured: $dumpFile ($dumpSizeGB GB)"
@@ -1148,19 +1147,19 @@ if ($Categories -contains "Registry") {
                         $profileKey = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$sid"
                         $profileImage = (Get-ItemProperty -LiteralPath $profileKey -Name ProfileImagePath -ErrorAction Stop).ProfileImagePath
                         if ($profileImage) { $profileName = [System.IO.Path]::GetFileName($profileImage.TrimEnd('\')) }
-                    } catch {}
+                    } catch { Write-Verbose "Reading ProfileList entry for ${sid}: $($_.Exception.Message)" }
                     # Fallback: account name
                     if (-not $profileName) {
                         try {
                             $objSID = New-Object System.Security.Principal.SecurityIdentifier($sid)
                             $objUser = $objSID.Translate([System.Security.Principal.NTAccount])
                             $profileName = $objUser.Value -replace '^.*\\', ''
-                        } catch {}
+                        } catch { Write-Verbose "Translating SID $sid to an account name: $($_.Exception.Message)" }
                     }
                     if ($profileName) { $sidToUser[$profileName] = $sid }
                 }
             }
-        } catch {}
+        } catch { Write-Verbose "Mapping loaded HKU hives to profile folders: $($_.Exception.Message)" }
     }
 
     foreach ($userDir in $userProfiles) {
@@ -1187,7 +1186,7 @@ if ($Categories -contains "Registry") {
                         Log-Success "Collected NTUSER.DAT for $userName via reg save"
                         $collected = $true
                     }
-                } catch {}
+                } catch { Write-Verbose "reg save of HKU\$userSid for ${userName}: $($_.Exception.Message)" }
             }
 
             # Method 2: Shadow copy
@@ -1219,7 +1218,7 @@ if ($Categories -contains "Registry") {
                         Log-Success "Collected UsrClass.dat for $userName via reg save"
                         $collected = $true
                     }
-                } catch {}
+                } catch { Write-Verbose "reg save of HKU\${userSid}_Classes for ${userName}: $($_.Exception.Message)" }
             }
 
             # Method 2: Shadow copy
@@ -1367,7 +1366,7 @@ function Get-TriageRegLastWriteUtc {
         if ($rc -eq 0 -and $fileTime -gt 0) {
             return [DateTime]::FromFileTimeUtc($fileTime).ToString("o")
         }
-    } catch {}
+    } catch { Write-Verbose "Reading last-write time of $($Key.Name): $($_.Exception.Message)" }
     return ""
 }
 
@@ -1402,7 +1401,9 @@ function Get-TriageLoadedUserSids {
         foreach ($name in $hku.GetSubKeyNames()) {
             if ($name -match '^S-1-(5-21|12-1)-[\d-]+$') { $sids += $name }
         }
-    } catch {}
+    } catch {
+        Log-Warning "Could not enumerate loaded user hives under HKU (per-user registry data skipped): $($_.Exception.Message)"
+    }
     return $sids
 }
 
@@ -1421,6 +1422,7 @@ function Resolve-TriageSidUser {
                 $profilePath = [string]$profileKey.GetValue("ProfileImagePath")
                 if ($profilePath) { $name = [IO.Path]::GetFileName($profilePath.TrimEnd('\')) }
             } catch {
+                Write-Verbose "Reading ProfileImagePath for ${Sid}: $($_.Exception.Message)"
             } finally {
                 $profileKey.Close()
             }
@@ -1430,7 +1432,7 @@ function Resolve-TriageSidUser {
         try {
             $account = (New-Object System.Security.Principal.SecurityIdentifier($Sid)).Translate([System.Security.Principal.NTAccount]).Value
             $name = $account -replace '^.*\\', ''
-        } catch {}
+        } catch { Write-Verbose "Translating SID $Sid to an account name: $($_.Exception.Message)" }
     }
     $script:sidUserCache[$Sid] = $name
     return $name
@@ -1471,6 +1473,8 @@ function Get-TriageBamRows {
         )
     )
     $rows = @()
+    $failedSidKeys = 0
+    $lastError = ""
     foreach ($keyPath in $KeyPaths) {
         $rootKey = Open-TriageRegKey -Hive $Hive -SubKey $keyPath
         if ($null -eq $rootKey) { continue }
@@ -1488,7 +1492,7 @@ function Get-TriageBamRows {
                         $fileTime = [BitConverter]::ToInt64($data, 0)
                         $lastExec = ""
                         if ($fileTime -gt 0) {
-                            try { $lastExec = [DateTime]::FromFileTimeUtc($fileTime).ToString("o") } catch {}
+                            try { $lastExec = [DateTime]::FromFileTimeUtc($fileTime).ToString("o") } catch { Write-Verbose "Converting BAM FILETIME of ${valueName}: $($_.Exception.Message)" }
                         }
                         $rows += [PSCustomObject]@{
                             Sid              = $sid
@@ -1498,6 +1502,8 @@ function Get-TriageBamRows {
                         }
                     }
                 } catch {
+                    $failedSidKeys++
+                    $lastError = $_.Exception.Message
                 } finally {
                     if ($null -ne $sidKey) { $sidKey.Close() }
                 }
@@ -1505,6 +1511,9 @@ function Get-TriageBamRows {
         } finally {
             $rootKey.Close()
         }
+    }
+    if ($failedSidKeys -gt 0) {
+        Log-Warning "Could not read BAM entries of $failedSidKeys user key(s) -- last error: $lastError"
     }
     return $rows
 }
@@ -1517,6 +1526,8 @@ function Get-TriageUsbStorageRows {
         "DEVPKEY_Device_LastArrivalDate", "DEVPKEY_Device_LastRemovalDate")
     $devices = @(Get-PnpDevice -ErrorAction SilentlyContinue |
         Where-Object { $_.InstanceId -like 'USBSTOR\DISK*' } | Sort-Object InstanceId)
+    $failedDevices = 0
+    $lastError = ""
     foreach ($device in $devices) {
         $times = @{}
         try {
@@ -1526,7 +1537,10 @@ function Get-TriageUsbStorageRows {
                     $times[$prop.KeyName] = $prop.Data.ToUniversalTime().ToString("o")
                 }
             }
-        } catch {}
+        } catch {
+            $failedDevices++
+            $lastError = $_.Exception.Message
+        }
         # Serial = last instance id segment without the "&<n>" LUN suffix
         $serial = (($device.InstanceId -split '\\')[-1]) -replace '&\d+$', ''
         $rows += [PSCustomObject]@{
@@ -1538,6 +1552,9 @@ function Get-TriageUsbStorageRows {
             LastArrivalUtc  = [string]$times["DEVPKEY_Device_LastArrivalDate"]
             LastRemovalUtc  = [string]$times["DEVPKEY_Device_LastRemovalDate"]
         }
+    }
+    if ($failedDevices -gt 0) {
+        Log-Warning "Could not read PnP install/arrival/removal times of $failedDevices USB storage device(s) -- last error: $lastError"
     }
     return $rows
 }
@@ -1571,9 +1588,16 @@ function ConvertFrom-TriageLocalTimeText {
 function Get-TriageScheduledTaskRows {
     $rows = @()
     $tasks = @(Get-ScheduledTask -ErrorAction SilentlyContinue)
+    $failedInfo = 0
+    $lastError = ""
     foreach ($task in $tasks) {
         $info = $null
-        try { $info = Get-ScheduledTaskInfo -InputObject $task -ErrorAction Stop } catch {}
+        try {
+            $info = Get-ScheduledTaskInfo -InputObject $task -ErrorAction Stop
+        } catch {
+            $failedInfo++
+            $lastError = $_.Exception.Message
+        }
 
         # Account the task runs as (group name for group principals)
         $runAs = ""
@@ -1617,6 +1641,9 @@ function Get-TriageScheduledTaskRows {
             NextRunTimeUtc      = $nextRun
             LastTaskResult      = $lastResult
         }
+    }
+    if ($failedInfo -gt 0) {
+        Log-Warning "Could not read run times (Get-ScheduledTaskInfo) of $failedInfo scheduled task(s) -- last error: $lastError"
     }
     return $rows
 }
@@ -1667,6 +1694,8 @@ function Get-TriageRunKeyRows {
                     }
                 }
             } catch {
+                # Few iterations (Run-key paths x loaded hives): one warning per key
+                Log-Warning "Could not read Run key $($hive.Hive)\$keyPath for run_keys.csv -- $($_.Exception.Message)"
             } finally {
                 $key.Close()
             }
@@ -1845,13 +1874,13 @@ if ($Categories -contains "Execution") {
                 $recentAppsCount++
             } else {
                 # Do not leave an empty folder behind
-                try { [IO.Directory]::Delete($recentAppsDir) } catch {}
+                try { [IO.Directory]::Delete($recentAppsDir) } catch { Write-Verbose "Removing empty folder ${recentAppsDir}: $($_.Exception.Message)" }
             }
         }
         if ($recentAppsCount -gt 0) {
             Log-Success "Collected RecentApps registry export for $recentAppsCount user(s)."
         } else {
-            try { [IO.Directory]::Delete((Join-Path $execDir "RecentApps")) } catch {}
+            try { [IO.Directory]::Delete((Join-Path $execDir "RecentApps")) } catch { Write-Verbose "Removing empty RecentApps folder: $($_.Exception.Message)" }
             Log "RecentApps key not found for any loaded user (normal on Windows 11 and recent Windows 10 builds)."
         }
 
@@ -2065,14 +2094,14 @@ if ($Categories -contains "Browser") {
             $chromeProfiles = Get-ChildItem -Path $chromeBase -Directory -ErrorAction SilentlyContinue |
                 Where-Object { $_.Name -eq "Default" -or $_.Name -match "^Profile \d+$" }
 
-            foreach ($profile in $chromeProfiles) {
-                $destDir = Join-Path $browserDir "$userName\Chrome\$($profile.Name)"
+            foreach ($browserProfile in $chromeProfiles) {
+                $destDir = Join-Path $browserDir "$userName\Chrome\$($browserProfile.Name)"
                 # History-journal: SQLite rollback journal (collected when present).
                 # Files locked by a running browser are read from the shadow copy
                 # (see Copy-ForensicFile).
                 $chromeFiles = @("History", "History-journal", "Bookmarks", "Login Data", "Cookies", "Web Data", "Top Sites", "Shortcuts")
                 foreach ($cf in $chromeFiles) {
-                    $sourcePath = Join-Path $profile.FullName $cf
+                    $sourcePath = Join-Path $browserProfile.FullName $cf
                     if (Test-Path -LiteralPath $sourcePath) {
                         Copy-ForensicFile -SourcePath $sourcePath -DestDir $destDir -DestName $cf
                     }
@@ -2088,11 +2117,11 @@ if ($Categories -contains "Browser") {
             $edgeProfiles = Get-ChildItem -Path $edgeBase -Directory -ErrorAction SilentlyContinue |
                 Where-Object { $_.Name -eq "Default" -or $_.Name -match "^Profile \d+$" }
 
-            foreach ($profile in $edgeProfiles) {
-                $destDir = Join-Path $browserDir "$userName\Edge\$($profile.Name)"
+            foreach ($browserProfile in $edgeProfiles) {
+                $destDir = Join-Path $browserDir "$userName\Edge\$($browserProfile.Name)"
                 $edgeFiles = @("History", "History-journal", "Bookmarks", "Login Data", "Cookies", "Web Data", "Top Sites", "Shortcuts")
                 foreach ($ef in $edgeFiles) {
-                    $sourcePath = Join-Path $profile.FullName $ef
+                    $sourcePath = Join-Path $browserProfile.FullName $ef
                     if (Test-Path -LiteralPath $sourcePath) {
                         Copy-ForensicFile -SourcePath $sourcePath -DestDir $destDir -DestName $ef
                     }
@@ -2108,11 +2137,11 @@ if ($Categories -contains "Browser") {
             $braveProfiles = Get-ChildItem -Path $braveBase -Directory -ErrorAction SilentlyContinue |
                 Where-Object { $_.Name -eq "Default" -or $_.Name -match "^Profile \d+$" }
 
-            foreach ($profile in $braveProfiles) {
-                $destDir = Join-Path $browserDir "$userName\Brave\$($profile.Name)"
+            foreach ($browserProfile in $braveProfiles) {
+                $destDir = Join-Path $browserDir "$userName\Brave\$($browserProfile.Name)"
                 $braveFiles = @("History", "History-journal", "Bookmarks", "Login Data", "Cookies", "Web Data", "Top Sites", "Shortcuts")
                 foreach ($bf in $braveFiles) {
-                    $sourcePath = Join-Path $profile.FullName $bf
+                    $sourcePath = Join-Path $browserProfile.FullName $bf
                     if (Test-Path -LiteralPath $sourcePath) {
                         Copy-ForensicFile -SourcePath $sourcePath -DestDir $destDir -DestName $bf
                     }
@@ -2149,11 +2178,11 @@ if ($Categories -contains "Browser") {
             $vivaldiProfiles = Get-ChildItem -Path $vivaldiBase -Directory -ErrorAction SilentlyContinue |
                 Where-Object { $_.Name -eq "Default" -or $_.Name -match "^Profile \d+$" }
 
-            foreach ($profile in $vivaldiProfiles) {
-                $destDir = Join-Path $browserDir "$userName\Vivaldi\$($profile.Name)"
+            foreach ($browserProfile in $vivaldiProfiles) {
+                $destDir = Join-Path $browserDir "$userName\Vivaldi\$($browserProfile.Name)"
                 $vivaldiFiles = @("History", "History-journal", "Bookmarks", "Login Data", "Cookies", "Web Data", "Top Sites", "Shortcuts")
                 foreach ($vf in $vivaldiFiles) {
-                    $sourcePath = Join-Path $profile.FullName $vf
+                    $sourcePath = Join-Path $browserProfile.FullName $vf
                     if (Test-Path -LiteralPath $sourcePath) {
                         Copy-ForensicFile -SourcePath $sourcePath -DestDir $destDir -DestName $vf
                     }
@@ -2168,13 +2197,13 @@ if ($Categories -contains "Browser") {
             Log "Collecting Firefox data for $userName..."
             $ffProfiles = Get-ChildItem -Path $firefoxBase -Directory -ErrorAction SilentlyContinue
 
-            foreach ($profile in $ffProfiles) {
-                $destDir = Join-Path $browserDir "$userName\Firefox\$($profile.Name)"
+            foreach ($browserProfile in $ffProfiles) {
+                $destDir = Join-Path $browserDir "$userName\Firefox\$($browserProfile.Name)"
                 # *-wal: SQLite write-ahead logs with the most recent rows (not
                 # yet merged into the database); collected when present
                 $ffFiles = @("places.sqlite", "places.sqlite-wal", "logins.json", "cookies.sqlite", "cookies.sqlite-wal", "formhistory.sqlite", "formhistory.sqlite-wal", "permissions.sqlite", "key4.db")
                 foreach ($ff in $ffFiles) {
-                    $sourcePath = Join-Path $profile.FullName $ff
+                    $sourcePath = Join-Path $browserProfile.FullName $ff
                     if (Test-Path -LiteralPath $sourcePath) {
                         Copy-ForensicFile -SourcePath $sourcePath -DestDir $destDir -DestName $ff
                     }
@@ -2326,16 +2355,22 @@ if ($Categories -contains "Persistence") {
         Save-CommandOutput -Description "wmi_subscriptions" `
             -DestPath (Join-Path $persDir "wmi_subscriptions.csv") `
             -Command {
-                $filters = Get-WmiObject -Namespace "root\subscription" -Class __EventFilter -ErrorAction SilentlyContinue
-                $consumers = Get-WmiObject -Namespace "root\subscription" -Class __EventConsumer -ErrorAction SilentlyContinue
-                $bindings = Get-WmiObject -Namespace "root\subscription" -Class __FilterToConsumerBinding -ErrorAction SilentlyContinue
+                $filters = Get-CimInstance -Namespace "root\subscription" -ClassName __EventFilter -ErrorAction SilentlyContinue
+                $consumers = Get-CimInstance -Namespace "root\subscription" -ClassName __EventConsumer -ErrorAction SilentlyContinue
+                $bindings = Get-CimInstance -Namespace "root\subscription" -ClassName __FilterToConsumerBinding -ErrorAction SilentlyContinue
 
                 $results = @()
                 foreach ($binding in $bindings) {
+                    # CIM returns Filter/Consumer as instance references: write them
+                    # as WMI paths, e.g. __EventFilter.Name="SCM Event Log Filter"
+                    $filterRef = ""
+                    $consumerRef = ""
+                    if ($binding.Filter) { $filterRef = '{0}.Name="{1}"' -f $binding.Filter.CimClass.CimClassName, $binding.Filter.Name }
+                    if ($binding.Consumer) { $consumerRef = '{0}.Name="{1}"' -f $binding.Consumer.CimClass.CimClassName, $binding.Consumer.Name }
                     $results += [PSCustomObject]@{
                         Type     = "Binding"
-                        Filter   = $binding.Filter
-                        Consumer = $binding.Consumer
+                        Filter   = $filterRef
+                        Consumer = $consumerRef
                         Details  = ""
                     }
                 }
@@ -2352,7 +2387,7 @@ if ($Categories -contains "Persistence") {
                         Type     = "Consumer"
                         Filter   = ""
                         Consumer = $consumer.Name
-                        Details  = ($consumer | Select-Object * | Out-String).Trim()
+                        Details  = ($consumer | Select-Object * -ExcludeProperty CimClass, CimInstanceProperties, CimSystemProperties | Out-String).Trim()
                     }
                 }
                 if ($results.Count -eq 0) {
@@ -2367,7 +2402,7 @@ if ($Categories -contains "Persistence") {
         Save-CommandOutput -Description "drivers" `
             -DestPath (Join-Path $persDir "drivers.csv") `
             -Command {
-                Get-WmiObject Win32_SystemDriver |
+                Get-CimInstance -ClassName Win32_SystemDriver |
                     Select-Object Name, DisplayName, PathName, State, StartMode, ServiceType,
                         @{Name='KeyLastWriteUtc';Expression={ Get-TriageServiceKeyLastWriteUtc $_.Name }} |
                     ConvertTo-Csv -NoTypeInformation

@@ -60,14 +60,24 @@ jobs:
           if ($files.Count -eq 0) { Write-Host "::error::No .ps1 files found to analyze"; exit 1 }
           Write-Host "PSScriptAnalyzer $version -- analyzing $($files.Count) script(s): $($files.Name -join ', ')"
 
-          # Run all rules so the log shows the full picture; only errors fail the build
-          $results = @(foreach ($f in $files) { Invoke-ScriptAnalyzer -Path $f.FullName })
+          # Rules excluded on purpose are listed (with reasons) in the settings file
+          $settings = Join-Path (Get-Location).Path 'PSScriptAnalyzerSettings.psd1'
+          $analyzerArgs = @{}
+          if (Test-Path -LiteralPath $settings) {
+              $analyzerArgs.Settings = $settings
+              Write-Host "Using settings: PSScriptAnalyzerSettings.psd1"
+          }
+
+          # All remaining rules run; findings show as annotations on the PR,
+          # and only errors fail the build
+          $results = @(foreach ($f in $files) { Invoke-ScriptAnalyzer -Path $f.FullName @analyzerArgs })
           foreach ($group in ($results | Group-Object Severity)) {
               Write-Host "  $($group.Name): $($group.Count)"
           }
-          $failing = @($results | Where-Object { "$($_.Severity)" -in @('Error', 'ParseError') })
-          foreach ($r in $failing) {
-              Write-Host "::error file=$($r.ScriptName),line=$($r.Line)::$($r.RuleName): $($r.Message)"
+          foreach ($r in $results) {
+              $level = if ("$($r.Severity)" -in @('Error', 'ParseError')) { 'error' } else { 'warning' }
+              Write-Host "::$level file=$($r.ScriptName),line=$($r.Line)::$($r.RuleName): $($r.Message)"
           }
+          $failing = @($results | Where-Object { "$($_.Severity)" -in @('Error', 'ParseError') })
           if ($failing.Count -gt 0) { exit 1 }
           Write-Host "PSScriptAnalyzer: $($results.Count) finding(s), none at error level"

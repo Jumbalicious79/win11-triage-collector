@@ -757,6 +757,23 @@ function Copy-FromShadow {
     }
 }
 
+# Names of the files (not folders) in a folder of the shadow copy (path
+# relative to TargetRoot), or $null if there is no shadow copy or the folder
+# cannot be listed. .NET first; Windows PowerShell 5.1 (.NET Framework) may
+# refuse \\?\GLOBALROOT paths, so cmd's dir is the fallback, as cmd copy is
+# in Copy-FromShadow.
+function Get-ShadowFileNames {
+    param([string]$RelativePath)
+    if (-not $script:shadowPath) { return $null }
+    $shadowDir = "$($script:shadowPath)\$RelativePath"
+    try {
+        return , @([System.IO.Directory]::GetFiles($shadowDir) | ForEach-Object { [System.IO.Path]::GetFileName($_) })
+    } catch { Write-Verbose "Listing $shadowDir with .NET: $($_.Exception.Message)" }
+    $listing = @(cmd /c "dir /b /a:-d `"$shadowDir`" 2>nul")
+    if ($LASTEXITCODE -ne 0) { return $null }
+    return , @($listing | ForEach-Object { "$_".Trim() } | Where-Object { $_ })
+}
+
 function Remove-ShadowCopy {
     if ($script:shadowId) {
         Log "Removing shadow copy..."
@@ -2673,6 +2690,102 @@ function Get-TriageBamRows {
     return $rows
 }
 
+# SRUM (System Resource Usage Monitor): copies every file of the sru folder
+# (SourceDir) to DestDir -- the ESE database SRUDB.dat with its checkpoint
+# (SRU.chk), transaction logs (SRU*.log, SRUtmp.log), reserve logs
+# (SRUres*.jrs) and flush map (SRUDB.jfm) -- so the timeline builder can
+# bring a copy taken while the database was open to a clean state.
+# Subfolders are not copied; files over MaxBytes are skipped and logged.
+# On a live system the Diagnostic Policy Service keeps these files open and
+# ESE keeps rolling its logs: when SRUDB.dat can be read from the shadow
+# copy, every file is taken from the shadow copy, listed there too, so the
+# database, checkpoint and logs are from one moment (a log deleted since is
+# still collected, a newer one is not mixed in). Otherwise (no shadow copy,
+# mounted image) the files are copied from the volume, through the raw NTFS
+# read for locked files.
+function Copy-TriageSrumFiles {
+    [OutputType([void])]
+    param(
+        [string]$SourceDir,
+        [string]$DestDir,
+        [long]$MaxBytes
+    )
+    $listError = $null
+    $volumeFiles = @(Get-ChildItem -LiteralPath $SourceDir -File -Force -ErrorAction SilentlyContinue -ErrorVariable listError)
+    if ($listError) {
+        Log-Warning "Could not list the SRUM folder ${SourceDir}: $($listError[0].Exception.Message)"
+        $script:errorCount++
+    }
+    $volumeSizes = @{}
+    foreach ($vf in $volumeFiles) { $volumeSizes[$vf.Name] = $vf.Length }
+    $relDir = Get-TargetRelativePath $SourceDir
+    $capText = "$([math]::Round($MaxBytes / 1MB)) MB size cap"
+    $count = 0
+
+    # Live system: the database decides where all files come from. Its size
+    # from the shadow copy, else from the volume; over the cap it is
+    # reported with the other files below.
+    $useShadow = $false
+    if ($script:IsLive -and $relDir -and (Initialize-ShadowCopy)) {
+        $dbSize = Get-FileLength "$($script:shadowPath)\$relDir\SRUDB.dat"
+        if ($dbSize -lt 0 -and $volumeSizes.ContainsKey("SRUDB.dat")) { $dbSize = $volumeSizes["SRUDB.dat"] }
+        if ($dbSize -le $MaxBytes) {
+            $useShadow = Copy-FromShadow -RelativePath "$relDir\SRUDB.dat" -DestDir $DestDir -DestName "SRUDB.dat" -Quiet
+            if (-not $useShadow) {
+                Log "SRUDB.dat could not be read from the shadow copy -- the SRUM files are copied from the volume (the database and its logs may be from slightly different moments)."
+            }
+        }
+    }
+
+    if ($useShadow) {
+        $count++
+        $shadowNames = Get-ShadowFileNames -RelativePath $relDir
+        $names = $shadowNames
+        if ($null -eq $names) { $names = @($volumeFiles | ForEach-Object { $_.Name }) }
+        foreach ($name in $names) {
+            if ($name -eq "SRUDB.dat") { continue }
+            $size = Get-FileLength "$($script:shadowPath)\$relDir\$name"
+            if ($size -lt 0 -and $volumeSizes.ContainsKey($name)) { $size = $volumeSizes[$name] }
+            if ($size -gt $MaxBytes) {
+                Log-Warning "Skipped SRUM file $SourceDir\$name ($([math]::Round($size / 1MB, 1)) MB): larger than the $capText"
+                continue
+            }
+            if (Copy-FromShadow -RelativePath "$relDir\$name" -DestDir $DestDir -DestName $name -Quiet) {
+                $count++
+            } elseif ($null -ne $shadowNames) {
+                Log-Warning "Could not copy SRUM file $name from the shadow copy"
+                $script:errorCount++
+            } else {
+                # Listed on the volume only: newer than the shadow copy
+                Log "SRUM file not in the shadow copy (newer than the database copy) -- skipped: $name"
+            }
+        }
+    } else {
+        foreach ($vf in $volumeFiles) {
+            if ($vf.Length -gt $MaxBytes) {
+                Log-Warning "Skipped SRUM file $($vf.FullName) ($([math]::Round($vf.Length / 1MB, 1)) MB): larger than the $capText"
+                continue
+            }
+            Copy-ForensicFile -SourcePath $vf.FullName -DestDir $DestDir
+            if ((Get-FileLength (Join-Path $DestDir $vf.Name)) -gt 0) { $count++ }
+        }
+    }
+
+    if ((Get-FileLength (Join-Path $DestDir "SRUDB.dat")) -gt 0) {
+        $note = ""
+        if ($useShadow) {
+            $note = " (from the shadow copy)"
+        } elseif ($script:IsLive) {
+            $note = " (from the volume)"
+        }
+        Log-Success "Collected $count SRUM file(s)$note."
+    } elseif ($count -gt 0 -or $volumeFiles.Count -gt 0) {
+        Log-Warning "SRUM database (SRUDB.dat) not collected; $count other SRUM file(s) collected."
+    } elseif (-not $listError) {
+        Log "SRUM folder is empty: $SourceDir"
+    }
+}
+
 # USB storage disks known to PnP (including devices not currently connected)
 # with install / arrival / removal times from the device properties
 function Get-TriageUsbStorageRows {
@@ -3008,6 +3121,19 @@ if ($Categories -contains "Execution") {
         Log-Success "Collected $pfCount Prefetch files."
     } else {
         Log-Warning "Prefetch directory not found (may be disabled)."
+    }
+
+    # SRUM (System Resource Usage Monitor): the sru folder's database,
+    # checkpoint and logs (see Copy-TriageSrumFiles). SRUDB.dat is usually
+    # tens of MB but can grow to several GB; -SkipLargeFiles lowers the cap.
+    $srumSource = "${script:TargetRoot}Windows\System32\sru"
+    if (Test-Path -LiteralPath $srumSource) {
+        Log "Collecting SRUM database and logs..."
+        $srumMaxBytes = 16GB
+        if ($SkipLargeFiles) { $srumMaxBytes = 2GB }
+        Copy-TriageSrumFiles -SourceDir $srumSource -DestDir (Join-Path $execDir "SRUM") -MaxBytes $srumMaxBytes
+    } else {
+        Log "SRUM folder not found ($srumSource) -- SRUM not collected."
     }
 
     if ($script:IsLive) {

@@ -3558,6 +3558,65 @@ if ($Categories -contains "Persistence") {
     Log ""
 }
 
+# ----------------------------------------------------------
+# Helpers for the AntiVirus section: Defender data folders
+# (DetectionHistory, Quarantine\Entries)
+# ----------------------------------------------------------
+# "Present", "Missing", or "Denied" (the folder exists but this account may
+# not open it; Test-Path reports $false for both of the last two)
+function Get-TriageFolderAccess {
+    [OutputType([string])]
+    param([string]$Path)
+    try {
+        $null = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+        return "Present"
+    } catch [System.UnauthorizedAccessException] {
+        return "Denied"
+    } catch {
+        Write-Verbose "Folder $Path not found: $($_.Exception.Message)"
+        return "Missing"
+    }
+}
+
+# Copy the files of one Defender data folder to the collection, keeping its
+# subfolders. Files over -MaxFileBytes, and the files past the newest
+# -MaxFiles, are skipped and logged. Returns the number of files collected.
+function Copy-TriageDefenderFolder {
+    [OutputType([int])]
+    param(
+        [string]$SourceDir,
+        [string]$DestDir,
+        [string]$Label,
+        [switch]$Recurse,
+        [int]$MaxFiles = 2000,
+        [long]$MaxFileBytes = 1MB
+    )
+    $maxBytes = $MaxFileBytes
+    $listErrors = $null
+    $allFiles = @(Get-ChildItem -LiteralPath $SourceDir -File -Recurse:$Recurse -Force -ErrorAction SilentlyContinue -ErrorVariable listErrors)
+    if ($listErrors) {
+        Log-Warning "Could not list all of ${SourceDir}: $($listErrors[0].Exception.Message)"
+    }
+    foreach ($bigFile in @($allFiles | Where-Object { $_.Length -gt $maxBytes })) {
+        Log "Skipped $Label file over $([math]::Round($maxBytes / 1MB, 2)) MB ($($bigFile.Length) bytes): $($bigFile.FullName)"
+    }
+    $toCopy = @($allFiles | Where-Object { $_.Length -gt 0 -and $_.Length -le $maxBytes } | Sort-Object LastWriteTimeUtc -Descending)
+    if ($toCopy.Count -gt $MaxFiles) {
+        Log "Skipped the $($toCopy.Count - $MaxFiles) oldest $Label file(s): only the newest $MaxFiles are collected."
+        $toCopy = @($toCopy | Select-Object -First $MaxFiles)
+    }
+    $sourceRoot = $SourceDir.TrimEnd('\')
+    $collectedBefore = $script:fileCount
+    foreach ($file in $toCopy) {
+        $fileDestDir = $DestDir
+        if ($file.DirectoryName.Length -gt $sourceRoot.Length) {
+            $fileDestDir = Join-Path $DestDir $file.DirectoryName.Substring($sourceRoot.Length + 1)
+        }
+        Copy-ForensicFile -SourcePath $file.FullName -DestDir $fileDestDir
+    }
+    return ($script:fileCount - $collectedBefore)
+}
+
 # =============================================================
 # 10. AntiVirus / Endpoint Security Logs
 # =============================================================
@@ -3667,6 +3726,36 @@ if ($Categories -contains "AntiVirus") {
             Copy-ForensicFile -SourcePath $dl.FullName -DestDir $defenderDestDir
         }
         Log-Success "Collected $($defenderLogs.Count) Defender support log(s)."
+    }
+
+    # Defender detection history (Scans\History\Service\DetectionHistory\
+    # <nn>\<DetectionID>: one small binary file per detection) and quarantine
+    # metadata (Quarantine\Entries: original path, threat name and time of
+    # each quarantined item). Plain files: collected in live and image mode.
+    # Quarantine\ResourceData holds the quarantined files themselves (the
+    # malware) and is never collected, nor is Quarantine\Resources.
+    $defenderDataDir = "${script:TargetRoot}ProgramData\Microsoft\Windows Defender"
+    $detectionHistoryDir = Join-Path $defenderDataDir "Scans\History\Service\DetectionHistory"
+    switch (Get-TriageFolderAccess $detectionHistoryDir) {
+        "Present" {
+            Log "Collecting Defender detection history..."
+            $detectionHistoryCount = Copy-TriageDefenderFolder -SourceDir $detectionHistoryDir `
+                -DestDir (Join-Path $avDir "Defender\DetectionHistory") -Label "Defender DetectionHistory" -Recurse
+            Log-Success "Collected $detectionHistoryCount Defender DetectionHistory file(s)."
+        }
+        "Denied" { Log-Warning "Could not open the Defender DetectionHistory folder (access denied): $detectionHistoryDir" }
+        default { Log "No Defender DetectionHistory folder on the target (no detections kept)." }
+    }
+    $quarantineEntriesDir = Join-Path $defenderDataDir "Quarantine\Entries"
+    switch (Get-TriageFolderAccess $quarantineEntriesDir) {
+        "Present" {
+            Log "Collecting Defender quarantine metadata (Quarantine\Entries only; the quarantined files are not collected)..."
+            $quarantineEntryCount = Copy-TriageDefenderFolder -SourceDir $quarantineEntriesDir `
+                -DestDir (Join-Path $avDir "Defender\Quarantine\Entries") -Label "Defender quarantine entry"
+            Log-Success "Collected $quarantineEntryCount Defender quarantine entry file(s)."
+        }
+        "Denied" { Log-Warning "Could not open the Defender Quarantine\Entries folder (access denied): $quarantineEntriesDir" }
+        default { Log "No Defender Quarantine\Entries folder on the target (nothing quarantined)." }
     }
 
     # --- Symantec Endpoint Protection ---

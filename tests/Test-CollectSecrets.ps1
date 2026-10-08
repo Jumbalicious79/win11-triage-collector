@@ -11,9 +11,10 @@
 #     no Secrets folder, and collection_info.json has SecretsIncluded false.
 #   WITH -IncludeSecrets: the browser copies are byte-for-byte the originals
 #     (their manifest hash equals the original's), every credential file is
-#     collected with a manifest row carrying the original path and times,
-#     collection_info.json has SecretsIncluded true, and the warning is
-#     logged. A junction inside a profile folder is not followed.
+#     collected with a manifest row carrying the original path and original
+#     times, collection_info.json has SecretsIncluded true, and the warning is
+#     logged. A junction inside a profile folder is not followed, and neither
+#     is a credential folder that is itself a junction out of the profile.
 #
 # The image and the collections are removed afterwards and the drive letter
 # is unmapped.
@@ -227,6 +228,16 @@ try {
     $junction = Join-Path $vault "LinkOut"
     $junctionMade = (Invoke-NativeTool "cmd.exe" @("/c", "mklink", "/J", $junction, $escapedDir)) -eq 0 -and (Test-Path -LiteralPath $junction)
 
+    # A credential folder that is ITSELF a junction out of the profile must
+    # also not be followed: bob's Vault is a junction to a folder outside the
+    # image. Its file must never be collected.
+    $bob = Join-Path $imageDir "Users\bob"
+    New-Item -ItemType Directory -Path (Join-Path $bob "AppData\Local\Microsoft") -Force | Out-Null
+    $rootEscapedDir = Join-Path $workDir "root-escaped"
+    New-TestTextFile -Path (Join-Path $rootEscapedDir "root-probe.txt") -Text "$canary-rootjunction"
+    $rootJunction = Join-Path $bob "AppData\Local\Microsoft\Vault"
+    $rootJunctionMade = (Invoke-NativeTool "cmd.exe" @("/c", "mklink", "/J", $rootJunction, $rootEscapedDir)) -eq 0 -and (Test-Path -LiteralPath $rootJunction)
+
     # --- Map the image to a free drive letter ---
     $used = @([System.IO.DriveInfo]::GetDrives() | ForEach-Object { $_.Name.Substring(0, 1).ToUpperInvariant() })
     $letter = @("T", "S", "R", "Q", "P", "O", "N", "M", "L", "K", "J", "I", "H") | Where-Object { $used -notcontains $_ } | Select-Object -First 1
@@ -340,6 +351,14 @@ try {
         elseif ($row.SourcePath -ne ($root + $credFiles[$rel])) { $problem = "manifest SourcePath is '$($row.SourcePath)'" }
         elseif ($row.SHA256 -ne (Get-FileHash -LiteralPath $copy -Algorithm SHA256).Hash) { $problem = "manifest hash differs from the copy" }
         elseif (-not $row.SourceModifiedUtc) { $problem = "no original modified time in the manifest" }
+        else {
+            # The recorded time is the ORIGINAL file's time, not the collector's
+            # or another file's (each fixture has its own LastWriteTimeUtc)
+            $expectedUtc = [System.IO.File]::GetLastWriteTimeUtc((Join-Path $imageDir $credFiles[$rel]))
+            $styles = [System.Globalization.DateTimeStyles]::AssumeUniversal -bor [System.Globalization.DateTimeStyles]::AdjustToUniversal
+            $gotUtc = [datetime]::Parse($row.SourceModifiedUtc, [System.Globalization.CultureInfo]::InvariantCulture, $styles)
+            if ([math]::Abs(($gotUtc - $expectedUtc).TotalSeconds) -gt 1) { $problem = "manifest modified time '$($row.SourceModifiedUtc)' is not the original ($($expectedUtc.ToString('o')))" }
+        }
         Write-TestResult -Succeeded (-not $problem) -Message "-IncludeSecrets: credential file collected: $rel$(if ($problem) { " -- $problem" })"
     }
 
@@ -347,10 +366,22 @@ try {
     if ($junctionMade) {
         $escapedPresent = @($manifest | Where-Object { $_.SourcePath -like "*escaped.txt" }).Count -gt 0 -or
             (Get-ChildItem -LiteralPath $outSecrets -Recurse -File -Filter "escaped.txt" -ErrorAction SilentlyContinue).Count -gt 0
-        Write-TestResult -Succeeded (-not $escapedPresent) -Message "-IncludeSecrets: the junction out of the profile was not followed"
+        Write-TestResult -Succeeded (-not $escapedPresent) -Message "-IncludeSecrets: the junction inside the profile was not followed"
     }
     else {
         Write-Host "SKIP: junction could not be created (mklink /J unavailable); link-following not checked" -ForegroundColor Yellow
+    }
+
+    # A credential folder that is itself a junction out of the profile was not
+    # followed, and the skip was logged
+    if ($rootJunctionMade) {
+        $rootProbePresent = @($manifest | Where-Object { $_.SourcePath -like "*root-probe.txt" }).Count -gt 0 -or
+            (Get-ChildItem -LiteralPath $outSecrets -Recurse -File -Filter "root-probe.txt" -ErrorAction SilentlyContinue).Count -gt 0
+        Write-TestResult -Succeeded (-not $rootProbePresent) -Message "-IncludeSecrets: a credential folder that is itself a junction was not followed"
+        Write-TestResult -Succeeded ($logText -match 'junction/symbolic link out of the profile, not followed') -Message "-IncludeSecrets: the skipped root junction was logged"
+    }
+    else {
+        Write-Host "SKIP: root junction could not be created (mklink /J unavailable); root-link-following not checked" -ForegroundColor Yellow
     }
 
     if ($script:failures -gt 0) {

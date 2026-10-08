@@ -567,7 +567,10 @@ function Copy-ForensicFile {
                 Log "Skipped (in use, not in the shadow copy; temporary database journal): $SourcePath"
                 return
             }
-            Log-Warning "Could not copy ($cause; shadow copy and raw NTFS read also failed): $SourcePath"
+            # Default-path wording for the in-use case is unchanged ("locked");
+            # "access denied" is reached only with -FallbackOnAccessDenied.
+            $failCause = if ($inUse) { "locked" } else { "access denied" }
+            Log-Warning "Could not copy ($failCause; shadow copy and raw NTFS read also failed): $SourcePath"
             $script:errorCount++
             return
         }
@@ -936,22 +939,22 @@ function Write-CollectionInfo {
             $targetTz = Get-ImageTimeZoneId
         }
         $info = [PSCustomObject][ordered]@{
-            SchemaVersion           = 1
-            ComputerName            = $env:COMPUTERNAME
-            CollectorUser           = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-            Mode                    = $mode
-            TargetDrive             = $TargetDrive
-            TargetRoot              = $script:TargetRoot
-            CollectionStartUtc      = $script:startTime.ToUniversalTime().ToString("o")
-            CollectorTimeZoneId     = $collectorTz
-            CollectorCulture        = (Get-Culture).Name
-            TargetTimeZoneId        = $targetTz
+            SchemaVersion            = 1
+            ComputerName             = $env:COMPUTERNAME
+            CollectorUser            = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+            Mode                     = $mode
+            TargetDrive              = $TargetDrive
+            TargetRoot               = $script:TargetRoot
+            CollectionStartUtc       = $script:startTime.ToUniversalTime().ToString("o")
+            CollectorTimeZoneId      = $collectorTz
+            CollectorCulture         = (Get-Culture).Name
+            TargetTimeZoneId         = $targetTz
             # Additive fields (SchemaVersion stays 1): whether this collection
             # holds unredacted browser files + DPAPI credential material
             # (-IncludeSecrets) and Thunderbird's search index
             # (-IncludeThunderbirdIndex). The timeline builder logs when
             # SecretsIncluded is true; no parser reads the Secrets folder.
-            SecretsIncluded         = [bool]$IncludeSecrets
+            SecretsIncluded          = [bool]$IncludeSecrets
             ThunderbirdIndexIncluded = [bool]$IncludeThunderbirdIndex
         }
         $json = $info | ConvertTo-Json
@@ -5629,14 +5632,14 @@ if ($Categories -contains "Email") {
 }
 
 # =============================================================
-# 11. Secrets (opt-in: -IncludeSecrets)
+# 12. Secrets (opt-in: -IncludeSecrets)
 # =============================================================
 # DPAPI credential material: what an examiner needs to decrypt the unredacted
-# browser copies (and other DPAPI-protected data) offline, given the user's
-# password or the domain backup key. Collected both live and from a mounted
-# image. The files are small; a shared total cap guards against anything
-# unexpected and skips are logged. Junctions and symbolic links out of the
-# profile are never followed.
+# browser copies (and the user's other DPAPI-protected data) offline, given
+# the user's password or the domain backup key. Collected both live and from a
+# mounted image. The files are small; a shared total cap guards against
+# anything unexpected and skips are logged. Junctions and symbolic links out of
+# the profile are never followed.
 
 # Source paths of the files under $Folder and its subfolders (hidden/system
 # included), without entering junctions or symbolic links. A folder that
@@ -5663,11 +5666,14 @@ function Get-TriageSecretFiles {
         }
         if ($listed) {
             foreach ($entry in $entries) {
+                if (Test-TriageLinkItem -Item $entry) {
+                    # A junction or symbolic link (folder or file). Never
+                    # followed: in a mounted image its target resolves on the
+                    # analysis machine, and File.Copy would follow a link file.
+                    Log "Skipped (junction/symbolic link out of the profile, not followed): $($entry.FullName)"
+                    continue
+                }
                 if ($entry.PSIsContainer) {
-                    if (Test-TriageLinkItem -Item $entry) {
-                        Log "Skipped (junction/symbolic link out of the profile, not followed): $($entry.FullName)"
-                        continue
-                    }
                     $stack.Push($entry.FullName)
                 } else {
                     $results.Add([PSCustomObject]@{ Path = $entry.FullName; Length = [long]$entry.Length })
@@ -5675,11 +5681,18 @@ function Get-TriageSecretFiles {
             }
             continue
         }
-        # Direct listing failed (ACL). On a live system list the folder from
-        # the shadow copy; the file content is read later by Copy-ForensicFile.
+        # Direct listing failed. On current Windows the system DPAPI folders
+        # are readable by administrators, so this is only reached on a hardened
+        # system. As a best effort, list the folder from a shadow copy (created
+        # on demand) and let Copy-ForensicFile read the content. Note: a shadow
+        # copy preserves the volume's ACLs, so a listing denied here is usually
+        # denied in the snapshot too; anything that cannot be listed is logged.
         $relDir = Get-TargetRelativePath $dir
         $names = $null
-        if ($script:IsLive -and $relDir) { $names = Get-ShadowFileNames $relDir }
+        if ($script:IsLive -and $relDir) {
+            $null = Initialize-ShadowCopy
+            $names = Get-ShadowFileNames $relDir
+        }
         if ($null -ne $names) {
             foreach ($name in $names) { $results.Add([PSCustomObject]@{ Path = (Join-Path $dir $name); Length = [long](-1) }) }
             Log "Listed $($names.Count) file(s) from the shadow copy (folder not directly readable): $dir"
@@ -5699,9 +5712,20 @@ function Copy-TriageSecretFolder {
     param(
         [string]$SourceDir,
         [string]$DestDir,
-        [string]$Label
+        [string]$Label,
+        # Stop climbing at this folder when checking for a link above the
+        # source (the user profile, or the Windows root for the system keys).
+        [string]$StopAt = ""
     )
     if (-not (Test-Path -LiteralPath $SourceDir)) { return }
+    # Never follow a junction or symbolic link out of the profile: if the
+    # source folder itself (or a folder above it, up to $StopAt) is a link,
+    # skip it. Otherwise, in a mounted image an absolute link target would
+    # resolve on the analysis machine and copy the examiner's own files in.
+    if (Test-TriageLinkedFolder -Path $SourceDir -StopAt $StopAt) {
+        Log "Skipped (junction/symbolic link out of the profile, not followed): $SourceDir"
+        return
+    }
     $files = @(Get-TriageSecretFiles -Folder $SourceDir | Sort-Object Path)
     if ($files.Count -eq 0) { return }
     $root = $SourceDir.TrimEnd('\')
@@ -5749,20 +5773,27 @@ if ($IncludeSecrets) {
             @{ Rel = "AppData\Local\Microsoft\Vault";         Label = "$userName Vault" }
         )
         foreach ($s in $secretSources) {
-            Copy-TriageSecretFolder -SourceDir (Join-Path $userDir.FullName $s.Rel) -DestDir (Join-Path $userDest $s.Rel) -Label $s.Label
+            Copy-TriageSecretFolder -SourceDir (Join-Path $userDir.FullName $s.Rel) -DestDir (Join-Path $userDest $s.Rel) -Label $s.Label -StopAt $userDir.FullName
         }
     }
 
     # System DPAPI master keys: %SystemRoot%\System32\Microsoft\Protect
-    # (S-1-5-18 and its User subfolder). ACL-protected on a live system --
-    # Copy-ForensicFile's shadow-copy / raw-NTFS fallback reads them, and
-    # anything that still cannot be read is logged. App-Bound Encryption
-    # (Chrome/Edge) can only be undone on the live machine and is not touched.
+    # (S-1-5-18 and its User subfolder). These are hidden/system files that on
+    # current Windows are readable by administrators, so they copy directly; on
+    # a hardened system where access is denied, Copy-ForensicFile's
+    # shadow-copy / raw-NTFS fallback is a safety net (the raw read bypasses the
+    # ACL) and anything that still cannot be read is logged. App-Bound
+    # Encryption (Chrome/Edge) can only be undone on the live machine and is not
+    # touched.
     $systemProtect = "${script:TargetRoot}Windows\System32\Microsoft\Protect"
-    Copy-TriageSecretFolder -SourceDir $systemProtect -DestDir (Join-Path $secretsDir "System\System32\Microsoft\Protect") -Label "system DPAPI master key"
+    Copy-TriageSecretFolder -SourceDir $systemProtect -DestDir (Join-Path $secretsDir "System\System32\Microsoft\Protect") -Label "system DPAPI master key" -StopAt "${script:TargetRoot}Windows"
 
     Log "Secrets collected: $([math]::Round($script:secretsBudget.Used / 1MB, 2)) MB"
-    Log-Warning "The Secrets folder holds DPAPI credential material. With the SAM and SECURITY hives (collected by default) and the user's password or the domain backup key, the saved passwords and session cookies in the unredacted browser copies can be decrypted offline. Handle this collection like a password store."
+    if ($Categories -contains "Registry") {
+        Log-Warning "The Secrets folder holds DPAPI credential material. With the SYSTEM and SECURITY hives (boot key and the DPAPI_SYSTEM LSA secret; SAM for local password hashes), collected by the Registry category, and the user's password or the domain backup key, the saved passwords and session cookies in the unredacted browser copies can be decrypted offline. Handle this collection like a password store."
+    } else {
+        Log-Warning "The Secrets folder holds DPAPI credential material, but the Registry category was NOT selected, so the SYSTEM and SECURITY hives are not in this collection. The per-user secrets can still be decrypted offline with the user's password or the domain backup key, but the machine (S-1-5-18) DPAPI master keys cannot be decrypted without SYSTEM and SECURITY. Re-run including the Registry category if the machine keys are needed. Handle this collection like a password store."
+    }
     Log-Success "Secrets collection complete."
     Log ""
 }

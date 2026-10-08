@@ -682,8 +682,8 @@ Inside the zip:
 
   Collected only with -IncludeSecrets, into a top-level Secrets\ folder, on
   both live systems and mounted images. This is the DPAPI credential material
-  an examiner needs to decrypt the unredacted browser copies (and any other
-  DPAPI-protected data) offline.
+  an examiner needs to decrypt the unredacted browser copies (and the user's
+  other DPAPI-protected data) offline.
 
     Per user (Secrets\<user>\...)
       AppData\Roaming\Microsoft\Protect    DPAPI master keys: the <SID>\
@@ -696,27 +696,39 @@ Inside the zip:
     System (Secrets\System\...)
       System32\Microsoft\Protect\S-1-5-18  the machine DPAPI master keys and
                                            their User\ subfolder. These are
-                                           ACL-protected; on a live system
-                                           they are read through the shadow
-                                           copy / raw NTFS fallback, and
-                                           anything that still cannot be read
-                                           is logged.
+                                           hidden/system files that current
+                                           Windows lets administrators read, so
+                                           they copy directly; on a hardened
+                                           system where access is denied, the
+                                           shadow-copy / raw-NTFS fallback is a
+                                           safety net and anything that still
+                                           cannot be read is logged.
 
   All of these files are small. A shared total cap guards against anything
   unexpected and skips are logged; junctions and symbolic links out of a
-  profile are never followed. Collected copies keep the original path and
-  times in the manifest, and (unlike the blanked browser copies) their hashes
-  match the originals.
+  profile are never followed (a credential folder that is itself a link is
+  skipped and logged). Collected copies keep the original path and times in
+  the manifest, and (unlike the blanked browser copies) their hashes match the
+  originals.
 
-  Why this is enough for offline decryption: SAM and SECURITY (collected by
-  default in the Registry category) hold the LSA secrets and local password
-  hashes; the Protect master keys are themselves encrypted with a key derived
-  from the user's password (or escrowed to the domain's DPAPI backup key). So
-  with -IncludeSecrets, SAM/SECURITY, and either the user's password or the
-  domain backup key, the saved passwords and session cookies in the
-  unredacted browser copies can be decrypted on the analysis machine. The one
-  thing this does NOT give you is Chrome/Edge App-Bound Encryption, which can
-  only be undone on the live machine (see Known Limitations).
+  Not collected: SYSTEM-account Credential Manager and machine Vault stores
+  (systemprofile and ServiceProfiles AppData, ProgramData\Microsoft\Vault).
+  The machine (S-1-5-18) master keys above decrypt them, but the vaults
+  themselves are out of scope here; collect them separately if a case needs
+  them.
+
+  Why this is enough for offline decryption of the user's data: the per-user
+  Protect master keys are encrypted with a key derived from the user's
+  password (or escrowed to the domain's DPAPI backup key), so with the user's
+  password or the domain backup key the saved passwords and session cookies in
+  the unredacted browser copies can be decrypted on the analysis machine --
+  the Registry hives are not needed for that. The machine (S-1-5-18) master
+  keys instead need DPAPI_SYSTEM from the SECURITY hive, unlocked with the boot
+  key from the SYSTEM hive; SAM holds local password hashes. SYSTEM, SECURITY
+  and SAM are collected by the Registry category (selected by default), so for
+  the machine keys include that category. The one thing none of this gives you
+  is Chrome/Edge App-Bound Encryption, which can only be undone on the live
+  machine (see Known Limitations).
 
   A prominent warning is logged at the start of a run with -IncludeSecrets:
   the collection then holds secrets equivalent to a password store and must
@@ -1041,10 +1053,12 @@ The fastest path from collection to analysis:
     live machine before collecting if the case needs them.
 
   - The system DPAPI master keys (System32\Microsoft\Protect\S-1-5-18) are
-    ACL-protected. On a live system the collector reads them through the
-    shadow copy / raw NTFS fallback; if a folder there cannot even be listed
-    (strict ACLs, no shadow copy), what could not be read is logged and the
-    run goes on.
+    hidden/system files that current Windows lets administrators read, so they
+    are normally copied directly. On a hardened system where access is denied,
+    the collector falls back to the shadow copy / raw NTFS read (the raw read
+    bypasses the ACL); if a folder there cannot even be listed (a shadow copy
+    preserves the volume's ACLs, so the listing fallback does not get past
+    them), what could not be read is logged and the run goes on.
     Warning: "Could not list (collected credential material may be incomplete): <path>"
 
 
@@ -1128,14 +1142,19 @@ the mounted image for a non-invasive collection.
                         Preferred and CREDHIST), Credentials (roaming and
                         local) and Vault, and the system master keys
                         (%SystemRoot%\System32\Microsoft\Protect\S-1-5-18).
-                   With SAM and SECURITY (collected by default) plus the user's
-                   password or the domain DPAPI backup key, this is everything
-                   needed to decrypt the unredacted browser secrets -- saved
-                   passwords and session cookies -- offline. The whole
-                   collection then holds secrets equivalent to a password
-                   store: handle, store and transfer it accordingly. A
-                   prominent warning is logged at the start of the run, and
-                   collection_info.json records "SecretsIncluded": true.
+                   With the user's password or the domain DPAPI backup key,
+                   this is everything needed to decrypt the unredacted browser
+                   secrets -- saved passwords and session cookies -- offline;
+                   the Registry hives are not needed for the per-user data. The
+                   machine (S-1-5-18) master keys instead need SYSTEM and
+                   SECURITY (boot key and the DPAPI_SYSTEM LSA secret; SAM for
+                   local hashes), collected by the Registry category (selected
+                   by default), so include that category if the machine keys
+                   are needed. The whole collection then holds secrets
+                   equivalent to a password store: handle, store and transfer
+                   it accordingly. A prominent warning is logged at the start
+                   of the run, and collection_info.json records
+                   "SecretsIncluded": true.
                    Use it for infostealer cases (which saved passwords and
                    cookies were exposed), session/token-theft cases (cookie
                    decryption), authorized access to cloud evidence, and

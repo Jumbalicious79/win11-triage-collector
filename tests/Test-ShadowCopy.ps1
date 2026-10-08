@@ -197,9 +197,15 @@ try {
                 $problems.Add("log: expected one line matching '$($case.Log)', got: $($logNew -join ' | ')")
             } elseif ($case.Expect -eq "Failed") {
                 # The warning gives the reason: the copy exception's message,
-                # which names the file, not a generic text
+                # which names the file, not a generic text. Log-Warning writes
+                # with Add-Content (ANSI in Windows PowerShell 5.1, UTF-8 in
+                # 7): compare with the reason as that encoding stores it, as
+                # characters of the temp path outside the code page come back
+                # as "?" in 5.1
                 $reason = $Matches[1]
-                if ($reason -ne $script:lastShadowCopyReason) { $problems.Add("warning reason differs from lastShadowCopyReason") }
+                $logEncoding = [System.Text.Encoding]::Default
+                $loggedReason = $logEncoding.GetString($logEncoding.GetBytes($script:lastShadowCopyReason))
+                if ($reason -ne $loggedReason) { $problems.Add("warning reason differs from lastShadowCopyReason") }
                 if ($reason.IndexOf([System.IO.Path]::GetFileName($case.Rel), [System.StringComparison]::OrdinalIgnoreCase) -lt 0) {
                     $problems.Add("warning reason is not the copy error: $reason")
                 }

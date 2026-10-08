@@ -720,7 +720,8 @@ The fastest path from collection to analysis:
     timeline builder skips Amcache parsing for that collection. It is
     normal for one of .LOG1/.LOG2 to be 0 bytes (Windows can write only one
     of them for long periods): an empty log holds nothing to collect and is
-    logged as info, not counted as an error.
+    skipped, not counted as an error (logged as info when it comes from the
+    shadow copy).
     Log: "Skipped empty file (0 bytes in the shadow copy): Windows\AppCompat\Programs\Amcache.hve.LOG2"
 
   - A file is reported as not collected only when the normal copy, the

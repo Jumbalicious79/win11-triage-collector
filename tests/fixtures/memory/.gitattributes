@@ -1,0 +1,3 @@
+# Fixture files are test input: keep them byte-for-byte (no line-ending
+# conversion)
+* -text

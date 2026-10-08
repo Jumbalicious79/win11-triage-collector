@@ -2312,6 +2312,38 @@ if ($Categories -contains "Registry") {
     Log ""
 }
 
+# ----------------------------------------------------------
+# Helper for the Event Logs section: the newest events of a large log
+# ----------------------------------------------------------
+# Exports only the newest events of an event log whose .evtx is larger than
+# -MaxBytes into -DestPath: from the record that leaves about -MaxBytes of
+# the log (its record-ID range cut in proportion to the size) to the newest.
+# Live: wevtutil reads the channel; mounted image: the .evtx file itself
+# (/lf). Returns "records <first>-<newest> of <oldest>-<newest>", or "" if
+# the log's record IDs could not be read or the export failed.
+function Export-NewestEventLogRecords {
+    param([string]$LogName, [string]$SourcePath, [string]$DestPath, [long]$SourceBytes, [long]$MaxBytes)
+    $source = $SourcePath
+    $fileOption = @("/lf:true")
+    if ($script:IsLive) {
+        $source = $LogName -replace '%4', '/'
+        $fileOption = @()
+    }
+    # Oldest and newest record IDs: the first event in each reading direction
+    $ids = @()
+    foreach ($direction in @("/rd:false", "/rd:true")) {
+        $xml = (& wevtutil.exe qe $source @fileOption $direction "/c:1" "/f:xml" 2>$null) -join ""
+        if ($xml -match '<EventRecordID>(\d+)</EventRecordID>') { $ids += [long]$Matches[1] }
+    }
+    if ($ids.Count -ne 2 -or $ids[1] -lt $ids[0]) { return "" }
+    $keep = [long][math]::Floor(($ids[1] - $ids[0] + 1) * ([double]$MaxBytes / $SourceBytes))
+    if ($keep -lt 1) { $keep = 1 }
+    $first = $ids[1] - $keep + 1
+    & wevtutil.exe epl $source $DestPath @fileOption "/q:*[System[EventRecordID>=$first]]" "/ow:true" 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $DestPath)) { return "" }
+    return "records $first-$($ids[1]) of $($ids[0])-$($ids[1])"
+}
+
 # =============================================================
 # 3. Event Logs
 # =============================================================
@@ -2351,8 +2383,9 @@ if ($Categories -contains "EventLogs") {
     )
     # Size limit for the logs above that are added context rather than core
     # evidence. Their default maximum sizes are 1 MB (15 MB for Windows
-    # PowerShell); one an administrator made much larger is skipped, with a
-    # warning, instead of slowing the collection down.
+    # PowerShell); of one an administrator made much larger only the newest
+    # events, about the limit's worth, are exported (Export-NewestEventLogRecords),
+    # with a warning, instead of slowing the collection down.
     $limitedEventLogs = @(
         "Windows PowerShell",
         "Microsoft-Windows-WMI-Activity%4Operational",
@@ -2370,13 +2403,21 @@ if ($Categories -contains "EventLogs") {
         $fileName = "$logName.evtx"
         $sourcePath = Join-Path $evtxRoot $fileName
         if (Test-Path $sourcePath) {
-            $logBytes = Get-FileLength $sourcePath
-            if ($limitedEventLogs -contains $logName -and $logBytes -gt $maxLimitedEventLogBytes) {
-                Log-Warning "Skipping $fileName ($([math]::Round($logBytes / 1MB)) MB, over the $([math]::Round($maxLimitedEventLogBytes / 1MB)) MB limit for this log)"
-                continue
-            }
             Log "Collecting $fileName..."
             $destFile = Join-Path $evtDir $fileName
+            $logBytes = Get-FileLength $sourcePath
+            if ($limitedEventLogs -contains $logName -and $logBytes -gt $maxLimitedEventLogBytes) {
+                $sizeText = "$([math]::Round($logBytes / 1MB)) MB, over the $([math]::Round($maxLimitedEventLogBytes / 1MB)) MB limit for this log"
+                $range = Export-NewestEventLogRecords -LogName $logName -SourcePath $sourcePath -DestPath $destFile -SourceBytes $logBytes -MaxBytes $maxLimitedEventLogBytes
+                if ($range) {
+                    Record-Manifest -SourcePath $sourcePath -DestPath $destFile
+                    Log-Warning "Collected only the newest events of $fileName ($sizeText): $range"
+                } else {
+                    Remove-Item -LiteralPath $destFile -Force -ErrorAction SilentlyContinue
+                    Log-Warning "Skipping $fileName ($sizeText; its newest events could not be exported)"
+                }
+                continue
+            }
             if ($script:IsLive) {
                 # Live system: use wevtutil to export (handles locked logs properly)
                 try {

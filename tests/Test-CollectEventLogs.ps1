@@ -7,12 +7,19 @@
 #   run 1  every listed log present: each is copied byte for byte into
 #          EventLogs\ and has a manifest row (source path, SHA256)
 #   run 2  OAlerts.evtx missing: an info line, not a warning or an error;
-#          a 300 MB Shell-Core log: skipped with a warning (size limit)
+#          a 300 MB Shell-Core log (real events padded with zeros): over
+#          the 256 MB limit of the Phase 2 logs, so only its newest events
+#          are exported (wevtutil /lf), with a warning naming the record
+#          range; a 300 MB WMI-Activity log of zeros: skipped with a
+#          warning (no events to export); a 300 MB System log: copied whole
+#          (the core logs have no limit)
 # It also checks, on this machine, that every channel the test lists is
 # stored in winevt\Logs under the file name the collector expects ("/" in
 # the channel name is "%4"); a channel that does not exist here is skipped.
 # The .evtx files are empty exports of this machine's System log (wevtutil
-# epl with a query that matches nothing): only their names matter here.
+# epl with a query that matches nothing): only their names matter here,
+# except for the 300 MB Shell-Core log of run 2, which holds the newest 200
+# events of this machine's System log.
 #
 # Needs Administrator rights, like the collector (GitHub Actions Windows
 # runners are elevated), unless -CollectorPath names a copy of the collector
@@ -168,15 +175,38 @@ try {
     $problems1 = @($log1 | Where-Object { $_ -match 'WARNING: .*\.evtx|ERROR:' })
     Write-TestResult -Name "run 1: no warnings or errors about event logs" -Passed ($problems1.Count -eq 0) -Message ($problems1 -join " || ")
 
-    # --- Run 2: OAlerts missing, Shell-Core over the size limit ---
+    # --- Run 2: OAlerts missing; three logs of 300 MB ---
+    # Shell-Core: real events (the newest 200 of this machine's System log)
+    # padded to 300 MB, over the 256 MB limit of the Phase 2 logs: only its
+    # newest events are exported. WMI-Activity: 300 MB of zeros, over the
+    # limit and unreadable: skipped. System: 300 MB of zeros, a core log
+    # without a limit: copied whole, as before.
     Remove-Item -LiteralPath (Join-Path $logsDir "OAlerts.evtx")
-    $bigLog = Join-Path $logsDir "Microsoft-Windows-Shell-Core%4Operational.evtx"
+    $bigName = "Microsoft-Windows-Shell-Core%4Operational.evtx"
+    $badName = "Microsoft-Windows-WMI-Activity%4Operational.evtx"
+    $bigLog = Join-Path $logsDir $bigName
     Remove-Item -LiteralPath $bigLog
-    [System.IO.File]::WriteAllBytes($bigLog, [byte[]]@())
-    # Sparse where possible, so the 300 MB take no disk space
-    $null = Invoke-NativeTool "fsutil.exe" @("sparse", "setflag", $bigLog)
-    $stream = [System.IO.File]::Open($bigLog, "Open", "ReadWrite", "None")
-    try { $stream.SetLength(300MB) } finally { $stream.Dispose() }
+    $newestXml = ""
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try { $newestXml = (& wevtutil.exe qe System /rd:true /c:1 /f:xml 2>$null) -join "" }
+    finally { $ErrorActionPreference = $previous }
+    if ($newestXml -notmatch '<EventRecordID>(\d+)</EventRecordID>') { throw "could not read the newest record of this machine's System log" }
+    $newestSystem = [long]$Matches[1]
+    $exit = Invoke-NativeTool "wevtutil.exe" @("epl", "System", $bigLog, "/q:*[System[EventRecordID>$($newestSystem - 200)]]")
+    if ($exit -ne 0 -or -not (Test-Path -LiteralPath $bigLog)) { throw "wevtutil could not export System events (exit code $exit)" }
+    $bigEvents = @(Get-WinEvent -Path $bigLog -Oldest -ErrorAction Stop)
+    foreach ($name in @($bigName, $badName, "System.evtx")) {
+        $path = Join-Path $logsDir $name
+        if ($name -ne $bigName) {
+            Remove-Item -LiteralPath $path
+            [System.IO.File]::WriteAllBytes($path, [byte[]]@())
+        }
+        # Sparse where possible, so the 300 MB take no disk space
+        $null = Invoke-NativeTool "fsutil.exe" @("sparse", "setflag", $path)
+        $stream = [System.IO.File]::Open($path, "Open", "ReadWrite", "None")
+        try { $stream.SetLength(300MB) } finally { $stream.Dispose() }
+    }
 
     $out2 = Join-Path $workDir "run2"
     $log2 = Invoke-TestCollection -OutputDir $out2
@@ -188,14 +218,39 @@ try {
         -Passed ($oalertsInfo.Count -eq 1 -and $oalertsLines.Count -eq 1 -and -not (Test-Path -LiteralPath (Join-Path $out2 "EventLogs\OAlerts.evtx"))) `
         -Message "log lines: $($oalertsLines -join ' || ')"
 
-    $bigName = "Microsoft-Windows-Shell-Core%4Operational.evtx"
+    # Shell-Core: the newest events only, about 256/300 of them, with a
+    # warning that names the record range and a manifest row
     $bigLines = @($log2 | Where-Object { $_ -like "*$bigName*" })
-    $bigWarning = @($bigLines | Where-Object { $_ -match 'WARNING: Skipping .*\(300 MB, over the 256 MB limit for this log\)' })
-    Write-TestResult -Name "run 2: 300 MB Shell-Core log skipped with a warning (256 MB limit)" `
-        -Passed ($bigWarning.Count -eq 1 -and -not (Test-Path -LiteralPath (Join-Path $out2 "EventLogs\$bigName")) -and -not $manifest2.ContainsKey("EventLogs\$bigName")) `
-        -Message "log lines: $($bigLines -join ' || ')"
+    $first = $bigEvents[0].RecordId
+    $last = $bigEvents[$bigEvents.Count - 1].RecordId
+    $expectedFirst = $last - [math]::Floor(($last - $first + 1) * 256 / 300) + 1
+    $expectedCount = @($bigEvents | Where-Object { $_.RecordId -ge $expectedFirst }).Count
+    $bigWarning = @($bigLines | Where-Object { $_ -match "WARNING: Collected only the newest events of .*\(300 MB, over the 256 MB limit for this log\): records $expectedFirst-$last of $first-$last$" })
+    $bigCopy = Join-Path $out2 "EventLogs\$bigName"
+    $copied = @()
+    if (Test-Path -LiteralPath $bigCopy) { $copied = @(Get-WinEvent -Path $bigCopy -Oldest -ErrorAction SilentlyContinue) }
+    $problem = ""
+    if ($bigWarning.Count -ne 1) { $problem = "no size-limit warning with the record range" }
+    elseif (-not $manifest2.ContainsKey("EventLogs\$bigName")) { $problem = "no manifest row" }
+    elseif ($copied.Count -ne $expectedCount) { $problem = "$($copied.Count) event(s) collected, expected the newest $expectedCount of $($bigEvents.Count)" }
+    elseif ($copied[$copied.Count - 1].RecordId -ne $last) { $problem = "the newest event (record $last) is missing" }
+    Write-TestResult -Name "run 2: 300 MB Shell-Core log: only its newest events collected, with a warning (256 MB limit)" -Passed (-not $problem) `
+        -Message "$problem. Log lines: $($bigLines -join ' || ')"
 
-    $others = @($coreLogs + $newLogs | Where-Object { $_ -notin @("OAlerts", "Microsoft-Windows-Shell-Core%4Operational") })
+    $badLines = @($log2 | Where-Object { $_ -like "*$badName*" })
+    $badWarning = @($badLines | Where-Object { $_ -match 'WARNING: Skipping .*\(300 MB, over the 256 MB limit for this log; its newest events could not be exported\)' })
+    Write-TestResult -Name "run 2: unreadable 300 MB WMI-Activity log skipped with a warning" `
+        -Passed ($badWarning.Count -eq 1 -and -not (Test-Path -LiteralPath (Join-Path $out2 "EventLogs\$badName")) -and -not $manifest2.ContainsKey("EventLogs\$badName")) `
+        -Message "log lines: $($badLines -join ' || ')"
+
+    # The limit does not apply to the core logs
+    $systemRow = $manifest2["EventLogs\System.evtx"]
+    $systemWarnings = @($log2 | Where-Object { $_ -match 'WARNING:.*System\.evtx' })
+    Write-TestResult -Name "run 2: 300 MB System log (core log, no size limit) collected whole" `
+        -Passed ($systemRow -and [long]$systemRow.SizeBytes -eq 300MB -and $systemWarnings.Count -eq 0) `
+        -Message "manifest SizeBytes '$($systemRow.SizeBytes)'; warnings: $($systemWarnings -join ' || ')"
+
+    $others = @($coreLogs + $newLogs | Where-Object { $_ -notin @("OAlerts", "Microsoft-Windows-Shell-Core%4Operational", "Microsoft-Windows-WMI-Activity%4Operational") })
     $missing = @($others | Where-Object { -not $manifest2.ContainsKey("EventLogs\$_.evtx") })
     Write-TestResult -Name "run 2: the other logs are still collected" -Passed ($missing.Count -eq 0) -Message "missing: $($missing -join ', ')"
 }

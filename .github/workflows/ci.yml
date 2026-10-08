@@ -3,8 +3,9 @@ name: CI
 on:
   push:
     branches: [master]
+  # Every pull request, whatever its base branch: a PR stacked on another
+  # PR's branch gets the same checks as a PR into master
   pull_request:
-    branches: [master]
 
 permissions:
   contents: read

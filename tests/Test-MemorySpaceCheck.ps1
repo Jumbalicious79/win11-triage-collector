@@ -139,42 +139,42 @@ try {
     # =========================================================
     # 1. The space check with fixed numbers
     # =========================================================
-    $c487 = New-TestVolume "C:\" 40.8 487.41
+    $c487 = New-TestVolume -Root "C:\" -FreeGB 40.8 -TotalGB 487.41
     $spaceCases = @(
         @{ What = "run 2: C:, 40.8 GB free -> LowReserve"; Volume = $c487; System = $true; With = $true
            Result = "LowReserve"; Dump = $ram2 + 1MB; Collection = 5GB; Reserve = 20GB
            Reason = '^C:\\ would be left with ~3\.9 GB free, less than the 20 GB to keep free on the system drive$' }
-        @{ What = "C: at 2.6 GB free -> NoFit"; Volume = (New-TestVolume "C:\" 2.6 487.41); System = $true; With = $true
+        @{ What = "C: at 2.6 GB free -> NoFit"; Volume = (New-TestVolume -Root "C:\" -FreeGB 2.6 -TotalGB 487.41); System = $true; With = $true
            Result = "NoFit"; Reason = '^less than 1 GB would be left free on C:\\$' }
-        @{ What = "D: at 453 GB free -> Ok"; Volume = (New-TestVolume "D:\" 453 1400)
+        @{ What = "D: at 453 GB free -> Ok"; Volume = (New-TestVolume -Root "D:\" -FreeGB 453 -TotalGB 1400)
            Result = "Ok"; Dump = $ram2 + 1MB; Collection = 0; Reserve = 1GB }
-        @{ What = "FAT32 stick, 16 GB RAM -> NoFit"; Volume = (New-TestVolume "E:\" 60 64 "FAT32"); Ram = 16GB; With = $true
+        @{ What = "FAT32 stick, 16 GB RAM -> NoFit"; Volume = (New-TestVolume -Root "E:\" -FreeGB 60 -TotalGB 64 -FileSystem "FAT32"); Ram = 16GB; With = $true
            Result = "NoFit"; Reason = '^E:\\ is FAT32, which cannot hold a file of 4 GB or more$' }
-        @{ What = "FAT32 stick, 2 GB RAM -> Ok"; Volume = (New-TestVolume "E:\" 60 64 "FAT32"); Ram = 2GB; With = $true
+        @{ What = "FAT32 stick, 2 GB RAM -> Ok"; Volume = (New-TestVolume -Root "E:\" -FreeGB 60 -TotalGB 64 -FileSystem "FAT32"); Ram = 2GB; With = $true
            Result = "Ok" }
-        @{ What = "exFAT stick, 16 GB RAM -> Ok"; Volume = (New-TestVolume "E:\" 60 64 "exFAT"); Ram = 16GB; With = $true
+        @{ What = "exFAT stick, 16 GB RAM -> Ok"; Volume = (New-TestVolume -Root "E:\" -FreeGB 60 -TotalGB 64 -FileSystem "exFAT"); Ram = 16GB; With = $true
            Result = "Ok" }
         @{ What = "-MinFreeSpaceGB 0, 40.8 GB free -> Ok"; Volume = $c487; System = $true; With = $true; Min = 0
            Result = "Ok"; Reserve = 0 }
-        @{ What = "-MinFreeSpaceGB 50 on the system drive"; Volume = (New-TestVolume "C:\" 80 487.41); System = $true; With = $true; Min = 50
+        @{ What = "-MinFreeSpaceGB 50 on the system drive"; Volume = (New-TestVolume -Root "C:\" -FreeGB 80 -TotalGB 487.41); System = $true; With = $true; Min = 50
            Result = "LowReserve"; Reserve = 50GB }
-        @{ What = "-MinFreeSpaceGB is for the system drive only"; Volume = (New-TestVolume "D:\" 453 1400); Min = 500
+        @{ What = "-MinFreeSpaceGB is for the system drive only"; Volume = (New-TestVolume -Root "D:\" -FreeGB 453 -TotalGB 1400); Min = 500
            Result = "Ok"; Reserve = 1GB }
         @{ What = "unknown volume -> Unknown"; Volume = $null; System = $true; With = $true
            Result = "Unknown"; Reason = '^the free space could not be read$' }
         @{ What = "unknown RAM -> Unknown"; Volume = $c487; Ram = 0; System = $true
            Result = "Unknown"; Dump = -1; Reason = '^the size of the RAM could not be read$' }
-        @{ What = "reserve at least 4 GB (30 GB volume)"; Volume = (New-TestVolume "C:\" 20 30); Ram = 1GB; System = $true
+        @{ What = "reserve at least 4 GB (30 GB volume)"; Volume = (New-TestVolume -Root "C:\" -FreeGB 20 -TotalGB 30); Ram = 1GB; System = $true
            Result = "Ok"; Reserve = 4GB }
-        @{ What = "reserve 10% of the volume (100 GB)"; Volume = (New-TestVolume "C:\" 20 100); Ram = 1GB; System = $true
+        @{ What = "reserve 10% of the volume (100 GB)"; Volume = (New-TestVolume -Root "C:\" -FreeGB 20 -TotalGB 100); Ram = 1GB; System = $true
            Result = "Ok"; Reserve = 10GB }
-        @{ What = "WinPmem raw image: RAM x 1.05"; Volume = (New-TestVolume "D:\" 453 1400); Tool = "WinPmem"
+        @{ What = "WinPmem raw image: RAM x 1.05"; Volume = (New-TestVolume -Root "D:\" -FreeGB 453 -TotalGB 1400); Tool = "WinPmem"
            Result = "Ok"; Dump = [long][math]::Ceiling($ram2 * 1.05) }
-        @{ What = "collection with -SkipLargeFiles: 1 GB x 1.25"; Volume = (New-TestVolume "D:\" 453 1400); With = $true; Large = $false
+        @{ What = "collection with -SkipLargeFiles: 1 GB x 1.25"; Volume = (New-TestVolume -Root "D:\" -FreeGB 453 -TotalGB 1400); With = $true; Large = $false
            Result = "Ok"; Collection = [long](1GB * 1.25) }
-        @{ What = "collection with -NoCompress: 4 GB"; Volume = (New-TestVolume "D:\" 453 1400); With = $true; Compress = $false
+        @{ What = "collection with -NoCompress: 4 GB"; Volume = (New-TestVolume -Root "D:\" -FreeGB 453 -TotalGB 1400); With = $true; Compress = $false
            Result = "Ok"; Collection = 4GB }
-        @{ What = "collection alone (-NoDump)"; Volume = (New-TestVolume "C:\" 40.8 487.41); System = $true; With = $true; NoDump = $true
+        @{ What = "collection alone (-NoDump)"; Volume = (New-TestVolume -Root "C:\" -FreeGB 40.8 -TotalGB 487.41); System = $true; With = $true; NoDump = $true
            Result = "Ok"; Dump = 0; Collection = 5GB }
         @{ What = "1 GB left on another drive -> Ok"; Volume = [PSCustomObject]@{ Root = "D:\"; FreeBytes = $ram2 + 1MB + 1GB; TotalBytes = 1400GB; FileSystem = "NTFS" }
            Result = "Ok" }
@@ -208,9 +208,9 @@ try {
     $lineCases = @(
         @{ What = "run 2"; Params = @{ Volume = $c487; RamBytes = $ram2; OnSystemDrive = $true; WithCollection = $true }
            Line = 'Free space on C:\: 40.8 GB; memory dump ~31.9 GB + collection ~5 GB would leave ~3.9 GB (to keep free on the system drive: 20 GB)' }
-        @{ What = "another drive"; Params = @{ Volume = (New-TestVolume "D:\" 453 1400); RamBytes = $ram2 }
+        @{ What = "another drive"; Params = @{ Volume = (New-TestVolume -Root "D:\" -FreeGB 453 -TotalGB 1400); RamBytes = $ram2 }
            Line = 'Free space on D:\: 453 GB; memory dump ~31.9 GB would leave ~421.1 GB (to keep free: 1 GB)' }
-        @{ What = "no room"; Params = @{ Volume = (New-TestVolume "C:\" 2.6 487.41); RamBytes = $ram2; OnSystemDrive = $true; WithCollection = $true }
+        @{ What = "no room"; Params = @{ Volume = (New-TestVolume -Root "C:\" -FreeGB 2.6 -TotalGB 487.41); RamBytes = $ram2; OnSystemDrive = $true; WithCollection = $true }
            Line = 'Free space on C:\: 2.6 GB; memory dump ~31.9 GB + collection ~5 GB would need ~34.3 GB more (to keep free on the system drive: 20 GB)' }
         @{ What = "collection alone"; Params = @{ Volume = $c487; OnSystemDrive = $true; WithCollection = $true; NoDump = $true }
            Line = 'Free space on C:\: 40.8 GB; collection ~5 GB would leave ~35.8 GB (to keep free on the system drive: 20 GB)' }
@@ -405,10 +405,10 @@ try {
         }
     }
     $script:testVolumes = @{
-        "C:\" = New-TestVolume "C:\" 40.8 487.41
-        "D:\" = New-TestVolume "D:\" 453 1400
-        "E:\" = New-TestVolume "E:\" 60 64 "FAT32"
-        "F:\" = New-TestVolume "F:\" 20 500
+        "C:\" = New-TestVolume -Root "C:\" -FreeGB 40.8 -TotalGB 487.41
+        "D:\" = New-TestVolume -Root "D:\" -FreeGB 453 -TotalGB 1400
+        "E:\" = New-TestVolume -Root "E:\" -FreeGB 60 -TotalGB 64 -FileSystem "FAT32"
+        "F:\" = New-TestVolume -Root "F:\" -FreeGB 20 -TotalGB 500
     }
     $runTwoLines = @(
         '^  Captures a full RAM dump \(~32 GB on this system\)\.$',
@@ -450,7 +450,7 @@ try {
     Add-Result "prompt: run 2, skipped" $problems
 
     # No room on C: and no other drive: nothing to choose, no question
-    $script:testVolumes["C:\"] = New-TestVolume "C:\" 2.6 487.41
+    $script:testVolumes["C:\"] = New-TestVolume -Root "C:\" -FreeGB 2.6 -TotalGB 487.41
     $script:testDriveRoots = @("C:\", "E:\")
     $run = Invoke-Prompt -Answers @()
     $problems = New-Problems
@@ -462,7 +462,7 @@ try {
     Add-Result "prompt: no room anywhere, no question" $problems
 
     # Plenty of room: today's Yes / No, still the system drive warning
-    $script:testVolumes["C:\"] = New-TestVolume "C:\" 400 487.41
+    $script:testVolumes["C:\"] = New-TestVolume -Root "C:\" -FreeGB 400 -TotalGB 487.41
     $run = Invoke-Prompt -Answers @("1")
     $problems = New-Problems
     if ($run.Thrown) { $problems.Add("prompt threw: $($run.Thrown)") }
@@ -502,7 +502,7 @@ try {
 
     # Collection on an NTFS stick with room: Yes / No, a 1 GB margin only
     $script:OutputPath = "G:\win11-triage-collector\reports\TriageCollection_2026-01-02_03-04"
-    $script:testVolumes["G:\"] = New-TestVolume "G:\" 200 256
+    $script:testVolumes["G:\"] = New-TestVolume -Root "G:\" -FreeGB 200 -TotalGB 256
     $run = Invoke-Prompt -Answers @("2")
     $problems = New-Problems
     if ($run.Thrown) { $problems.Add("prompt threw: $($run.Thrown)") }
@@ -585,7 +585,7 @@ try {
         $script:MemoryOutputPath = $DumpDir
         $script:standIn = $StandIn
         $script:toolCalls = 0
-        if ($Volume -is [string]) { $Volume = New-TestVolume $tempRoot 500 1000 }
+        if ($Volume -is [string]) { $Volume = New-TestVolume -Root $tempRoot -FreeGB 500 -TotalGB 1000 }
         $script:testVolumes = @{}
         if ($Volume) { $script:testVolumes[$tempRoot] = $Volume }
         $dumpPath = Get-MemoryDumpPath -ToolName "DumpIt" -DumpDir $DumpDir
@@ -646,14 +646,14 @@ try {
     $run = Invoke-MemorySection -Name "complete" -StandIn (New-StandIn $completeBytes)
     $problems = New-Problems
     $dumpText = [regex]::Escape((ConvertTo-LogText $run.DumpPath))
-    Test-SectionRun $run @(
+    Test-SectionRun -Run $run -Lines @(
         "Memory dump file: $dumpText$",
         "Free space on ${rootText}: 500 GB; memory dump ~0 GB \+ collection ~5 GB would leave ~495 GB \(to keep free on the system drive: 20 GB\)$",
         'The memory dump is written to the system drive being examined',
         'Capturing memory',
         "Memory dump check: $completeBytes bytes \(100\.8% of the RAM\); DumpIt reported NtStatus 0x00000000 and a file of $completeBytes bytes$",
         "OK: Memory dump captured: $dumpText"
-    ) 0 1 $problems -Absent @('WARNING', 'ERROR')
+    ) -Errors 0 -ToolCalls 1 -Problems $problems -Absent @('WARNING', 'ERROR')
     if ($run.MemDumpPath -ne $run.DumpPath) { $problems.Add("memDumpPath '$($run.MemDumpPath)'") }
     if ((Get-FileLength $run.DumpPath) -ne $completeBytes) { $problems.Add("dump is $(Get-FileLength $run.DumpPath) bytes") }
     $dumpRows = @($run.Rows | Where-Object { $_.SourcePath -eq "(memory dump via DumpIt)" })
@@ -662,35 +662,35 @@ try {
     Add-Result "section: complete dump" $problems -Info "$completeBytes bytes"
 
     # No room: an error, no capture, nothing written
-    $run = Invoke-MemorySection -Name "noroom" -StandIn (New-StandIn $completeBytes) -Volume (New-TestVolume $tempRoot 2 100)
+    $run = Invoke-MemorySection -Name "noroom" -StandIn (New-StandIn $completeBytes) -Volume (New-TestVolume -Root $tempRoot -FreeGB 2 -TotalGB 100)
     $problems = New-Problems
-    Test-SectionRun $run @(
+    Test-SectionRun -Run $run -Lines @(
         "Free space on ${rootText}: 2 GB; memory dump ~0 GB \+ collection ~5 GB would need ~3 GB more",
         "ERROR: Memory capture skipped: less than 1 GB would be left free on $rootText\. Free up space, or write the dump to another drive with -MemoryOutputPath\.$"
-    ) 1 0 $problems -Absent @('Capturing memory')
+    ) -Errors 1 -ToolCalls 0 -Problems $problems -Absent @('Capturing memory')
     if ((Get-FileLength $run.DumpPath) -ge 0 -or (Test-Path -LiteralPath $run.AcqLog) -or $run.MemDumpPath -or $run.Incomplete) { $problems.Add("something was written or set") }
     Add-Result "section: no room -> error, no capture" $problems
 
     # Low reserve, no prompt: a warning, the capture runs
-    $run = Invoke-MemorySection -Name "lowreserve" -StandIn (New-StandIn $completeBytes) -Volume (New-TestVolume $tempRoot 12 100)
+    $run = Invoke-MemorySection -Name "lowreserve" -StandIn (New-StandIn $completeBytes) -Volume (New-TestVolume -Root $tempRoot -FreeGB 12 -TotalGB 100)
     $problems = New-Problems
-    Test-SectionRun $run @(
+    Test-SectionRun -Run $run -Lines @(
         "Free space on ${rootText}: 12 GB; memory dump ~0 GB \+ collection ~5 GB would leave ~7 GB \(to keep free on the system drive: 10 GB\)$",
         "WARNING: Capturing anyway: $rootText would be left with ~7 GB free, less than the 10 GB to keep free on the system drive\. -MemoryOutputPath writes the dump to another drive\.$",
         'OK: Memory dump captured'
-    ) 0 1 $problems
+    ) -Errors 0 -ToolCalls 1 -Problems $problems
     if ($run.MemDumpPath -ne $run.DumpPath) { $problems.Add("memDumpPath '$($run.MemDumpPath)'") }
     Add-Result "section: low reserve -> warning, capture" $problems
 
-    $run = Invoke-MemorySection -Name "lowaccepted" -StandIn (New-StandIn $completeBytes) -Volume (New-TestVolume $tempRoot 12 100) -Accepted
+    $run = Invoke-MemorySection -Name "lowaccepted" -StandIn (New-StandIn $completeBytes) -Volume (New-TestVolume -Root $tempRoot -FreeGB 12 -TotalGB 100) -Accepted
     $problems = New-Problems
-    Test-SectionRun $run @('WARNING: Capturing anyway \(chosen at the prompt\): ', 'OK: Memory dump captured') 0 1 $problems
+    Test-SectionRun -Run $run -Lines @('WARNING: Capturing anyway \(chosen at the prompt\): ', 'OK: Memory dump captured') -Errors 0 -ToolCalls 1 -Problems $problems
     Add-Result "section: low reserve chosen at the prompt" $problems
 
     # Free space unknown: a warning, the capture runs
     $run = Invoke-MemorySection -Name "unknown" -StandIn (New-StandIn $completeBytes) -Volume $null
     $problems = New-Problems
-    Test-SectionRun $run @("Free space on ${rootText}: unknown$", 'WARNING: Capturing without a free space check: the free space could not be read\.$', 'OK: Memory dump captured') 0 1 $problems
+    Test-SectionRun -Run $run -Lines @("Free space on ${rootText}: unknown$", 'WARNING: Capturing without a free space check: the free space could not be read\.$', 'OK: Memory dump captured') -Errors 0 -ToolCalls 1 -Problems $problems
     Add-Result "section: free space unknown -> warning, capture" $problems
 
     # Failed capture: error, DumpIt's error line, the dump moved out of the
@@ -698,12 +698,12 @@ try {
     $run = Invoke-MemorySection -Name "failed" -StandIn (New-StandIn -DumpBytes 524288 -ReportedBytes $completeBytes -NtStatus "0xC000007F" -Extra @("    Error: Not enough disk space to save dump file."))
     $problems = New-Problems
     $incompletePath = "${OutputPath}_memory_dump.dmp.incomplete"
-    Test-SectionRun $run @(
+    Test-SectionRun -Run $run -Lines @(
         'WARNING: DumpIt: Error: Not enough disk space to save dump file\.$',
         "ERROR: Memory capture failed: DumpIt reported NtStatus 0xC000007F; DumpIt reported a file of $completeBytes bytes, the dump has 524288 bytes; the dump has 524288 bytes, less than 95% of the RAM \(1048576 bytes\)\.$",
         'WARNING: Check acquisition log: ',
         ("WARNING: Incomplete memory dump kept outside the collection \(not zipped, not for analysis\): " + [regex]::Escape((ConvertTo-LogText $incompletePath)))
-    ) 1 1 $problems -Absent @('OK: Memory dump captured')
+    ) -Errors 1 -ToolCalls 1 -Problems $problems -Absent @('OK: Memory dump captured')
     if ((Get-FileLength $run.DumpPath) -ge 0) { $problems.Add("dump still in the collection") }
     if ((Get-FileLength $incompletePath) -ne 524288) { $problems.Add("no 524288-byte file at $incompletePath") }
     if ($run.MemDumpPath -or $run.Incomplete -ne $incompletePath) { $problems.Add("memDumpPath '$($run.MemDumpPath)', incomplete '$($run.Incomplete)'") }
@@ -714,28 +714,28 @@ try {
     # Empty dump: error, deleted
     $run = Invoke-MemorySection -Name "empty" -StandIn (New-StandIn -DumpBytes 0 -ReportedBytes -1 -NtStatus "")
     $problems = New-Problems
-    Test-SectionRun $run @('ERROR: Memory capture failed: the dump file is empty\.$', 'Deleted the empty memory dump file: ') 1 1 $problems
+    Test-SectionRun -Run $run -Lines @('ERROR: Memory capture failed: the dump file is empty\.$', 'Deleted the empty memory dump file: ') -Errors 1 -ToolCalls 1 -Problems $problems
     if ((Get-FileLength $run.DumpPath) -ge 0 -or $run.MemDumpPath -or $run.Incomplete) { $problems.Add("dump left or set") }
     Add-Result "section: empty dump -> error, deleted" $problems
 
     # No dump written
     $run = Invoke-MemorySection -Name "nodump" -StandIn (New-StandIn -DumpBytes -1 -ReportedBytes -1 -NtStatus "")
     $problems = New-Problems
-    Test-SectionRun $run @('ERROR: Memory capture failed: no dump file was written\.$') 1 1 $problems
+    Test-SectionRun -Run $run -Lines @('ERROR: Memory capture failed: no dump file was written\.$') -Errors 1 -ToolCalls 1 -Problems $problems
     if ($run.MemDumpPath -or $run.Incomplete) { $problems.Add("memDumpPath '$($run.MemDumpPath)', incomplete '$($run.Incomplete)'") }
     Add-Result "section: no dump written -> error" $problems
 
     # The tool fails after writing part of the dump: the catch, then set aside
     $run = Invoke-MemorySection -Name "throws" -StandIn (New-StandIn -DumpBytes 4096 -Throw "synthetic tool failure")
     $problems = New-Problems
-    Test-SectionRun $run @('ERROR: Memory capture failed: synthetic tool failure$', 'WARNING: Incomplete memory dump kept outside the collection') 1 1 $problems
+    Test-SectionRun -Run $run -Lines @('ERROR: Memory capture failed: synthetic tool failure$', 'WARNING: Incomplete memory dump kept outside the collection') -Errors 1 -ToolCalls 1 -Problems $problems
     if ((Get-FileLength $run.DumpPath) -ge 0 -or -not $run.Incomplete -or $run.MemDumpPath) { $problems.Add("dump not set aside") }
     Add-Result "section: tool error -> error, set aside" $problems
 
     # An earlier dump at the path: not overwritten, no capture
     $run = Invoke-MemorySection -Name "earlier" -StandIn (New-StandIn $completeBytes) -EarlierDump
     $problems = New-Problems
-    Test-SectionRun $run @(("ERROR: Memory capture skipped: a file is already at " + [regex]::Escape((ConvertTo-LogText $run.DumpPath)))) 1 0 $problems
+    Test-SectionRun -Run $run -Lines @(("ERROR: Memory capture skipped: a file is already at " + [regex]::Escape((ConvertTo-LogText $run.DumpPath)))) -Errors 1 -ToolCalls 0 -Problems $problems
     if ((Get-FileLength $run.DumpPath) -ne 12 -or $run.MemDumpPath -or $run.Incomplete) { $problems.Add("earlier dump changed or set") }
     Add-Result "section: earlier dump at the path -> kept, no capture" $problems
 
@@ -746,7 +746,7 @@ try {
     $problems = New-Problems
     $expectedDump = Join-Path $dumpDir "TriageCollection_2026-01-02_03-04_memory_dump.dmp"
     if ($run.DumpPath -ne $expectedDump) { $problems.Add("dump path '$($run.DumpPath)'") }
-    Test-SectionRun $run @(("Memory dump file: " + [regex]::Escape((ConvertTo-LogText $expectedDump)) + '$'), 'OK: Memory dump captured') 0 1 $problems
+    Test-SectionRun -Run $run -Lines @(("Memory dump file: " + [regex]::Escape((ConvertTo-LogText $expectedDump)) + '$'), 'OK: Memory dump captured') -Errors 0 -ToolCalls 1 -Problems $problems
     if ($run.MemDumpPath -ne $expectedDump -or (Get-FileLength $expectedDump) -ne $completeBytes) { $problems.Add("memDumpPath '$($run.MemDumpPath)', $(Get-FileLength $expectedDump) bytes") }
     if (-not (Test-Path -LiteralPath $run.AcqLog)) { $problems.Add("no acquisition log in Memory\") }
     $dumpRows = @($run.Rows | Where-Object { $_.SourcePath -eq "(memory dump via DumpIt)" })
@@ -756,7 +756,7 @@ try {
     # A failed capture to -MemoryOutputPath: renamed in place
     $run = Invoke-MemorySection -Name "dumpdirfailed" -StandIn (New-StandIn -DumpBytes 4096 -ReportedBytes 4096) -DumpDir (Join-Path $workDir "dumps2")
     $problems = New-Problems
-    Test-SectionRun $run @('ERROR: Memory capture failed: the dump has 4096 bytes, less than 95% of the RAM', 'WARNING: Incomplete memory dump kept outside the collection') 1 1 $problems
+    Test-SectionRun -Run $run -Lines @('ERROR: Memory capture failed: the dump has 4096 bytes, less than 95% of the RAM', 'WARNING: Incomplete memory dump kept outside the collection') -Errors 1 -ToolCalls 1 -Problems $problems
     if ($run.Incomplete -ne "$($run.DumpPath).incomplete" -or (Get-FileLength $run.Incomplete) -ne 4096 -or (Get-FileLength $run.DumpPath) -ge 0) { $problems.Add("incomplete '$($run.Incomplete)'") }
     Add-Result "section: -MemoryOutputPath, failed -> renamed" $problems
 
@@ -765,11 +765,11 @@ try {
     $run = Invoke-MemorySection -Name "dumpdirblocked" -StandIn (New-StandIn -DumpBytes 4096 -ReportedBytes 4096) -DumpDir (Join-Path $workDir "dumps3") -BlockIncomplete
     $problems = New-Problems
     $dumpText = [regex]::Escape((ConvertTo-LogText $run.DumpPath))
-    Test-SectionRun $run @(
+    Test-SectionRun -Run $run -Lines @(
         'ERROR: Memory capture failed: ',
         "WARNING: Could not set the incomplete memory dump aside as $dumpText\.incomplete, deleting it so it is not taken for a good dump: ",
         "Deleted the incomplete memory dump: $dumpText$"
-    ) 1 1 $problems
+    ) -Errors 1 -ToolCalls 1 -Problems $problems
     if ((Get-FileLength $run.DumpPath) -ge 0 -or $run.Incomplete -or $run.MemDumpPath) { $problems.Add("dump left ($(Get-FileLength $run.DumpPath) bytes), incomplete '$($run.Incomplete)'") }
     if ((Get-FileLength "$($run.DumpPath).incomplete") -ne 7) { $problems.Add("the file already at .incomplete was changed") }
     Add-Result "section: -MemoryOutputPath, failed, not renamed -> deleted" $problems
@@ -779,11 +779,11 @@ try {
     $run = Invoke-MemorySection -Name "failedlocked" -StandIn (New-StandIn -DumpBytes 4096 -ReportedBytes 4096) -LockDump
     $problems = New-Problems
     $dumpText = [regex]::Escape((ConvertTo-LogText $run.DumpPath))
-    Test-SectionRun $run @(
+    Test-SectionRun -Run $run -Lines @(
         'ERROR: Memory capture failed: ',
         ("WARNING: Could not set the incomplete memory dump aside as " + [regex]::Escape((ConvertTo-LogText "${OutputPath}_memory_dump.dmp.incomplete")) + ", deleting it"),
         "WARNING: Could not delete the incomplete memory dump, delete it by hand \(it is not complete, do not analyze it\): $dumpText$"
-    ) 1 1 $problems -Absent @('Incomplete memory dump kept outside', 'Deleted the incomplete')
+    ) -Errors 1 -ToolCalls 1 -Problems $problems -Absent @('Incomplete memory dump kept outside', 'Deleted the incomplete')
     if ($run.Incomplete -ne $run.DumpPath -or (Get-FileLength $run.DumpPath) -ne 4096 -or $run.MemDumpPath) { $problems.Add("incomplete '$($run.Incomplete)', $(Get-FileLength $run.DumpPath) bytes") }
     Add-Result "section: failed, locked -> left, named" $problems
 

@@ -4,6 +4,7 @@
 # Use Run-TriageCollector.bat to launch (handles elevation + policy)
 # =============================================================
 
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute("PSReviewUnusedParameter", "MinFreeSpaceGB", Justification = "Read by Get-TriageSpaceCheck through script scope")]
 param(
     [string]$OutputPath = "",
     [switch]$SkipLargeFiles,

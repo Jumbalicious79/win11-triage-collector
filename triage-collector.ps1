@@ -15,7 +15,11 @@ param(
     # No prompts (scripts and tests): the target is the live system drive unless
     # -TargetDrive is given, memory is captured only when -Categories includes
     # Memory, and there is no "Press any key" at the end
-    [switch]$Unattended
+    [switch]$Unattended,
+    # Email category: also copy Thunderbird's global-messages-db.sqlite search
+    # index. Off by default: besides the headers it holds the text of the
+    # indexed messages
+    [switch]$IncludeThunderbirdIndex
 )
 
 # --- Require Administrator ---
@@ -3975,14 +3979,26 @@ if ($Categories -contains "AntiVirus") {
 # Helpers for the Email section: file listings that never follow
 # links, listing rows, and capped copies
 # ----------------------------------------------------------
-# Attachments in the mail clients' temp folders are copied up to 50 MB per
-# file and 500 MB per user (newest first), a Thunderbird
-# global-messages-db.sqlite (with its -wal) up to 1 GB. A listing stops
-# after 20,000 files per folder.
-$script:emailMaxFileBytes = 50MB
-$script:emailMaxUserBytes = 500MB
+# Attachments in the mail clients' temp folders are copied newest first, up
+# to 50 MB per file, 500 MB per user and 2 GB for all users together (with
+# -SkipLargeFiles: 10 MB, 100 MB and 500 MB). Thunderbird's
+# global-messages-db.sqlite (with its -wal) holds the text of the indexed
+# messages: it is copied only with -IncludeThunderbirdIndex, up to 1 GB. A
+# listing stops after 20,000 files per folder.
+if ($SkipLargeFiles) {
+    $script:emailMaxFileBytes = 10MB
+    $script:emailMaxUserBytes = 100MB
+    $script:emailMaxTotalBytes = 500MB
+} else {
+    $script:emailMaxFileBytes = 50MB
+    $script:emailMaxUserBytes = 500MB
+    $script:emailMaxTotalBytes = 2GB
+}
 $script:emailMaxDatabaseBytes = 1GB
 $script:emailMaxListedFiles = 20000
+$script:emailIncludeIndex = [bool]$IncludeThunderbirdIndex
+# Attachment bytes copied for all users together (Used, Limit)
+$script:emailTotalBudget = @{ Used = 0L; Limit = [long]$script:emailMaxTotalBytes }
 # Columns of every email listing CSV
 $script:emailListingColumns = @("User", "Program", "Store", "Profile", "Path", "RelativePath", "SizeBytes",
     "CreatedUtc", "ModifiedUtc", "AccessedUtc", "Status", "CollectedAs")
@@ -3990,6 +4006,22 @@ $script:emailListingColumns = @("User", "Program", "Store", "Profile", "Path", "
 # RecallOnDataAccess 0x400000) are listed but never read: reading a OneDrive
 # placeholder would download it
 $script:emailNoReadAttributes = [int][System.IO.FileAttributes]::ReparsePoint -bor [int][System.IO.FileAttributes]::Offline -bor 0x40000 -bor 0x400000
+
+# $true for a junction or symbolic link. Other reparse points (OneDrive
+# folders, for one) are ordinary folders here. The link type is read from
+# the reparse point itself, without following it; if it cannot be read, the
+# item counts as a link.
+function Test-TriageLinkItem {
+    param([System.IO.FileSystemInfo]$Item)
+    if (([int]$Item.Attributes -band [int][System.IO.FileAttributes]::ReparsePoint) -eq 0) { return $false }
+    try {
+        $linkType = [string](Get-Item -LiteralPath $Item.FullName -Force -ErrorAction Stop).LinkType
+        return ($linkType -eq "Junction" -or $linkType -eq "SymbolicLink")
+    } catch {
+        Write-Verbose "Reading the reparse point of $($Item.FullName): $($_.Exception.Message)"
+        return $true
+    }
+}
 
 # $true if the folder, or a folder above it up to (not including) -StopAt,
 # is a junction or symbolic link. Such folders are not listed: in a mounted
@@ -4005,7 +4037,7 @@ function Test-TriageLinkedFolder {
         $dir = New-Object System.IO.DirectoryInfo($Path)
         while ($null -ne $dir) {
             if ($StopAt -and $dir.FullName.TrimEnd('\') -ieq $StopAt.TrimEnd('\')) { break }
-            if ($dir.Exists -and ([int]$dir.Attributes -band [int][System.IO.FileAttributes]::ReparsePoint) -ne 0) { return $true }
+            if ($dir.Exists -and (Test-TriageLinkItem -Item $dir)) { return $true }
             $dir = $dir.Parent
         }
     } catch { Write-Verbose "Checking $Path for links: $($_.Exception.Message)" }
@@ -4013,18 +4045,27 @@ function Test-TriageLinkedFolder {
 }
 
 # Files in a folder (and all its subfolders with -Recurse), sorted by path.
-# -Extensions keeps only those (".pst"). Subfolders that are junctions or
-# symbolic links are not entered. Stops at $script:emailMaxListedFiles
-# files; a cut-off listing or an unreadable subfolder is logged.
+# -Extensions keeps only those (".pst"); -SkipFolders names subfolders right
+# below -Folder that are not entered (they are listed on their own).
+# Subfolders that are junctions or symbolic links are not entered. A listing
+# stops at $script:emailMaxListedFiles files; with -NewestFirst it looks at
+# up to five times as many and keeps the newest (by modified time). A cut-off
+# listing or an unreadable subfolder is logged.
 function Get-TriageEmailFiles {
     param(
         [string]$Folder,
         [switch]$Recurse,
-        [string[]]$Extensions = @()
+        [string[]]$Extensions = @(),
+        [string[]]$SkipFolders = @(),
+        [switch]$NewestFirst
     )
+    $keep = [int]$script:emailMaxListedFiles
+    $scanLimit = $keep
+    if ($NewestFirst) { $scanLimit = 5 * $keep }
     $files = New-Object System.Collections.Generic.List[System.IO.FileInfo]
     $pending = New-Object System.Collections.Generic.Stack[System.IO.DirectoryInfo]
     $pending.Push((New-Object System.IO.DirectoryInfo($Folder)))
+    $atRoot = $true
     $truncated = $false
     $failedFolders = 0
     $lastError = ""
@@ -4033,25 +4074,51 @@ function Get-TriageEmailFiles {
         try {
             foreach ($file in $dir.GetFiles()) {
                 if ($Extensions.Count -gt 0 -and $Extensions -notcontains $file.Extension) { continue }
-                if ($files.Count -ge $script:emailMaxListedFiles) { $truncated = $true; break }
+                if ($files.Count -ge $scanLimit) { $truncated = $true; break }
                 $files.Add($file)
             }
             if ($Recurse -and -not $truncated) {
                 foreach ($subDir in $dir.GetDirectories()) {
-                    if (([int]$subDir.Attributes -band [int][System.IO.FileAttributes]::ReparsePoint) -eq 0) { $pending.Push($subDir) }
+                    if ($atRoot -and $SkipFolders -contains $subDir.Name) { continue }
+                    if (-not (Test-TriageLinkItem -Item $subDir)) { $pending.Push($subDir) }
                 }
             }
         } catch {
             $failedFolders++
             $lastError = $_.Exception.Message
         }
+        $atRoot = $false
     }
-    if ($truncated) {
-        Log-Warning "More than $($script:emailMaxListedFiles) files below $Folder -- only $($script:emailMaxListedFiles) are listed"
+    $result = @($files)
+    if ($files.Count -gt $keep) {
+        # Only with -NewestFirst: keep the newest
+        $result = @($files | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First $keep)
+        if ($truncated) {
+            Log-Warning "More than $scanLimit files below $Folder -- only the $keep newest of the first $scanLimit found are listed"
+        } else {
+            Log-Warning "$($files.Count) files below $Folder -- only the $keep newest are listed"
+        }
+    } elseif ($truncated) {
+        Log-Warning "More than $keep files below $Folder -- only $keep are listed"
     }
     if ($failedFolders -gt 0) {
         Log-Warning "Could not list $failedFolders folder(s) below $Folder -- last error: $lastError"
     }
+    return @($result | Sort-Object FullName)
+}
+
+# Files of the new Outlook's Olk folder. Attachments\ is listed first and on
+# its own (newest first within the listing cap), so that a large WebView
+# cache in EBWebView\ cannot push the attachments out of the listing; then
+# the rest of the folder.
+function Get-TriageOlkFiles {
+    param([string]$OlkDir)
+    $files = @()
+    $attachmentsDir = Join-Path $OlkDir "Attachments"
+    if ([System.IO.Directory]::Exists($attachmentsDir) -and -not (Test-TriageLinkedFolder -Path $attachmentsDir -StopAt $OlkDir)) {
+        $files += @(Get-TriageEmailFiles -Folder $attachmentsDir -Recurse -NewestFirst)
+    }
+    $files += @(Get-TriageEmailFiles -Folder $OlkDir -Recurse -SkipFolders @("Attachments"))
     return @($files | Sort-Object FullName)
 }
 
@@ -4092,14 +4159,16 @@ function New-TriageEmailFileRow {
 
 # Copy the file of a listing row into its DestDir, unless it is empty, a
 # link or cloud placeholder, larger than -MaxBytes, or would take the user's
-# attachment total (-Budget, a hashtable with Used and Limit in bytes) over
-# its cap. Sets the row's Status and CollectedAs.
+# attachment total (-Budget) or the total of all users (-TotalBudget) over
+# its cap (hashtables with Used and Limit in bytes). Sets the row's Status
+# and CollectedAs.
 function Copy-TriageEmailFile {
     [OutputType([void])]
     param(
         [object]$Row,
         [long]$MaxBytes,
-        [hashtable]$Budget = $null
+        [hashtable]$Budget = $null,
+        [hashtable]$TotalBudget = $null
     )
     $file = $Row.File
     if ($file.Length -eq 0) {
@@ -4110,6 +4179,8 @@ function Copy-TriageEmailFile {
         $Row.Status = "Skipped: over the $($MaxBytes / 1MB) MB per-file cap"
     } elseif ($Budget -and $Budget.Used + $file.Length -gt $Budget.Limit) {
         $Row.Status = "Skipped: over the $($Budget.Limit / 1MB) MB per-user cap"
+    } elseif ($TotalBudget -and $TotalBudget.Used + $file.Length -gt $TotalBudget.Limit) {
+        $Row.Status = "Skipped: over the $($TotalBudget.Limit / 1MB) MB cap for all users"
     } else {
         $copiedBefore = $script:fileCount
         Copy-ForensicFile -SourcePath $file.FullName -DestDir $Row.DestDir
@@ -4117,33 +4188,135 @@ function Copy-TriageEmailFile {
             $Row.Status = "Copied"
             $Row.CollectedAs = Get-CollectionRelativePath $script:lastRecordedDestPath
             if ($Budget) { $Budget.Used += $file.Length }
+            if ($TotalBudget) { $TotalBudget.Used += $file.Length }
         } else {
             $Row.Status = "Not copied: copy failed (see collection_log.txt)"
         }
     }
 }
 
+# Text with its %NAME% variables replaced from -Variables (a hashtable,
+# names not case-sensitive); "" if one of them is not in it
+function Expand-TriageUserPath {
+    param(
+        [string]$Text,
+        [hashtable]$Variables
+    )
+    $result = $Text
+    foreach ($match in [regex]::Matches($Text, '%([^%]+)%')) {
+        $name = $match.Groups[1].Value
+        if (-not $Variables.ContainsKey($name) -or -not $Variables[$name]) { return "" }
+        $result = $result.Replace($match.Value, [string]$Variables[$name])
+    }
+    return $result
+}
+
+# Environment variables of a logged-on user, to expand that user's registry
+# values as the user's own programs do: the system's variables (SystemRoot,
+# ProgramData, ...), the user's Volatile Environment (USERPROFILE, APPDATA,
+# LOCALAPPDATA, ...; USERPROFILE and LOCALAPPDATA from the profile list if
+# it is missing) and the user's Environment (TEMP, TMP, ...). The
+# collector's own user variables are never used.
+function Get-TriageUserEnvironment {
+    param([string]$Sid)
+    $variables = @{}
+    foreach ($name in @("SystemRoot", "windir", "SystemDrive", "ProgramData", "ALLUSERSPROFILE", "PUBLIC", "ProgramFiles",
+                        "ProgramFiles(x86)", "ProgramW6432", "CommonProgramFiles", "CommonProgramFiles(x86)")) {
+        $value = [Environment]::GetEnvironmentVariable($name)
+        if ($value) { $variables[$name] = $value }
+    }
+    $noExpand = [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames
+    $volatileKey = Open-TriageRegKey -Hive "HKU" -SubKey "$Sid\Volatile Environment"
+    if ($null -ne $volatileKey) {
+        try {
+            foreach ($name in $volatileKey.GetValueNames()) {
+                $value = Expand-TriageUserPath -Text ([string]$volatileKey.GetValue($name, "", $noExpand)) -Variables $variables
+                if ($name -and $value) { $variables[$name] = $value }
+            }
+        } catch {
+            Write-Verbose "Reading the Volatile Environment of ${Sid}: $($_.Exception.Message)"
+        } finally {
+            $volatileKey.Close()
+        }
+    }
+    if (-not $variables.ContainsKey("USERPROFILE")) {
+        $profileKey = Open-TriageRegKey -Hive "HKLM" -SubKey "SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$Sid"
+        if ($null -ne $profileKey) {
+            try {
+                $value = Expand-TriageUserPath -Text ([string]$profileKey.GetValue("ProfileImagePath", "", $noExpand)) -Variables $variables
+                if ($value) { $variables["USERPROFILE"] = $value.TrimEnd('\') }
+            } catch {
+                Write-Verbose "Reading ProfileImagePath for ${Sid}: $($_.Exception.Message)"
+            } finally {
+                $profileKey.Close()
+            }
+        }
+    }
+    if ($variables.ContainsKey("USERPROFILE") -and -not $variables.ContainsKey("LOCALAPPDATA")) {
+        $variables["LOCALAPPDATA"] = Join-Path $variables["USERPROFILE"] "AppData\Local"
+    }
+    $environmentKey = Open-TriageRegKey -Hive "HKU" -SubKey "$Sid\Environment"
+    if ($null -ne $environmentKey) {
+        try {
+            foreach ($name in $environmentKey.GetValueNames()) {
+                $value = Expand-TriageUserPath -Text ([string]$environmentKey.GetValue($name, "", $noExpand)) -Variables $variables
+                if ($name -and $value) { $variables[$name] = $value }
+            }
+        } catch {
+            Write-Verbose "Reading the Environment of ${Sid}: $($_.Exception.Message)"
+        } finally {
+            $environmentKey.Close()
+        }
+    }
+    return $variables
+}
+
+# An OutlookSecureTempFolder value as a folder path without the trailing
+# backslash; "" unless it is a full path below a drive or share root
+# ("C:\" or "C:" alone would list the whole drive or the current folder)
+function Get-TriageSecureTempFolderPath {
+    param([string]$Value)
+    $folder = $Value.Trim()
+    if ($folder -notmatch '^(?:[A-Za-z]:\\|\\\\[^\\]+\\[^\\]+\\)') { return "" }
+    try {
+        $root = [System.IO.Path]::GetPathRoot($folder).TrimEnd('\')
+    } catch {
+        Write-Verbose "Not a usable folder path: $folder -- $($_.Exception.Message)"
+        return ""
+    }
+    $folder = $folder.TrimEnd('\')
+    if ($folder.Length -le $root.Length) { return "" }
+    return $folder
+}
+
 # Live system: OutlookSecureTempFolder of each Office version in every
 # loaded user hive (HKU\<SID>\Software\Microsoft\Office\<ver>\Outlook\
-# Security): objects with User (profile folder name), Version and Folder
+# Security): objects with User (profile folder name), Version, Value (as
+# stored) and Folder (environment variables expanded with the user's own
+# values; "" if one is unknown)
 function Get-TriageOutlookSecureTempFolders {
     $folders = @()
     foreach ($sid in (Get-TriageLoadedUserSids)) {
         $officeKey = Open-TriageRegKey -Hive "HKU" -SubKey "$sid\Software\Microsoft\Office"
         if ($null -eq $officeKey) { continue }
+        $userVariables = $null
         try {
             foreach ($version in $officeKey.GetSubKeyNames()) {
                 if ($version -notmatch '^\d+\.\d+$') { continue }
                 $securityKey = $officeKey.OpenSubKey("$version\Outlook\Security", $false)
                 if ($null -eq $securityKey) { continue }
                 try {
-                    $folder = [string]$securityKey.GetValue("OutlookSecureTempFolder", "", [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+                    $value = [string]$securityKey.GetValue("OutlookSecureTempFolder", "", [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
                 } finally {
                     $securityKey.Close()
                 }
-                if ($folder.Trim()) {
-                    $folders += [PSCustomObject]@{ User = (Resolve-TriageSidUser $sid); Version = $version; Folder = $folder.Trim().TrimEnd('\') }
+                if (-not $value.Trim()) { continue }
+                $folder = $value.Trim()
+                if ($folder.Contains('%')) {
+                    if ($null -eq $userVariables) { $userVariables = Get-TriageUserEnvironment -Sid $sid }
+                    $folder = Expand-TriageUserPath -Text $folder -Variables $userVariables
                 }
+                $folders += [PSCustomObject]@{ User = (Resolve-TriageSidUser $sid); Version = $version; Value = $value.Trim(); Folder = $folder }
             }
         } catch {
             Log-Warning "Could not read the Outlook settings in HKU\$sid -- $($_.Exception.Message)"
@@ -4266,7 +4439,7 @@ function Save-TriageUserEmail {
     $tempRows = New-Object System.Collections.Generic.List[object]
     foreach ($root in $tempRoots) {
         Log "Listing Outlook attachment temp folder of ${UserName}: $($root.Folder)"
-        foreach ($file in (Get-TriageEmailFiles -Folder $root.Folder -Recurse:$root.Recurse)) {
+        foreach ($file in (Get-TriageEmailFiles -Folder $root.Folder -Recurse:$root.Recurse -NewestFirst)) {
             $row = New-TriageEmailFileRow -User $UserName -Program "Classic Outlook" -Store "SecureTemp" -File $file -RelativeTo $root.RelativeTo
             $subFolder = [System.IO.Path]::GetDirectoryName($row.RelativePath)
             if (-not $subFolder -or [System.IO.Path]::IsPathRooted($subFolder)) { $subFolder = "" }
@@ -4284,7 +4457,7 @@ function Save-TriageUserEmail {
     $hasOlk = $olkDir -and [System.IO.Directory]::Exists($olkDir) -and -not (Test-TriageLinkedFolder -Path $olkDir -StopAt $ProfileDir)
     if ($hasOlk) {
         Log "Listing new Outlook (olk) folder of ${UserName}: $olkDir"
-        foreach ($file in (Get-TriageEmailFiles -Folder $olkDir -Recurse)) {
+        foreach ($file in (Get-TriageOlkFiles -OlkDir $olkDir)) {
             $row = New-TriageEmailFileRow -User $UserName -Program "New Outlook" -Store "Olk" -File $file -RelativeTo $olkDir
             if ($row.RelativePath -like "Attachments\*") {
                 $row.DestDir = Join-Path $userDest ("NewOutlook\" + [System.IO.Path]::GetDirectoryName($row.RelativePath))
@@ -4300,7 +4473,7 @@ function Save-TriageUserEmail {
     # Attachment copies, newest first, within the caps
     $copyRows = @($attachmentRows | Sort-Object { $_.File.LastWriteTimeUtc } -Descending)
     foreach ($row in $copyRows) {
-        Copy-TriageEmailFile -Row $row -MaxBytes $script:emailMaxFileBytes -Budget $budget
+        Copy-TriageEmailFile -Row $row -MaxBytes $script:emailMaxFileBytes -Budget $budget -TotalBudget $script:emailTotalBudget
     }
     if ($olkSettingsRow) {
         Copy-TriageEmailFile -Row $olkSettingsRow -MaxBytes $script:emailMaxFileBytes
@@ -4374,12 +4547,15 @@ function Save-TriageUserEmail {
             Log "Collecting Thunderbird profile of ${UserName}: $thunderbirdProfile"
             Copy-ForensicFile -SourcePath (Join-Path $thunderbirdProfile "prefs.js") -DestDir $profileDest
             # global-messages-db.sqlite: the search index (dates, authors,
-            # recipients, subjects, attachment names of the indexed mail)
+            # recipients, subjects, attachment names -- and the text -- of
+            # the indexed mail); only with -IncludeThunderbirdIndex
             $glodaPath = Join-Path $thunderbirdProfile "global-messages-db.sqlite"
             $glodaBytes = Get-FileLength $glodaPath
             if ($glodaBytes -ge 0) {
                 $glodaBytes += [Math]::Max(0, (Get-FileLength "$glodaPath-wal"))
-                if ($glodaBytes -gt $script:emailMaxDatabaseBytes) {
+                if (-not $script:emailIncludeIndex) {
+                    Log "Not copied (search index, holds the message text; -IncludeThunderbirdIndex copies it), $([math]::Round($glodaBytes / 1MB)) MB: $glodaPath"
+                } elseif ($glodaBytes -gt $script:emailMaxDatabaseBytes) {
                     Log "Skipped (over the $($script:emailMaxDatabaseBytes / 1MB) MB database cap, $([math]::Round($glodaBytes / 1MB)) MB): $glodaPath"
                 } else {
                     foreach ($suffix in @("", "-wal", "-journal")) {
@@ -4440,15 +4616,20 @@ function Save-TriageUserEmail {
 #   NewOutlook\   new Outlook (olk): UserSettings.json and Attachments\
 #                 (capped copies), and a listing of the whole Olk folder
 #                 (its mail data in EBWebView\ is listed, not copied)
-#   Thunderbird\  profiles.ini; per profile prefs.js and the
-#                 global-messages-db.sqlite search index, and a listing of
-#                 the Mail\ and ImapMail\ folders (mailboxes are not copied)
+#   Thunderbird\  profiles.ini; per profile prefs.js (and, only with
+#                 -IncludeThunderbirdIndex, the global-messages-db.sqlite
+#                 search index, which holds the message text), and a listing
+#                 of the Mail\ and ImapMail\ folders (mailboxes are not copied)
 #   WindowsMail\  a listing of the Windows Mail store (not copied)
 if ($Categories -contains "Email") {
     Log "============================================================="
     Log "  COLLECTING: Email Artifacts"
     Log "============================================================="
     $emailDir = Join-Path $OutputPath "Email"
+    Log "Attachment copy caps: $($script:emailMaxFileBytes / 1MB) MB per file, $($script:emailMaxUserBytes / 1MB) MB per user, $($script:emailMaxTotalBytes / 1MB) MB for all users"
+    if ($script:emailIncludeIndex) {
+        Log "Thunderbird search index (global-messages-db.sqlite): copied (-IncludeThunderbirdIndex)"
+    }
 
     # Live system: the attachment temp folder each logged-on user's Outlook
     # uses (normally a Content.Outlook subfolder, listed anyway; a folder
@@ -4457,14 +4638,20 @@ if ($Categories -contains "Email") {
     if ($script:IsLive) {
         Log "Reading OutlookSecureTempFolder from the loaded user hives..."
         foreach ($entry in (Get-TriageOutlookSecureTempFolders)) {
-            if ($entry.Folder -match '%') {
-                Log "OutlookSecureTempFolder of $($entry.User) (Office $($entry.Version)) holds environment variables -- not expanded, skipped: $($entry.Folder)"
+            $label = "OutlookSecureTempFolder of $($entry.User) (Office $($entry.Version))"
+            if (-not $entry.Folder) {
+                Log "$label holds an environment variable the user does not have -- skipped: $($entry.Value)"
                 continue
             }
-            Log "OutlookSecureTempFolder of $($entry.User) (Office $($entry.Version)): $($entry.Folder)"
+            $folder = Get-TriageSecureTempFolderPath $entry.Folder
+            if (-not $folder) {
+                Log "$label is not a folder below a drive or share root -- not listed: $($entry.Folder)"
+                continue
+            }
+            Log "${label}: $folder"
             if (-not $entry.User) { continue }
             if (-not $registryTempFolders.ContainsKey($entry.User)) { $registryTempFolders[$entry.User] = @() }
-            $registryTempFolders[$entry.User] += $entry.Folder
+            $registryTempFolders[$entry.User] += $folder
         }
     } else {
         Log "Skipping the OutlookSecureTempFolder lookup (mounted image -- the Content.Outlook folders are listed instead; the value is in the collected NTUSER.DAT)"

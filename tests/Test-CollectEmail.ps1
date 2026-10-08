@@ -6,14 +6,25 @@
 # letter with subst, runs triage-collector.ps1 -TargetDrive <letter>
 # -Categories Email -Unattended -NoCompress and checks the collected files,
 # the listing CSVs and the manifest: attachments are copied within the caps
-# (50 MB per file, 500 MB per user, newest first); OST/PST files, mailboxes
-# and the new Outlook's mail data are listed but never copied; junctions are
-# never followed. Needs about 1.1 GB of free space in %TEMP% for a moment.
-# Part 2 (live system): sets OutlookSecureTempFolder of a made-up Office
-# version (HKCU\Software\Microsoft\Office\99.0\Outlook\Security) to a folder
-# outside Content.Outlook and checks that the collector lists and copies
-# it. It writes to HKCU, so it runs only in GitHub Actions or with
-# -AllowSystemChanges (otherwise SKIPPED); the key is removed afterwards.
+# (50 MB per file, 500 MB per user, newest first); OST/PST files, mailboxes,
+# the new Outlook's mail data and Thunderbird's search index (it holds the
+# message text) are listed or logged but never copied; junctions are never
+# followed. A second run with -IncludeThunderbirdIndex -SkipLargeFiles
+# copies the search index and uses the lower caps (10 MB per file). Needs
+# about 1.1 GB of free space in %TEMP% for a moment.
+# Part 2 (helper functions): loads the collector's functions without
+# running it and checks, with the listing cap lowered to 5 files, that a
+# cut-off listing keeps the newest files and that a large new Outlook
+# WebView cache cannot push Olk\Attachments out of the listing; also the
+# cap for all users, the checks of OutlookSecureTempFolder values (a drive
+# root is refused) and their environment variables, and link detection.
+# Part 3 (live system): sets OutlookSecureTempFolder of three made-up Office
+# versions (HKCU\Software\Microsoft\Office\97.0, 98.0, 99.0 \Outlook\
+# Security): a folder outside Content.Outlook, one given with
+# %LOCALAPPDATA%, and the drive root; checks that the collector lists and
+# copies the first two and refuses the third. It writes to HKCU, so it runs
+# only in GitHub Actions or with -AllowSystemChanges (otherwise SKIPPED);
+# the keys are removed afterwards.
 #
 # Needs Administrator rights, like the collector (GitHub Actions Windows
 # runners are elevated). For a local run without them, pass -CollectorPath
@@ -22,7 +33,7 @@
 # Exit code 0 = pass, 1 = fail.
 #
 #   powershell -ExecutionPolicy Bypass -File tests\Test-CollectEmail.ps1
-#   ... -AllowSystemChanges   also run Part 2 outside GitHub Actions
+#   ... -AllowSystemChanges   also run Part 3 outside GitHub Actions
 # =============================================================
 param(
     # Collector script to test (default: the repository's triage-collector.ps1)
@@ -114,6 +125,40 @@ function Get-ListingRows {
     return $rows
 }
 
+# Checks collected copies (collection-relative path -> source file): present,
+# same bytes as the source, in the manifest with the source's modified time
+function Test-CollectedCopies {
+    param([string]$CollectionPath, [hashtable]$Manifest, [System.Collections.IDictionary]$Copies)
+    foreach ($relative in $Copies.Keys) {
+        $source = $Copies[$relative]
+        $copy = Join-Path $CollectionPath $relative
+        $problem = ""
+        if (-not (Test-Path -LiteralPath $copy)) { $problem = "not collected" }
+        elseif ((Get-FileHash -LiteralPath $copy -Algorithm SHA256).Hash -ne (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash) { $problem = "copy differs from the source" }
+        elseif (-not $Manifest.ContainsKey($relative)) { $problem = "no manifest row" }
+        elseif ($Manifest[$relative].SHA256 -ne (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash) { $problem = "manifest hash differs" }
+        elseif ([datetime]::Parse($Manifest[$relative].SourceModifiedUtc, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AdjustToUniversal) -ne [System.IO.File]::GetLastWriteTimeUtc($source)) { $problem = "manifest SourceModifiedUtc differs from the source" }
+        Write-TestResult -Succeeded (-not $problem) -Message "collected: $relative$(if ($problem) { " -- $problem" })"
+    }
+}
+
+# Rows of collection_manifest.csv by RelativePath
+function Get-ManifestRows {
+    param([string]$CollectionPath)
+    $rows = @{}
+    foreach ($row in (Import-Csv -LiteralPath (Join-Path $CollectionPath "collection_manifest.csv"))) { $rows[$row.RelativePath] = $row }
+    return $rows
+}
+
+# $true if a syntax tree node is inside a function definition
+function Test-InsideFunction {
+    param($Node)
+    for ($parent = $Node.Parent; $parent; $parent = $parent.Parent) {
+        if ($parent -is [System.Management.Automation.Language.FunctionDefinitionAst]) { return $true }
+    }
+    return $false
+}
+
 # Checks one listing row: present, Status, and CollectedAs (Copied rows)
 function Test-ListingRow {
     param([hashtable]$Rows, [string]$RelativePath, [string]$Status, [string]$CollectedAs = "", [string]$Label)
@@ -129,13 +174,17 @@ function Test-ListingRow {
     Write-TestResult -Succeeded ($problems.Count -eq 0) -Message "${Label}: $RelativePath -> $Status$(if ($problems) { ' -- ' + ($problems -join '; ') })"
 }
 
-$workDir = Join-Path ([System.IO.Path]::GetTempPath()) ("email-collect-test-" + [guid]::NewGuid().ToString("N"))
+$testId = "email-collect-test-" + [guid]::NewGuid().ToString("N")
+$workDir = Join-Path ([System.IO.Path]::GetTempPath()) $testId
 $script:junctions = @()
 $driveLetter = ""
 $officeParentPath = "Software\Microsoft\Office"
-$officeKeyPath = "$officeParentPath\99.0"
-$officeKeyCreated = $false
+# Made-up Office versions for Part 3
+$officeKeyPaths = @("$officeParentPath\97.0", "$officeParentPath\98.0", "$officeParentPath\99.0")
+$officeKeysCreated = $false
 $officeParentCreated = $false
+# Part 3's folder given with %LOCALAPPDATA%
+$envFolderRoot = ""
 New-Item -ItemType Directory -Path $workDir | Out-Null
 try {
     # =========================================================
@@ -216,8 +265,7 @@ try {
         throw "the collector wrote no collection to $imageOut"
     }
     $log = [System.IO.File]::ReadAllText((Join-Path $imageOut "collection_log.txt"))
-    $manifest = @{}
-    foreach ($row in (Import-Csv -LiteralPath (Join-Path $imageOut "collection_manifest.csv"))) { $manifest[$row.RelativePath] = $row }
+    $manifest = Get-ManifestRows -CollectionPath $imageOut
 
     # --- Collected files: present, same bytes as the source, in the manifest
     # with the source's original modified time ---
@@ -228,32 +276,25 @@ try {
         "$userOut\NewOutlook\Attachments\0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0\report.pdf" = Join-Path $olk "Attachments\0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0\report.pdf"
         "$userOut\Thunderbird\profiles.ini" = Join-Path $thunderbird "profiles.ini"
         "$userOut\Thunderbird\abcd1234.default-release\prefs.js" = Join-Path $tbProfile "prefs.js"
-        "$userOut\Thunderbird\abcd1234.default-release\global-messages-db.sqlite" = Join-Path $tbProfile "global-messages-db.sqlite"
-        "$userOut\Thunderbird\abcd1234.default-release\global-messages-db.sqlite-wal" = Join-Path $tbProfile "global-messages-db.sqlite-wal"
         "$userOut\Thunderbird\work.profile\prefs.js" = Join-Path $alice "TBProfiles\work.profile\prefs.js"
     }
     for ($i = 1; $i -le 10; $i++) {
         $name = "fill{0:D2}.bin" -f $i
         $copies["$userOut\Outlook\SecureTemp\INetCache\EFGH5678\$name"] = Join-Path $contentOutlook "EFGH5678\$name"
     }
-    foreach ($relative in $copies.Keys) {
-        $source = $copies[$relative]
-        $copy = Join-Path $imageOut $relative
-        $problem = ""
-        if (-not (Test-Path -LiteralPath $copy)) { $problem = "not collected" }
-        elseif ((Get-FileHash -LiteralPath $copy -Algorithm SHA256).Hash -ne (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash) { $problem = "copy differs from the source" }
-        elseif (-not $manifest.ContainsKey($relative)) { $problem = "no manifest row" }
-        elseif ($manifest[$relative].SHA256 -ne (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash) { $problem = "manifest hash differs" }
-        elseif ([datetime]::Parse($manifest[$relative].SourceModifiedUtc, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AdjustToUniversal) -ne [System.IO.File]::GetLastWriteTimeUtc($source)) { $problem = "manifest SourceModifiedUtc differs from the source" }
-        Write-TestResult -Succeeded (-not $problem) -Message "collected: $relative$(if ($problem) { " -- $problem" })"
-    }
+    Test-CollectedCopies -CollectionPath $imageOut -Manifest $manifest -Copies $copies
 
-    # --- Never collected: over the caps, empty, mail contents, link targets ---
+    # --- Never collected: over the caps, empty, mail contents, the search
+    # index (it holds the message text), link targets ---
     $collectedNames = @(Get-ChildItem -LiteralPath $imageOut -Recurse -File -Force | ForEach-Object { $_.Name })
     foreach ($name in @("big.bin", "fill11.bin", "empty.txt", "alice@example.com.ost", "archive.pst", "old.pst", "Inbox", "INBOX", "Work",
-                        "Inbox.msf", "msgFilterRules.dat", "000003.log", "HxStore.hxd", "quote[1].pdf", "store.vol", "outside-secret.txt", "notes.txt")) {
+                        "Inbox.msf", "msgFilterRules.dat", "000003.log", "HxStore.hxd", "quote[1].pdf", "store.vol", "outside-secret.txt", "notes.txt",
+                        "global-messages-db.sqlite", "global-messages-db.sqlite-wal")) {
         Write-TestResult -Succeeded ($collectedNames -cnotcontains $name) -Message "not collected: $name"
     }
+    # Copies through the "Temporary Internet Files" junction would land here
+    $viaJunction = @($manifest.Keys | Where-Object { $_ -like "*\SecureTemp\TemporaryInternetFiles\*" })
+    Write-TestResult -Succeeded ($viaJunction.Count -eq 0) -Message "nothing collected through the Temporary Internet Files junction ($($viaJunction.Count) file(s))"
     # (the 48 MB copies are all zeros)
     $canaryFiles = @(Get-ChildItem -LiteralPath $imageOut -Recurse -File -Force | Where-Object { $_.Length -lt 1MB } |
         Where-Object { [System.IO.File]::ReadAllText($_.FullName).IndexOf($canary, [System.StringComparison]::Ordinal) -ge 0 } | ForEach-Object { $_.Name })
@@ -272,7 +313,9 @@ try {
         Test-ListingRow -Rows $tempRows -RelativePath "EFGH5678\$name" -Status "Copied" -CollectedAs "$userOut\Outlook\SecureTemp\INetCache\EFGH5678\$name" -Label $label
     }
     Test-ListingRow -Rows $tempRows -RelativePath "EFGH5678\fill11.bin" -Status "Skipped: over the 500 MB per-user cap" -Label $label
-    Write-TestResult -Succeeded ($tempRows.Count -eq 14) -Message "${label}: $($tempRows.Count) rows (14 expected; the Temporary Internet Files junction is not listed again)"
+    # Raw row count: rows listed again through the junction would have the same RelativePath
+    $tempRowCount = @(Import-Csv -LiteralPath (Join-Path $imageOut "$userOut\Outlook\outlook_temp_files.csv")).Count
+    Write-TestResult -Succeeded ($tempRowCount -eq 14 -and $tempRows.Count -eq 14) -Message "${label}: $tempRowCount rows (14 expected; the Temporary Internet Files junction is not listed again)"
     $invoice = $tempRows["ABCD1234\invoice.docx"]
     if ($invoice) {
         $timesOk = $invoice.Program -eq "Classic Outlook" -and $invoice.Store -eq "SecureTemp" -and $invoice.SizeBytes -eq "14" -and
@@ -327,6 +370,8 @@ try {
         "per-user cap skip logged"       = "Skipped (over the 500 MB per-user cap): ${driveLetter}:\Users\alice\AppData\Local\Microsoft\Windows\INetCache\Content.Outlook\EFGH5678\fill11.bin"
         "registry lookup skipped (image)" = "Skipping the OutlookSecureTempFolder lookup (mounted image"
         "user without email data logged" = "No email artifacts for bob"
+        "caps logged"                    = "Attachment copy caps: 50 MB per file, 500 MB per user, 2048 MB for all users"
+        "search index not copied (logged)" = "Not copied (search index, holds the message text; -IncludeThunderbirdIndex copies it), 0 MB: ${driveLetter}:\Users\alice\AppData\Roaming\Thunderbird\Profiles\abcd1234.default-release\global-messages-db.sqlite"
     }
     foreach ($check in $logChecks.Keys) {
         Write-TestResult -Succeeded ($log.Contains($logChecks[$check])) -Message $check
@@ -334,27 +379,178 @@ try {
     $logErrors = @($log -split "`r?`n" | Where-Object { $_ -match '\] (ERROR|WARNING): ' -and $_ -notmatch 'time zone could not be read' })
     Write-TestResult -Succeeded ($logErrors.Count -eq 0) -Message "no errors or warnings in the collection log$(if ($logErrors) { ': ' + ($logErrors[0]) })"
 
+    # --- Second run: -IncludeThunderbirdIndex copies the search index;
+    # -SkipLargeFiles lowers the caps (10 MB per file) ---
+    $optOut = Join-Path $workDir "image-collection-options"
+    Write-Host "Running the collector ($powershellExe) on the fake image with -IncludeThunderbirdIndex -SkipLargeFiles ..."
+    $output = Invoke-Collector -Arguments @("-TargetDrive", $driveLetter, "-OutputPath", $optOut, "-IncludeThunderbirdIndex", "-SkipLargeFiles")
+    if (-not (Test-Path -LiteralPath (Join-Path $optOut "collection_manifest.csv"))) {
+        $output | ForEach-Object { Write-Host "  | $_" }
+        throw "the collector wrote no collection to $optOut"
+    }
+    $optLog = [System.IO.File]::ReadAllText((Join-Path $optOut "collection_log.txt"))
+    $optManifest = Get-ManifestRows -CollectionPath $optOut
+    Test-CollectedCopies -CollectionPath $optOut -Manifest $optManifest -Copies ([ordered]@{
+        "$userOut\Thunderbird\abcd1234.default-release\global-messages-db.sqlite" = Join-Path $tbProfile "global-messages-db.sqlite"
+        "$userOut\Thunderbird\abcd1234.default-release\global-messages-db.sqlite-wal" = Join-Path $tbProfile "global-messages-db.sqlite-wal"
+        "$userOut\Outlook\SecureTemp\INetCache\ABCD1234\invoice.docx" = Join-Path $contentOutlook "ABCD1234\invoice.docx"
+    })
+    $optRows = Get-ListingRows (Join-Path $optOut "$userOut\Outlook\outlook_temp_files.csv")
+    $label = "-SkipLargeFiles outlook_temp_files.csv"
+    for ($i = 1; $i -le 11; $i++) {
+        Test-ListingRow -Rows $optRows -RelativePath ("EFGH5678\fill{0:D2}.bin" -f $i) -Status "Skipped: over the 10 MB per-file cap" -Label $label
+    }
+    Write-TestResult -Succeeded ($optLog.Contains("Attachment copy caps: 10 MB per file, 100 MB per user, 500 MB for all users")) -Message "-SkipLargeFiles: lower caps logged"
+    Write-TestResult -Succeeded ($optLog.Contains("Thunderbird search index (global-messages-db.sqlite): copied (-IncludeThunderbirdIndex)")) -Message "-IncludeThunderbirdIndex logged"
+
     # =========================================================
-    # Part 2: live system, OutlookSecureTempFolder outside Content.Outlook
+    # Part 2: helper functions, loaded from the collector's syntax tree (no
+    # collection), with the listing cap lowered to 5 files
+    # =========================================================
+    $parseErrors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($collector, [ref]$null, [ref]$parseErrors)
+    if ($parseErrors.Count -gt 0) { throw "$collector does not parse: $($parseErrors[0].Message)" }
+    $definitions = @($ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) |
+        Where-Object { -not (Test-InsideFunction $_) } | ForEach-Object { $_.Extent.Text })
+    $script:helperLog = New-Object System.Collections.Generic.List[string]
+    $helperDir = Join-Path $workDir "helpers"
+    & {
+        . ([scriptblock]::Create($definitions -join "`r`n"))
+        # Log lines and listings are kept for the checks; copies are only counted
+        function Log { param([string]$Message) $script:helperLog.Add("INFO: $Message") }
+        function Log-Warning { param([string]$Message) $script:helperLog.Add("WARNING: $Message") }
+        function Log-Success { param([string]$Message) $script:helperLog.Add("OK: $Message") }
+        function Copy-ForensicFile {
+            param([string]$SourcePath, [string]$DestDir)
+            $script:fileCount++
+            $script:lastRecordedDestPath = Join-Path $DestDir (Split-Path $SourcePath -Leaf)
+        }
+        function Get-CollectionRelativePath { param([string]$Path) return $Path }
+        function Export-TriageCsv {
+            param([string]$Description, [string]$DestPath, [string[]]$Columns, [object[]]$Rows)
+            $script:helperCsv[(Split-Path $DestPath -Leaf)] = [PSCustomObject]@{ Description = $Description; Columns = $Columns; Rows = $Rows }
+        }
+        $script:helperCsv = @{}
+        $script:emailMaxListedFiles = 5
+        $script:emailMaxFileBytes = 50MB
+        $script:emailMaxUserBytes = 500MB
+        $script:emailMaxDatabaseBytes = 1GB
+        $script:emailIncludeIndex = $false
+        $script:emailTotalBudget = @{ Used = 0L; Limit = [long]2GB }
+        $script:emailNoReadAttributes = [int][System.IO.FileAttributes]::ReparsePoint
+        $script:fileCount = 0
+
+        # A cut-off listing keeps the newest files
+        $many = Join-Path $helperDir "many"
+        for ($i = 1; $i -le 8; $i++) { New-TestFile -Path (Join-Path $many "f$i.txt") -Text "x" -Modified ("2026-01-0{0} 00:00:00" -f $i) }
+        $listed = @(Get-TriageEmailFiles -Folder $many -NewestFirst | ForEach-Object { $_.Name })
+        Write-TestResult -Succeeded (($listed -join ",") -eq "f4.txt,f5.txt,f6.txt,f7.txt,f8.txt") -Message "helpers: a cut-off listing (cap 5) keeps the 5 newest of 8 files ($($listed -join ','))"
+        Write-TestResult -Succeeded (@($script:helperLog | Where-Object { $_ -like "WARNING: 8 files below *only the 5 newest are listed" }).Count -eq 1) -Message "helpers: the cut-off is logged"
+
+        # New Outlook: a WebView cache over the cap does not push the
+        # attachments or the settings out of the listing
+        $helperProfile = Join-Path $helperDir "profile"
+        $olkHelper = Join-Path $helperProfile "AppData\Local\Microsoft\Olk"
+        New-TestFile -Path (Join-Path $olkHelper "UserSettings.json") -Text "{}"
+        New-TestFile -Path (Join-Path $olkHelper "Attachments\0f1e2d3c\invoice.pdf") -Text "pdf"
+        for ($i = 1; $i -le 10; $i++) { New-TestFile -Path (Join-Path $olkHelper "EBWebView\Default\IndexedDB\blob\$i") -Text "b" }
+        $script:helperLog.Clear()
+        $olkListed = @(Get-TriageOlkFiles -OlkDir $olkHelper | ForEach-Object { $_.FullName.Substring($olkHelper.Length + 1) })
+        $olkOk = $olkListed -contains "Attachments\0f1e2d3c\invoice.pdf" -and $olkListed -contains "UserSettings.json" -and $olkListed.Count -eq 6
+        Write-TestResult -Succeeded $olkOk -Message "helpers: Olk listing with the cap reached in EBWebView still lists Attachments\ and UserSettings.json ($($olkListed.Count) files: $($olkListed[0]), ...)"
+        Write-TestResult -Succeeded (@($script:helperLog | Where-Object { $_ -like "WARNING: More than 5 files below $olkHelper -- only 5 are listed" }).Count -eq 1) -Message "helpers: the Olk cut-off is logged"
+        # The same through a user's whole email collection: the attachment is listed and copied
+        Save-TriageUserEmail -UserName "helper" -ProfileDir $helperProfile -RegistryTempFolders @() -EmailDir (Join-Path $helperDir "out")
+        $olkCsv = $script:helperCsv["olk_files.csv"]
+        $attachmentRow = if ($olkCsv) { @($olkCsv.Rows | Where-Object { $_.RelativePath -eq "Attachments\0f1e2d3c\invoice.pdf" }) | Select-Object -First 1 }
+        Write-TestResult -Succeeded ($attachmentRow -and $attachmentRow.Status -eq "Copied" -and @($olkCsv.Rows).Count -eq 6) `
+            -Message "helpers: olk_files.csv of a user with the cap reached in EBWebView has the attachment, copied ($(if ($olkCsv) { @($olkCsv.Rows).Count } else { 0 }) rows)"
+
+        # Copy caps (1 MB here): per user, then for all users together. u1's
+        # second file goes over u1's cap, u2's file over the cap for all
+        $capsDir = Join-Path $helperDir "caps"
+        foreach ($name in @("u1\a.bin", "u1\b.bin", "u2\c.bin")) { New-TestFile -Path (Join-Path $capsDir $name) -Length (600KB) }
+        $total = @{ Used = 0L; Limit = [long]1MB }
+        $statuses = @()
+        foreach ($copyUser in @("u1", "u2")) {
+            $userBudget = @{ Used = 0L; Limit = [long]1MB }
+            foreach ($file in @(Get-ChildItem -LiteralPath (Join-Path $capsDir $copyUser) -File | Sort-Object Name)) {
+                $row = New-TriageEmailFileRow -User $copyUser -Program "Classic Outlook" -Store "SecureTemp" -File $file -RelativeTo $capsDir
+                $row.DestDir = Join-Path $helperDir "out"
+                Copy-TriageEmailFile -Row $row -MaxBytes 1MB -Budget $userBudget -TotalBudget $total
+                $statuses += $row.Status
+            }
+        }
+        $expectedStatuses = @("Copied", "Skipped: over the 1 MB per-user cap", "Skipped: over the 1 MB cap for all users")
+        Write-TestResult -Succeeded (($statuses -join " / ") -eq ($expectedStatuses -join " / ")) -Message "helpers: copy caps per user and for all users ($($statuses -join ' / '))"
+
+        # OutlookSecureTempFolder values: only folders below a drive or share root
+        $pathCases = [ordered]@{
+            "C:\" = ""; "C:" = ""; "C:Olk" = ""; "Olk\Temp" = ""; "\\server\share" = ""; "\\server\share\" = ""
+            " D:\Olk\Temp\ " = "D:\Olk\Temp"; "\\server\share\olk" = "\\server\share\olk"
+            "C:\Users\a\AppData\Local\Microsoft\Windows\INetCache\Content.Outlook\ABCD1234\" = "C:\Users\a\AppData\Local\Microsoft\Windows\INetCache\Content.Outlook\ABCD1234"
+        }
+        foreach ($value in $pathCases.Keys) {
+            $folder = Get-TriageSecureTempFolderPath $value
+            Write-TestResult -Succeeded ($folder -eq $pathCases[$value]) -Message "helpers: OutlookSecureTempFolder '$value' -> '$folder' (expected '$($pathCases[$value])')"
+        }
+
+        # Environment variables from the user's own values; unknown ones refuse the value
+        $variables = @{ USERPROFILE = "C:\Users\alice"; LOCALAPPDATA = "C:\Users\alice\AppData\Local" }
+        $expandCases = [ordered]@{
+            "%localappdata%\Olk Temp" = "C:\Users\alice\AppData\Local\Olk Temp"
+            "%USERPROFILE%\x\%NOT_SET%" = ""
+            "C:\100%\x" = "C:\100%\x"
+        }
+        foreach ($text in $expandCases.Keys) {
+            $expanded = Expand-TriageUserPath -Text $text -Variables $variables
+            Write-TestResult -Succeeded ($expanded -eq $expandCases[$text]) -Message "helpers: '$text' expands to '$expanded' (expected '$($expandCases[$text])')"
+        }
+
+        # Junctions count as links, ordinary folders do not
+        $plainDir = Join-Path $helperDir "plain"
+        New-Item -ItemType Directory -Path $plainDir -Force | Out-Null
+        $junctionDir = Join-Path $helperDir "junction"
+        New-TestJunction -Link $junctionDir -Target $plainDir
+        $linkOk = (Test-TriageLinkItem -Item (New-Object System.IO.DirectoryInfo($junctionDir))) -and -not (Test-TriageLinkItem -Item (New-Object System.IO.DirectoryInfo($plainDir)))
+        Write-TestResult -Succeeded $linkOk -Message "helpers: a junction is a link, an ordinary folder is not"
+    }
+
+    # =========================================================
+    # Part 3: live system, OutlookSecureTempFolder values in HKCU: a folder
+    # outside Content.Outlook (99.0), one given with %LOCALAPPDATA% (98.0)
+    # and the drive root (97.0, refused)
     # =========================================================
     if (-not $runLive) {
-        Write-Host "SKIPPED: Part 2 (live system) writes HKCU\$officeKeyPath -- runs only in GitHub Actions or with -AllowSystemChanges" -ForegroundColor Yellow
+        Write-Host "SKIPPED: Part 3 (live system) writes HKCU\$officeParentPath\97.0, 98.0 and 99.0 -- runs only in GitHub Actions or with -AllowSystemChanges" -ForegroundColor Yellow
     } else {
         $hkcu = [Microsoft.Win32.Registry]::CurrentUser
-        $existing = $hkcu.OpenSubKey($officeKeyPath)
-        if ($null -ne $existing) {
-            $existing.Close()
-            throw "HKCU\$officeKeyPath already exists -- not touching it"
+        foreach ($keyPath in $officeKeyPaths) {
+            $existing = $hkcu.OpenSubKey($keyPath)
+            if ($null -ne $existing) {
+                $existing.Close()
+                throw "HKCU\$keyPath already exists -- not touching it"
+            }
         }
         $liveFolder = Join-Path $workDir "CustomSecureTemp\XY12"
         New-TestFile -Path (Join-Path $liveFolder "live-attachment.txt") -Text "live attachment" -Modified "2026-03-05 07:00:00"
+        $envFolderRoot = Join-Path $env:LOCALAPPDATA $testId
+        $envFolder = Join-Path $envFolderRoot "XY34"
+        New-TestFile -Path (Join-Path $envFolder "env-attachment.txt") -Text "env attachment" -Modified "2026-03-06 07:00:00"
         $officeParent = $hkcu.OpenSubKey($officeParentPath)
         $officeParentCreated = $null -eq $officeParent
         if ($officeParent) { $officeParent.Close() }
-        $officeKeyCreated = $true
-        $securityKey = $hkcu.CreateSubKey("$officeKeyPath\Outlook\Security")
-        try { $securityKey.SetValue("OutlookSecureTempFolder", "$liveFolder\", [Microsoft.Win32.RegistryValueKind]::String) }
-        finally { $securityKey.Close() }
+        $officeKeysCreated = $true
+        $values = @(
+            @{ Key = $officeKeyPaths[2]; Value = "$liveFolder\"; Kind = [Microsoft.Win32.RegistryValueKind]::String },
+            @{ Key = $officeKeyPaths[1]; Value = "%LOCALAPPDATA%\$testId\XY34\"; Kind = [Microsoft.Win32.RegistryValueKind]::ExpandString },
+            @{ Key = $officeKeyPaths[0]; Value = "$env:SystemDrive\"; Kind = [Microsoft.Win32.RegistryValueKind]::String }
+        )
+        foreach ($value in $values) {
+            $securityKey = $hkcu.CreateSubKey("$($value.Key)\Outlook\Security")
+            try { $securityKey.SetValue("OutlookSecureTempFolder", $value.Value, $value.Kind) }
+            finally { $securityKey.Close() }
+        }
 
         $liveOut = Join-Path $workDir "live-collection"
         Write-Host "Running the collector ($powershellExe) on the live system ..."
@@ -367,24 +563,33 @@ try {
         $me = Split-Path $env:USERPROFILE -Leaf
         $liveLog = [System.IO.File]::ReadAllText($liveLogPath)
         Write-TestResult -Succeeded ($liveLog.Contains("OutlookSecureTempFolder of $me (Office 99.0): $liveFolder")) -Message "live: OutlookSecureTempFolder read from HKCU"
+        Write-TestResult -Succeeded ($liveLog.Contains("OutlookSecureTempFolder of $me (Office 98.0): $envFolder")) -Message "live: %LOCALAPPDATA% in OutlookSecureTempFolder expanded with the user's own value"
+        Write-TestResult -Succeeded ($liveLog.Contains("OutlookSecureTempFolder of $me (Office 97.0) is not a folder below a drive or share root -- not listed: $env:SystemDrive\")) -Message "live: a drive root in OutlookSecureTempFolder is refused"
         $liveRows = Get-ListingRows (Join-Path $liveOut "Email\$me\Outlook\outlook_temp_files.csv")
-        $expectedCopy = "Email\$me\Outlook\SecureTemp\Custom\XY12\live-attachment.txt"
-        $liveRow = $liveRows["XY12\live-attachment.txt"]
-        $liveOk = $liveRow -and $liveRow.Status -eq "Copied" -and $liveRow.CollectedAs -eq $expectedCopy -and $liveRow.ModifiedUtc -like "2026-03-05T07:00:00*Z" -and
-            (Test-Path -LiteralPath (Join-Path $liveOut $expectedCopy))
-        Write-TestResult -Succeeded $liveOk -Message "live: the folder from the registry is listed and its file copied to $expectedCopy"
+        foreach ($expected in @(@("XY12\live-attachment.txt", "2026-03-05T07:00:00*Z"), @("XY34\env-attachment.txt", "2026-03-06T07:00:00*Z"))) {
+            $expectedCopy = "Email\$me\Outlook\SecureTemp\Custom\$($expected[0])"
+            $liveRow = $liveRows[$expected[0]]
+            $liveOk = $liveRow -and $liveRow.Status -eq "Copied" -and $liveRow.CollectedAs -eq $expectedCopy -and $liveRow.ModifiedUtc -like $expected[1] -and
+                (Test-Path -LiteralPath (Join-Path $liveOut $expectedCopy))
+            Write-TestResult -Succeeded $liveOk -Message "live: the folder from the registry is listed and its file copied to $expectedCopy"
+        }
+        $rootRows = @($liveRows.Values | Where-Object { $_.Path -notlike "$liveFolder\*" -and $_.Path -notlike "$envFolder\*" -and $_.Path -notlike "*\Content.Outlook\*" })
+        Write-TestResult -Succeeded ($rootRows.Count -eq 0) -Message "live: nothing listed from the drive root ($($rootRows.Count) row(s))"
     }
 }
 catch {
     Write-TestResult -Succeeded $false -Message "test setup or run error: $($_.Exception.Message)"
 }
 finally {
-    if ($officeKeyCreated) {
-        # The test's own Office version key, and the Office key if the test
+    if ($officeKeysCreated) {
+        # The test's own Office version keys, and the Office key if the test
         # created it and nothing else was added to it meanwhile
-        $removeKey = $officeKeyPath
+        $removeKey = ""
         try {
-            [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKeyTree($officeKeyPath, $false)
+            foreach ($keyPath in $officeKeyPaths) {
+                $removeKey = $keyPath
+                [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKeyTree($keyPath, $false)
+            }
             if ($officeParentCreated) {
                 $removeKey = $officeParentPath
                 $officeParent = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($officeParentPath)
@@ -399,6 +604,7 @@ finally {
     # Remove the junctions first (rmdir removes the link, not its target)
     foreach ($junction in $script:junctions) { $null = cmd /c rmdir "$junction" 2>&1 }
     Remove-Item -LiteralPath $workDir -Recurse -Force -ErrorAction SilentlyContinue
+    if ($envFolderRoot) { Remove-Item -LiteralPath $envFolderRoot -Recurse -Force -ErrorAction SilentlyContinue }
 }
 
 if ($script:failures -gt 0) {

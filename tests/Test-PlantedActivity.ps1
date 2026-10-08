@@ -18,6 +18,9 @@
 param(
     [string]$PlantedFile = "",
     [string]$TimelinePath = "",
+    # findings.csv from the report (default: next to the timeline). The report
+    # checks below run only when this file exists.
+    [string]$FindingsPath = "",
     # Allowed difference between a planted time and its timeline time
     [int]$ToleranceSeconds = 120
 )
@@ -175,6 +178,55 @@ foreach ($e in $expectations) {
     } else {
         Write-Host "  --    $label $reason (best effort: $($e.Why))" -ForegroundColor DarkYellow
     }
+}
+
+# --- Report checks (findings.csv from the timeline builder) ------
+# When the report's findings.csv sits next to the timeline, confirm the
+# report flagged the planted actions by rule id. These are required checks:
+# a planted action the report did not flag fails the test. Each check is
+# skipped if its planting step was not planted (same rule as above).
+if (-not $FindingsPath) { $FindingsPath = Join-Path (Split-Path $TimelinePath -Parent) "findings.csv" }
+Write-Host ""
+if (Test-Path -LiteralPath $FindingsPath) {
+    Write-Host "Report findings:  $FindingsPath"
+    # findings.csv: one row per evidence line (RowNumber filled) plus a
+    # summary line per finding (RowNumber blank); match evidence rows only
+    $findingRows = @(Import-Csv -LiteralPath $FindingsPath)
+    # Step: the planted action; RuleId: the report rule that must flag it;
+    # Text: a regex that must appear in the finding evidence row's Description
+    $reportChecks = @(
+        [PSCustomObject]@{ Step = "Stomp";  Name = "Report flags timestomp";   RuleId = "FS-TIMESTOMP";           Text = "${b}_stomp\.exe" }
+        [PSCustomObject]@{ Step = "RunKey"; Name = "Report flags Run value";    RuleId = "PERSIST-RUNKEY-STAGING"; Text = $b }
+        [PSCustomObject]@{ Step = "Run";    Name = "Report flags run program";  RuleId = "EXEC-STAGING";           Text = "${b}_run" }
+        [PSCustomObject]@{ Step = "Task";   Name = "Report flags task";         RuleId = "PERSIST-TASK-STAGING";   Text = $b }
+        [PSCustomObject]@{ Step = "Eicar";  Name = "Report flags EICAR";        RuleId = "AV-DETECTION-EICAR";     Text = "EICAR" }
+    )
+    foreach ($rc in $reportChecks) {
+        $step = $s.($rc.Step)
+        $label = "{0,-26} {1,-8}" -f $rc.Name, $rc.Step
+        if (-not $step -or $step.Status -ne "Planted") {
+            $why = if ($step) { "$($step.Status)" } else { "not in planted.json" }
+            Write-Host "  SKIP  $label step not planted ($why)" -ForegroundColor DarkGray
+            continue
+        }
+        $requiredTotal++
+        $hit = @($findingRows | Where-Object {
+            $_.RuleId -eq $rc.RuleId -and "$($_.RowNumber)".Trim() -ne "" -and ("$($_.Description)" -match $rc.Text)
+        })
+        if ($hit.Count -gt 0) {
+            $f0 = $hit[0]
+            $text = "$($f0.Description)"
+            if ($text.Length -gt 80) { $text = $text.Substring(0, 77) + "..." }
+            Write-Host "  PASS  $label $($f0.FindingId)/$($f0.Severity) row $($f0.RowNumber)  $text" -ForegroundColor Green
+            $requiredPassed++
+        } else {
+            $reason = "no $($rc.RuleId) finding evidence row matching the planted marker"
+            Write-Host "  FAIL  $label $reason" -ForegroundColor Red
+            if ($env:GITHUB_ACTIONS) { Write-Host "::error::$($rc.Name): $reason" }
+        }
+    }
+} else {
+    Write-Host "No findings.csv next to the timeline; skipping report checks (the builder writes it unless run with -NoReport)." -ForegroundColor DarkGray
 }
 
 Write-Host ""

@@ -1329,11 +1329,23 @@ capture before collection begins.
        fail the test; best-effort ones (BAM, Amcache, ShimCache, UserAssist,
        jump list, deleted MFT record) depend on when Windows writes them and
        are only reported. Restart before collecting to get ShimCache.
+       When the report's findings.csv sits next to the timeline, the test
+       also confirms the report flagged the planted actions by rule id --
+       the timestomped exe (FS-TIMESTOMP), the Run value into Downloads
+       (PERSIST-RUNKEY-STAGING), the program run from Downloads
+       (EXEC-STAGING), the disabled task whose action is in Downloads
+       (PERSIST-TASK-STAGING) and, with -Eicar, the EICAR detection
+       (AV-DETECTION-EICAR). These are required checks; they are skipped
+       (not failed) when there is no findings.csv, for example after a
+       builder run with -NoReport.
        -PlantedFile <planted.json>  which planting to check (default: the
                                     newest TriageE2E_* folder in Downloads)
        -TimelinePath <timeline.csv> which timeline to check (default: the
                                     newest one in a win11-timeline-builder
                                     folder next to this repository)
+       -FindingsPath <findings.csv> the report findings to check (default:
+                                    findings.csv next to the timeline; the
+                                    report checks run only when it exists)
        -ToleranceSeconds <n>        allowed difference between a planted
                                     time and its timeline time (default 120)
     4. powershell -ExecutionPolicy Bypass -File tests\Invoke-PlantedActivity.ps1 -Cleanup

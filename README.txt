@@ -559,6 +559,12 @@ Inside the zip:
   in place with sharing, without the shadow copy or raw NTFS fallback.
   Login Data, Cookies and Web Data are still copied unchanged.
 
+  With -IncludeSecrets the blanking above is skipped: every one of these
+  files is copied unaltered through the normal copy path (with the shadow
+  copy / raw NTFS fallbacks), so each copy is byte-for-byte the original and
+  its manifest hash equals the original's. The size caps still apply. See
+  "Secrets" below and the -IncludeSecrets parameter.
+
 ### USB
 
   setupapi.dev*.log          Device install timestamps (first USB connect).
@@ -672,6 +678,50 @@ Inside the zip:
   The copied attachments are files someone opened, sent or received by mail
   and can be malware; handle the collection accordingly.
 
+### Secrets (opt-in: -IncludeSecrets, authorized examinations only)
+
+  Collected only with -IncludeSecrets, into a top-level Secrets\ folder, on
+  both live systems and mounted images. This is the DPAPI credential material
+  an examiner needs to decrypt the unredacted browser copies (and any other
+  DPAPI-protected data) offline.
+
+    Per user (Secrets\<user>\...)
+      AppData\Roaming\Microsoft\Protect    DPAPI master keys: the <SID>\
+                                           subfolder (the master key GUID
+                                           files, including hidden/system
+                                           ones), Preferred and CREDHIST
+      AppData\Roaming\Microsoft\Credentials   roaming credential blobs
+      AppData\Local\Microsoft\Credentials     local credential blobs
+      AppData\Local\Microsoft\Vault            Windows Vault (vcrd/vpol)
+    System (Secrets\System\...)
+      System32\Microsoft\Protect\S-1-5-18  the machine DPAPI master keys and
+                                           their User\ subfolder. These are
+                                           ACL-protected; on a live system
+                                           they are read through the shadow
+                                           copy / raw NTFS fallback, and
+                                           anything that still cannot be read
+                                           is logged.
+
+  All of these files are small. A shared total cap guards against anything
+  unexpected and skips are logged; junctions and symbolic links out of a
+  profile are never followed. Collected copies keep the original path and
+  times in the manifest, and (unlike the blanked browser copies) their hashes
+  match the originals.
+
+  Why this is enough for offline decryption: SAM and SECURITY (collected by
+  default in the Registry category) hold the LSA secrets and local password
+  hashes; the Protect master keys are themselves encrypted with a key derived
+  from the user's password (or escrowed to the domain's DPAPI backup key). So
+  with -IncludeSecrets, SAM/SECURITY, and either the user's password or the
+  domain backup key, the saved passwords and session cookies in the
+  unredacted browser copies can be decrypted on the analysis machine. The one
+  thing this does NOT give you is Chrome/Edge App-Bound Encryption, which can
+  only be undone on the live machine (see Known Limitations).
+
+  A prominent warning is logged at the start of a run with -IncludeSecrets:
+  the collection then holds secrets equivalent to a password store and must
+  be handled, stored and transferred accordingly.
+
 
 ## Output File Formats
 
@@ -697,10 +747,18 @@ Written at the start of the run, at the root of the collection:
   TargetTimeZoneId     Time zone of the examined Windows install. Live: same
                        as CollectorTimeZoneId. Mounted image: TimeZoneKeyName
                        from the image's SYSTEM hive, or null if unreadable.
+  SecretsIncluded      true when the run used -IncludeSecrets: the browser
+                       copies are unredacted and the collection holds the
+                       Secrets\ folder (DPAPI credential material). The
+                       timeline builder logs one line when this is true and
+                       reads nothing under Secrets\.
+  ThunderbirdIndexIncluded  true when the run used -IncludeThunderbirdIndex
+                       (Thunderbird's search index was copied).
 
-The timeline builder uses these to convert local-time text (USN journal,
-setupapi logs) correctly even when the analysis machine uses a different
-time zone or locale.
+SecretsIncluded and ThunderbirdIndexIncluded are additive fields;
+SchemaVersion stays 1. The timeline builder uses the time-zone and culture
+fields to convert local-time text (USN journal, setupapi logs) correctly even
+when the analysis machine uses a different time zone or locale.
 
 ### collection_manifest.csv
 
@@ -962,6 +1020,32 @@ The fastest path from collection to analysis:
     blanked (see Browser), so their hashes do not match the originals.
     Log: "Collected with N secret value(s) blanked (keys, tokens, password
     hashes): <path>"
+    With -IncludeSecrets these files are copied unaltered instead, so their
+    manifest hashes DO match the originals (see Secrets).
+
+  - -IncludeSecrets (authorized examinations only): the collection holds
+    DPAPI credential material (Secrets\) and unredacted browser files, i.e.
+    secrets equivalent to saved passwords and session cookies. Handle, store
+    and transfer the whole collection like a password store. A prominent
+    warning is logged at the start of such a run.
+    Warning: "-IncludeSecrets is set: browser settings and session files are
+    collected UNREDACTED ..."
+
+  - App-Bound Encryption (Chrome/Edge): newer Chromium versions wrap the
+    profile encryption key with an App-Bound Encryption key that is itself
+    tied to the machine and can only be unwrapped by code running as the
+    logged-in user on that live machine. -IncludeSecrets does NOT try to work
+    around this: it collects the DPAPI material (which still protects older
+    keys and everything else), but App-Bound-protected Chrome/Edge passwords
+    and cookies cannot be decrypted from an offline copy. Decrypt those on the
+    live machine before collecting if the case needs them.
+
+  - The system DPAPI master keys (System32\Microsoft\Protect\S-1-5-18) are
+    ACL-protected. On a live system the collector reads them through the
+    shadow copy / raw NTFS fallback; if a folder there cannot even be listed
+    (strict ACLs, no shadow copy), what could not be read is logged and the
+    run goes on.
+    Warning: "Could not list (collected credential material may be incomplete): <path>"
 
 
 ## Legal and Authorization
@@ -972,6 +1056,14 @@ IMPORTANT: Only run this script on systems you are authorized to examine.
   - This script accesses sensitive data including password databases (SAM),
     security policies, browser credentials, email attachments, and user
     activity history.
+  - -IncludeSecrets additionally collects DPAPI master keys, Windows
+    Credentials and Vault, and copies the browser settings/session files
+    unredacted. With SAM/SECURITY and the user's password or the domain DPAPI
+    backup key, this is enough to decrypt saved passwords and session cookies
+    offline. Use it only where that is authorized (e.g. infostealer and
+    session/token-theft cases, authorized cloud-evidence access, and evidence
+    integrity where copies must hash-match the originals), and treat the
+    output as a password store.
   - Collected artifacts may contain PII subject to privacy regulations.
   - Maintain chain of custody documentation if used in legal proceedings.
   - The collection manifest provides SHA256 hashes for integrity verification.
@@ -1018,6 +1110,36 @@ the mounted image for a non-invasive collection.
                    only their headers; the timeline builder reads only the
                    headers from it (date, addresses, subject, attachment
                    names).
+  -IncludeSecrets  AUTHORIZED EXAMINATIONS ONLY. Two changes, both off by
+                   default (see "What Gets Collected" > "Secrets" and "Known
+                   Limitations"):
+                     1. The browser settings and session files (Chromium Local
+                        State, Preferences and Secure Preferences; Firefox
+                        prefs.js; Firefox and Chromium session files) are
+                        copied UNREDACTED -- no private or secret value is
+                        blanked -- so each copy is byte-for-byte the original
+                        and its manifest hash equals the original's. The size
+                        caps still apply. (Without the switch these copies have
+                        their encrypted keys, tokens, password hashes, cookies,
+                        form data and page state blanked, as always.)
+                     2. DPAPI credential material is collected into a top-level
+                        Secrets\ folder: per user the master keys
+                        (AppData\Roaming\Microsoft\Protect\<SID>\, including
+                        Preferred and CREDHIST), Credentials (roaming and
+                        local) and Vault, and the system master keys
+                        (%SystemRoot%\System32\Microsoft\Protect\S-1-5-18).
+                   With SAM and SECURITY (collected by default) plus the user's
+                   password or the domain DPAPI backup key, this is everything
+                   needed to decrypt the unredacted browser secrets -- saved
+                   passwords and session cookies -- offline. The whole
+                   collection then holds secrets equivalent to a password
+                   store: handle, store and transfer it accordingly. A
+                   prominent warning is logged at the start of the run, and
+                   collection_info.json records "SecretsIncluded": true.
+                   Use it for infostealer cases (which saved passwords and
+                   cookies were exposed), session/token-theft cases (cookie
+                   decryption), authorized access to cloud evidence, and
+                   evidence integrity (copies that hash-match the originals).
 
 
 ## Optional Tools (tools\ directory)
@@ -1100,7 +1222,7 @@ capture before collection begins.
     file, a file extended past its written data, and an NTFS-compressed
     file, which the raw read must decline cleanly.
 
-  tests\Test-Collect*.ps1 (run as Administrator; all five also run in CI)
+  tests\Test-Collect*.ps1 (run as Administrator; all six also run in CI)
     Each builds a fake mounted image in a temporary folder (a
     Windows\System32 tree with test artifacts), maps it to a free drive
     letter with subst, runs the collector on it with -Unattended
@@ -1155,6 +1277,19 @@ capture before collection begins.
     Quarantine\Resources are not; of 2,001 DetectionHistory files only the
     newest 2,000 are; a folder the account may not open gives an "access
     denied" warning.
+
+  tests\Test-CollectSecrets.ps1 (-Categories Browser, run with and without
+    -IncludeSecrets)
+    Browser settings/session files holding canary secret values, DPAPI
+    master key files (Protect\<SID>\<GUID>, hidden+system), Preferred,
+    CREDHIST, Credentials, Vault, and the system keys
+    System32\Microsoft\Protect\S-1-5-18. Without the switch: the canary is
+    in no browser copy, there is no Secrets folder, and SecretsIncluded is
+    false. With the switch: the browser copies are byte-for-byte the
+    originals (manifest hash equals the original's), every credential file is
+    collected with a manifest row and original times, SecretsIncluded is
+    true, the warning is logged, and a junction out of the profile is not
+    followed.
 
     powershell -ExecutionPolicy Bypass -File tests\Test-CollectBrowser.ps1
     powershell -ExecutionPolicy Bypass -File tests\Test-CollectEmail.ps1 -AllowSystemChanges

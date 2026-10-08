@@ -98,6 +98,10 @@ jobs:
         if: ${{ !cancelled() }}
         run: ./tests/Test-CollectDefender.ps1
 
+      - name: Run secrets collection test
+        if: ${{ !cancelled() }}
+        run: ./tests/Test-CollectSecrets.ps1
+
   analyze:
     name: PSScriptAnalyzer
     runs-on: windows-latest

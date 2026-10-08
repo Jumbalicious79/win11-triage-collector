@@ -986,8 +986,10 @@ capture before collection begins.
     which is listed in the manifest with its hash and size, with no log
     line and no error; a tool that prints nothing gives a log with a note,
     also listed. The collection folders have [ ] in their names. Also
-    checks that the collector saves the log only this way and writes
-    nothing to it afterwards, so the hash in the manifest matches the file.
+    checks that the collector saves the log only this way, right after
+    the tool runs and before it checks the dump (so a failed capture also
+    has its log), and writes nothing to it afterwards, so the hash in the
+    manifest matches the file.
       powershell -ExecutionPolicy Bypass -File tests\Test-MemoryAcquisitionLog.ps1
 
   Planted-activity test (both tools, end to end, on a live machine)

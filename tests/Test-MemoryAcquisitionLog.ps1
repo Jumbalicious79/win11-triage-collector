@@ -9,8 +9,10 @@
 # error; a tool that prints nothing gives a log with a note, also in the
 # manifest. The collection folders have [ ] in their names. Last, the
 # collector's memory capture section must save the log through this
-# helper and write nothing else to it (the manifest hash would no longer
-# match). No admin rights needed. Exit code 0 = pass, 1 = fail.
+# helper, right after the tool runs and before the dump file is checked
+# (so a failed capture also has its log), and write nothing else to it
+# (the manifest hash would no longer match). No admin rights needed.
+# Exit code 0 = pass, 1 = fail.
 #
 #   powershell -ExecutionPolicy Bypass -File tests\Test-MemoryAcquisitionLog.ps1
 # =============================================================
@@ -220,7 +222,8 @@ try {
     Add-Result "no output: a note, in the manifest" $problems -Info ($savedLines -join " ")
 
     # --- 3. The memory capture section (outside any function): the log is
-    # saved once, through the helper, and nothing else writes to it ---
+    # saved once, through the helper, right after the tool runs and before
+    # the dump is checked, and nothing else writes to it ---
     $problems = New-Object System.Collections.Generic.List[string]
     $commands = @($ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.CommandAst] }, $true) |
         Where-Object { -not (Test-InsideFunction $_) })
@@ -237,6 +240,35 @@ try {
             }
         }
         if ($logPathArg -ne '$memLogFile') { $problems.Add("Save-MemoryAcquisitionLog -LogPath is '$logPathArg', expected `$memLogFile") }
+
+        # Where it runs: a statement of the capture try block itself (not in
+        # an if, switch, catch or finally), after the statement that runs the
+        # tool and before the check of the dump file, so the log is saved and
+        # listed whatever the dump result (a failed capture needs it most)
+        $callLine = $helperCalls[0].Extent.StartLineNumber
+        $statement = $helperCalls[0]
+        while ($statement.Parent -and $statement.Parent -isnot [System.Management.Automation.Language.StatementBlockAst]) { $statement = $statement.Parent }
+        $block = $statement.Parent
+        if (-not ($block -and $block.Parent -is [System.Management.Automation.Language.TryStatementAst] -and [object]::ReferenceEquals($block.Parent.Body, $block))) {
+            $problems.Add("Save-MemoryAcquisitionLog (line $callLine) is not a statement of a try block's body")
+        } else {
+            $statements = @($block.Statements)
+            $callIndex = [array]::IndexOf($statements, $statement)
+            $toolIndex = -1
+            $dumpCheckIndex = -1
+            for ($k = 0; $k -lt $statements.Count; $k++) {
+                if ($statements[$k].Find({ param($node) $node -is [System.Management.Automation.Language.CommandAst] -and $node.InvocationOperator -eq "Ampersand" -and $node.CommandElements[0].Extent.Text -eq '$memTool' }, $true)) { $toolIndex = $k }
+                if ($dumpCheckIndex -lt 0 -and $statements[$k] -is [System.Management.Automation.Language.IfStatementAst]) {
+                    foreach ($clause in $statements[$k].Clauses) {
+                        if ($clause.Item1.Find({ param($node) $node -is [System.Management.Automation.Language.VariableExpressionAst] -and $node.VariablePath.UserPath -eq "dumpFile" }, $true)) { $dumpCheckIndex = $k }
+                    }
+                }
+            }
+            if ($toolIndex -lt 0) { $problems.Add("no statement of the try block around Save-MemoryAcquisitionLog runs the tool (& `$memTool)") }
+            elseif ($callIndex -lt $toolIndex) { $problems.Add("Save-MemoryAcquisitionLog (line $callLine) runs before the tool (line $($statements[$toolIndex].Extent.StartLineNumber))") }
+            if ($dumpCheckIndex -lt 0) { $problems.Add("no if on `$dumpFile in the try block around Save-MemoryAcquisitionLog") }
+            elseif ($callIndex -gt $dumpCheckIndex) { $problems.Add("Save-MemoryAcquisitionLog (line $callLine) runs after the dump check (line $($statements[$dumpCheckIndex].Extent.StartLineNumber))") }
+        }
     }
     # Writes to $memLogFile: a writing cmdlet given it (-Path $x or
     # -Path:$x), a .NET Write*/Append* call, or a > / >> redirection

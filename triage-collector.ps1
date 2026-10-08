@@ -2928,6 +2928,52 @@ if ($Categories -contains "Execution") {
         Log-Warning "Prefetch directory not found (may be disabled)."
     }
 
+    # SRUM (System Resource Usage Monitor): every file of the sru folder --
+    # the ESE database SRUDB.dat with its checkpoint (SRU.chk), transaction
+    # logs (SRU*.log, SRUtmp.log), reserve logs (SRUres*.jrs) and flush map
+    # (SRUDB.jfm), so the timeline builder can bring a copy taken while the
+    # database was open to a clean state. On a live system the Diagnostic
+    # Policy Service keeps these files open: they are read from the shadow
+    # copy first, so the database and its logs are from the same moment;
+    # files that are not in the shadow copy are copied directly.
+    $srumSource = "${script:TargetRoot}Windows\System32\sru"
+    if (Test-Path -LiteralPath $srumSource) {
+        Log "Collecting SRUM database and logs..."
+        $srumDir = Join-Path $execDir "SRUM"
+        # SRUDB.dat is usually tens of MB; a larger file is skipped
+        $srumMaxBytes = 2GB
+        $srumFiles = @(Get-ChildItem -LiteralPath $srumSource -File -Force -ErrorAction SilentlyContinue)
+        $srumCount = 0
+        $srumFromShadow = 0
+        foreach ($sf in $srumFiles) {
+            if ($sf.Length -gt $srumMaxBytes) {
+                Log-Warning "Skipped SRUM file $($sf.FullName) ($([math]::Round($sf.Length / 1MB, 1)) MB): larger than the $([math]::Round($srumMaxBytes / 1MB)) MB size cap"
+                continue
+            }
+            $fromShadow = $false
+            if ($script:IsLive) {
+                $fromShadow = Copy-FromShadow -RelativePath "Windows\System32\sru\$($sf.Name)" -DestDir $srumDir -DestName $sf.Name -Quiet
+            }
+            if ($fromShadow) {
+                $srumFromShadow++
+            } else {
+                Copy-ForensicFile -SourcePath $sf.FullName -DestDir $srumDir
+            }
+            if ((Get-FileLength (Join-Path $srumDir $sf.Name)) -gt 0) { $srumCount++ }
+        }
+        if ((Get-FileLength (Join-Path $srumDir "SRUDB.dat")) -gt 0) {
+            $srumNote = ""
+            if ($script:IsLive) { $srumNote = " ($srumFromShadow from the shadow copy)" }
+            Log-Success "Collected $srumCount SRUM file(s)$srumNote."
+        } elseif ($srumFiles.Count -gt 0) {
+            Log-Warning "SRUM database (SRUDB.dat) not collected; $srumCount other SRUM file(s) collected."
+        } else {
+            Log "SRUM folder is empty or not readable: $srumSource"
+        }
+    } else {
+        Log "SRUM folder not found ($srumSource) -- SRUM not collected."
+    }
+
     if ($script:IsLive) {
         # Recent Apps (per loaded user hive -- export the key where it exists)
         Log "Collecting RecentApps registry data..."

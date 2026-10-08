@@ -7,7 +7,8 @@
 # -Unattended -NoCompress) and checks that:
 #   - every DetectionHistory file (in its numbered subfolder) and every
 #     Quarantine\Entries file is collected byte for byte, with a manifest row
-#     that has the original path and file times
+#     that has the original path and the original creation and last write
+#     times
 #   - a file over the 1 MB cap and an empty file are not collected, and the
 #     skipped file is named in the log
 #   - nothing from Quarantine\ResourceData (the quarantined files) or
@@ -18,6 +19,8 @@
 #   - a DetectionHistory folder the account may not open (deny entries for
 #     the current user on the test's own temporary folders, removed again
 #     afterwards) gives an "access denied" warning, not a "no folder" line
+#   - of 2001 DetectionHistory files only the newest 2000 are collected (with
+#     manifest rows), the oldest is not, and the log says so
 # The subst drive letter is removed in a finally block.
 # Needs Administrator rights, like the collector (GitHub Actions Windows
 # runners are elevated). For a local run without them, pass -CollectorPath
@@ -103,12 +106,13 @@ function Get-Sha256 {
     return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash
 }
 
-# Writes a file with the given bytes and fixed original times
+# Writes a file with the given bytes and fixed original times (last write
+# $Utc, creation one hour earlier)
 function New-TestFile {
     param([string]$Path, [byte[]]$Bytes, [datetime]$Utc)
     New-Item -ItemType Directory -Path (Split-Path $Path -Parent) -Force | Out-Null
     [System.IO.File]::WriteAllBytes($Path, $Bytes)
-    [System.IO.File]::SetCreationTimeUtc($Path, $Utc)
+    [System.IO.File]::SetCreationTimeUtc($Path, $Utc.AddHours(-1))
     [System.IO.File]::SetLastWriteTimeUtc($Path, $Utc)
 }
 
@@ -197,8 +201,9 @@ try {
         Assert-Equal -Name "collected byte for byte: $name" -Expected (Get-Sha256 $source) -Actual (Get-Sha256 $dest)
         $row = @($manifest | Where-Object { $_.RelativePath -eq $file.Dest })
         $originalPath = "${letter}:\ProgramData\Microsoft\Windows Defender\$($file.Rel)"
-        Assert-Equal -Name "manifest row: $name" -Expected "1 $originalPath $($fileTime.ToString('o'))" `
-            -Actual "$($row.Count) $(@($row | ForEach-Object { $_.SourcePath }) -join ',') $(@($row | ForEach-Object { $_.SourceModifiedUtc }) -join ',')"
+        Assert-Equal -Name "manifest row: $name" -Expected "1 $originalPath $($fileTime.AddHours(-1).ToString('o')) $($fileTime.ToString('o'))" `
+            -Actual ("$($row.Count) $(@($row | ForEach-Object { $_.SourcePath }) -join ',') $(@($row | ForEach-Object { $_.SourceCreatedUtc }) -join ',') " +
+                "$(@($row | ForEach-Object { $_.SourceModifiedUtc }) -join ',')")
     }
 
     $collected = @(Get-ChildItem -LiteralPath $output -File -Recurse -Force -ErrorAction SilentlyContinue)
@@ -259,6 +264,40 @@ try {
     Write-TestResult -Name "log: DetectionHistory folder not readable (warning, not 'no folder')" -Message ($logText3 -split "`r?`n" | Where-Object { $_ -match 'Defender' } | Out-String) -Passed (
         $logText3 -match '\] WARNING: Could not open the Defender DetectionHistory folder \(access denied\): ' -and $logText3 -notmatch 'No Defender DetectionHistory folder')
     Assert-Equal -Name "nothing collected from the folder that is not readable" -Expected $false -Actual (Test-Path -LiteralPath (Join-Path $output3 "AntiVirus\Defender\DetectionHistory"))
+
+    # --- Run 4: more DetectionHistory files than the cap (the newest 2000) ---
+    # 2001 tiny files in two subfolders, one minute apart; file 0 is the oldest
+    $capImageDir = Join-Path $workDir "image-cap"
+    $capHistory = Join-Path $capImageDir "ProgramData\Microsoft\Windows Defender\Scans\History\Service\DetectionHistory"
+    New-Item -ItemType Directory -Path (Join-Path $capImageDir "Windows\System32"), (Join-Path $capHistory "02"), (Join-Path $capHistory "03") -Force | Out-Null
+    $capNames = @()
+    for ($n = 0; $n -le 2000; $n++) {
+        $capName = "0$(2 + $n % 2)\{0D1E2F30-4152-4637-8899-" + $n.ToString("X12") + "}"
+        $capPath = Join-Path $capHistory $capName
+        [System.IO.File]::WriteAllBytes($capPath, [BitConverter]::GetBytes([int]$n))
+        [System.IO.File]::SetLastWriteTimeUtc($capPath, $fileTime.AddMinutes($n))
+        $capNames += $capName
+    }
+    if ((Invoke-NativeTool "subst.exe" @("${letter}:", $capImageDir)) -ne 0) { throw "subst ${letter}: $capImageDir failed" }
+    $mapped = $true
+    $output4 = Join-Path $workDir "out4"
+    Write-Host "Running the collector on ${letter}: (2001 DetectionHistory files) ..."
+    $exitCode = Invoke-Collector -Letter $letter -OutputPath $output4
+    Assert-Equal -Name "collector exit code (2001 files)" -Expected 0 -Actual $exitCode
+    $null = Invoke-NativeTool "subst.exe" @("${letter}:", "/d")
+    $mapped = $false
+    $logText4 = ""
+    if (Test-Path -LiteralPath (Join-Path $output4 "collection_log.txt")) { $logText4 = [System.IO.File]::ReadAllText((Join-Path $output4 "collection_log.txt")) }
+    $capDest = Join-Path $output4 "AntiVirus\Defender\DetectionHistory"
+    Assert-Equal -Name "cap: 2000 DetectionHistory files collected" -Expected 2000 -Actual @(Get-ChildItem -LiteralPath $capDest -File -Recurse -Force -ErrorAction SilentlyContinue).Count
+    Assert-Equal -Name "cap: the oldest file not collected" -Expected $false -Actual (Test-Path -LiteralPath (Join-Path $capDest $capNames[0]))
+    Assert-Equal -Name "cap: the newest file collected" -Expected $true -Actual (Test-Path -LiteralPath (Join-Path $capDest $capNames[2000]))
+    $capManifest = @()
+    if (Test-Path -LiteralPath (Join-Path $output4 "collection_manifest.csv")) { $capManifest = @(Import-Csv -LiteralPath (Join-Path $output4 "collection_manifest.csv")) }
+    Assert-Equal -Name "cap: 2000 manifest rows" -Expected 2000 -Actual @($capManifest | Where-Object { $_.RelativePath -like "AntiVirus\Defender\DetectionHistory\*" }).Count
+    Assert-Equal -Name "log: cap skip line" -Expected $true -Actual (
+        $logText4 -match '\] Skipped the 1 oldest Defender DetectionHistory file\(s\): only the newest 2000 are collected\.')
+    Assert-Equal -Name "log: DetectionHistory count (2001 files)" -Expected $true -Actual ($logText4 -match 'OK: Collected 2000 Defender DetectionHistory file\(s\)\.')
 }
 catch {
     Write-TestResult -Name "test run" -Passed $false -Message "$($_.Exception.Message) ($($_.InvocationInfo.PositionMessage))"

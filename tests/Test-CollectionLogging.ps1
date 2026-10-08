@@ -3,17 +3,20 @@
 # Checks what the collector (triage-collector.ps1) logs and counts for:
 #  - Copy-HiveFile, used for Amcache.hve and its .LOG1/.LOG2, and for
 #    NTUSER.DAT / UsrClass.dat when reg save does not apply: the shadow copy
-#    first, then the direct copy. Each file gets one line saying how it was
-#    collected; an empty file is info; a shadow copy failure that the direct
-#    copy recovers is no error; a file that is not collected is one warning
-#    and one error, even when the direct copy has counted its own failure.
+#    first, then the direct copy (raw NTFS read for a locked file). Each
+#    file gets one outcome line naming the method that collected it; an
+#    empty file is info; a shadow copy failure that the direct copy
+#    recovers is no error; a file that is not collected is a warning and
+#    one error, even when the direct copy has logged and counted its own
+#    failure.
 #  - Copy-ForensicFileSet, which gives the Recent LNK, jump-list, Prefetch
 #    and task XML counts from $script:fileCount: a file saved under a
 #    shortened name, or with [ ] in its name, still counts; an empty one
 #    does not.
-# Folders stand in for the shadow copy and the target volume, so no
-# snapshot is made and no admin rights are needed (the raw NTFS read is
-# switched off; Test-RawCopy.ps1 covers it). Exit code 0 = pass, 1 = fail.
+# Folders stand in for the shadow copy and the target volume, and a
+# stand-in replaces the raw NTFS read, so no snapshot is made and no admin
+# rights are needed (Test-RawCopy.ps1 covers the raw NTFS read itself).
+# Exit code 0 = pass, 1 = fail.
 #
 #   powershell -ExecutionPolicy Bypass -File tests\Test-CollectionLogging.ps1
 # =============================================================
@@ -60,6 +63,7 @@ $testId = [guid]::NewGuid().ToString("N").Substring(0, 8)
 $workDir = Join-Path ([System.IO.Path]::GetTempPath()) "TriageLoggingTest_$testId"
 $snapshotDir = Join-Path $workDir "snapshot"
 $targetDir = Join-Path $workDir "target"
+$rawDir = Join-Path $workDir "raw"
 $OutputPath = Join-Path $workDir "collection"
 $logFile = Join-Path $workDir "collection_log.txt"
 $manifestFile = Join-Path $OutputPath "collection_manifest.csv"
@@ -72,13 +76,26 @@ $script:shadowPath = "\\?\$snapshotDir"
 $script:shadowId = $null
 $script:shadowUnavailable = $false
 # The raw NTFS read needs admin rights: switched off, so a locked live file
-# ends at "shadow copy and raw NTFS read also failed"
+# ends at "shadow copy and raw NTFS read also failed", except in the cases
+# that switch on the stand-in below (RawRead)
 $script:rawFileReader = $null
 $script:rawFileReaderUnavailable = $true
 $script:logToFile = $true
 $script:fileCount = 0
 $script:errorCount = 0
 $script:totalBytes = 0
+
+# Stand-in for the collector's raw NTFS read (which reads the volume and
+# needs admin rights): copies the locked live file's bytes from a folder
+# the test filled before locking it, and records the copy as the collector
+# does. Off (returns $false like the real one) unless the case switches it on
+function Copy-TriageRawFile {
+    param([string]$SourcePath, [string]$DestPath, $SourceTimes = $null)
+    if (-not $script:IsLive -or $script:rawFileReaderUnavailable) { return $false }
+    [System.IO.File]::Copy((Join-Path $rawDir (Get-TargetRelativePath $SourcePath)), $DestPath, $true)
+    Record-Manifest -SourcePath $SourcePath -DestPath $DestPath -SourceTimes $SourceTimes
+    return $true
+}
 
 $random = New-Object System.Random 20261008
 
@@ -126,50 +143,59 @@ try {
 
     # Snapshot / Live: file size in the stand-in snapshot / on the volume,
     # -1 for no file; Lock*: another handle allows no sharing, so a copy
-    # fails; NoShadow: no shadow copy (image mode, or none could be made).
-    # From: where the collected copy must come from ("" = not collected).
+    # fails; NoShadow: no shadow copy (image mode, or none could be made);
+    # RawRead: the raw NTFS read stand-in is on, so a locked live file is
+    # read anyway. From: where the collected copy must come from ("" = not
+    # collected).
     # Lines: the log lines the call must add, in order (regex; <rel> and
     # <live> stand for the relative path and the live file's path); a
     # "(.+)" group is the shadow copy's reason, which must name the file.
     # Errors: how much the error count must go up
     $unreadable = '\(locked; shadow copy and raw NTFS read also failed\): <live>$'
+    $rawRead = '\] Collected by raw NTFS read \(file in use, not available from a shadow copy\): <live>$'
     $cases = @(
         [PSCustomObject]@{ What = "in the snapshot"; Rel = "Windows\AppCompat\Programs\Amcache.hve"; Label = "Amcache.hve"
-            Snapshot = 8192; Live = 8192; LockSnapshot = $false; LockLive = $false; NoShadow = $false; From = "shadow"
+            Snapshot = 8192; Live = 8192; LockSnapshot = $false; LockLive = $false; NoShadow = $false; RawRead = $false; From = "shadow"
             Lines = @('\] OK: Collected Amcache\.hve via shadow copy$'); Errors = 0 }
         [PSCustomObject]@{ What = "empty in the snapshot and live"; Rel = "Windows\AppCompat\Programs\Amcache.hve.LOG2"; Label = "Amcache.hve.LOG2"
-            Snapshot = 0; Live = 0; LockSnapshot = $false; LockLive = $false; NoShadow = $false; From = ""
+            Snapshot = 0; Live = 0; LockSnapshot = $false; LockLive = $false; NoShadow = $false; RawRead = $false; From = ""
             Lines = @('\] Skipped empty file \(0 bytes in the shadow copy\): <rel>$'); Errors = 0 }
         [PSCustomObject]@{ What = "empty in the snapshot, written since"; Rel = "Windows\AppCompat\Programs\Amcache.hve.LOG1"; Label = "Amcache.hve.LOG1"
-            Snapshot = 0; Live = 4096; LockSnapshot = $false; LockLive = $false; NoShadow = $false; From = "live"
+            Snapshot = 0; Live = 4096; LockSnapshot = $false; LockLive = $false; NoShadow = $false; RawRead = $false; From = "live"
             Lines = @('\] OK: Collected Amcache\.hve\.LOG1 via direct copy$'); Errors = 0 }
         [PSCustomObject]@{ What = "not in the snapshot"; Rel = "Users\Case04\NTUSER.DAT"; Label = "NTUSER.DAT for Case04"
-            Snapshot = -1; Live = 4096; LockSnapshot = $false; LockLive = $false; NoShadow = $false; From = "live"
+            Snapshot = -1; Live = 4096; LockSnapshot = $false; LockLive = $false; NoShadow = $false; RawRead = $false; From = "live"
             Lines = @('\] OK: Collected NTUSER\.DAT for Case04 via direct copy$'); Errors = 0 }
         [PSCustomObject]@{ What = "snapshot unreadable, direct copy works"; Rel = "Users\Case05\NTUSER.DAT"; Label = "NTUSER.DAT for Case05"
-            Snapshot = 4096; Live = 4096; LockSnapshot = $true; LockLive = $false; NoShadow = $false; From = "live"
+            Snapshot = 4096; Live = 4096; LockSnapshot = $true; LockLive = $false; NoShadow = $false; RawRead = $false; From = "live"
             Lines = @('\] OK: Collected NTUSER\.DAT for Case05 via direct copy \(shadow copy: (.+)\)$'); Errors = 0 }
         [PSCustomObject]@{ What = "snapshot unreadable, no live file"; Rel = "Users\Case06\AppData\Local\Microsoft\Windows\UsrClass.dat"; Label = "UsrClass.dat for Case06"
-            Snapshot = 4096; Live = -1; LockSnapshot = $true; LockLive = $false; NoShadow = $false; From = ""
+            Snapshot = 4096; Live = -1; LockSnapshot = $true; LockLive = $false; NoShadow = $false; RawRead = $false; From = ""
             Lines = @('\] WARNING: Could not collect UsrClass\.dat for Case06 -- shadow copy: (.+)$'); Errors = 1 }
         [PSCustomObject]@{ What = "snapshot unreadable, live file empty"; Rel = "Users\Case07\NTUSER.DAT"; Label = "NTUSER.DAT for Case07"
-            Snapshot = 4096; Live = 0; LockSnapshot = $true; LockLive = $false; NoShadow = $false; From = ""
+            Snapshot = 4096; Live = 0; LockSnapshot = $true; LockLive = $false; NoShadow = $false; RawRead = $false; From = ""
             Lines = @('\] WARNING: Could not collect NTUSER\.DAT for Case07 -- shadow copy: (.+)$'); Errors = 1 }
         [PSCustomObject]@{ What = "snapshot and live file locked"; Rel = "Users\Case08\NTUSER.DAT"; Label = "NTUSER.DAT for Case08"
-            Snapshot = 4096; Live = 4096; LockSnapshot = $true; LockLive = $true; NoShadow = $false; From = ""
+            Snapshot = 4096; Live = 4096; LockSnapshot = $true; LockLive = $true; NoShadow = $false; RawRead = $false; From = ""
             Lines = @(('\] WARNING: Could not copy ' + $unreadable), '\] WARNING: Could not collect NTUSER\.DAT for Case08 -- shadow copy: (.+)$'); Errors = 1 }
         [PSCustomObject]@{ What = "no shadow copy, direct copy works"; Rel = "Users\Case09\NTUSER.DAT"; Label = "NTUSER.DAT for Case09"
-            Snapshot = -1; Live = 4096; LockSnapshot = $false; LockLive = $false; NoShadow = $true; From = "live"
+            Snapshot = -1; Live = 4096; LockSnapshot = $false; LockLive = $false; NoShadow = $true; RawRead = $false; From = "live"
             Lines = @('\] OK: Collected NTUSER\.DAT for Case09 via direct copy$'); Errors = 0 }
         [PSCustomObject]@{ What = "no shadow copy, empty file"; Rel = "Users\Case10\AppData\Local\Microsoft\Windows\UsrClass.dat"; Label = "UsrClass.dat for Case10"
-            Snapshot = -1; Live = 0; LockSnapshot = $false; LockLive = $false; NoShadow = $true; From = ""
+            Snapshot = -1; Live = 0; LockSnapshot = $false; LockLive = $false; NoShadow = $true; RawRead = $false; From = ""
             Lines = @('\] Skipped empty file \(0 bytes\): <rel>$'); Errors = 0 }
         [PSCustomObject]@{ What = "no shadow copy, live file locked"; Rel = "Users\Case11\NTUSER.DAT"; Label = "NTUSER.DAT for Case11"
-            Snapshot = -1; Live = 4096; LockSnapshot = $false; LockLive = $true; NoShadow = $true; From = ""
+            Snapshot = -1; Live = 4096; LockSnapshot = $false; LockLive = $true; NoShadow = $true; RawRead = $false; From = ""
             Lines = @(('\] WARNING: Could not copy ' + $unreadable), '\] WARNING: Could not collect NTUSER\.DAT for Case11$'); Errors = 1 }
         [PSCustomObject]@{ What = "in neither snapshot nor volume"; Rel = "Users\Case12\NTUSER.DAT"; Label = "NTUSER.DAT for Case12"
-            Snapshot = -1; Live = -1; LockSnapshot = $false; LockLive = $false; NoShadow = $false; From = ""
+            Snapshot = -1; Live = -1; LockSnapshot = $false; LockLive = $false; NoShadow = $false; RawRead = $false; From = ""
             Lines = @('\] WARNING: NTUSER\.DAT for Case12 not found at <live>$'); Errors = 0 }
+        [PSCustomObject]@{ What = "no shadow copy, locked, raw read works"; Rel = "Users\Case13\NTUSER.DAT"; Label = "NTUSER.DAT for Case13"
+            Snapshot = -1; Live = 4096; LockSnapshot = $false; LockLive = $true; NoShadow = $true; RawRead = $true; From = "live"
+            Lines = @($rawRead, '\] OK: Collected NTUSER\.DAT for Case13 via raw NTFS read$'); Errors = 0 }
+        [PSCustomObject]@{ What = "both locked, raw read works"; Rel = "Users\Case14\AppData\Local\Microsoft\Windows\UsrClass.dat"; Label = "UsrClass.dat for Case14"
+            Snapshot = 4096; Live = 4096; LockSnapshot = $true; LockLive = $true; NoShadow = $false; RawRead = $true; From = "live"
+            Lines = @($rawRead, '\] OK: Collected UsrClass\.dat for Case14 via raw NTFS read \(shadow copy: (.+)\)$'); Errors = 0 }
     )
 
     # --- Collect each file the way the collector does ---
@@ -180,6 +206,12 @@ try {
         $livePath = $script:TargetRoot.TrimEnd('\') + '\' + $case.Rel
         $snapshotHash = New-TestFile -Root $snapshotDir -RelativePath $case.Rel -Size $case.Snapshot
         $liveHash = New-TestFile -Root $targetDir -RelativePath $case.Rel -Size $case.Live
+        if ($case.RawRead) {
+            # What the raw NTFS read stand-in reads for the locked live file
+            $rawCopy = Join-Path $rawDir $case.Rel
+            New-Item -ItemType Directory -Path (Split-Path $rawCopy -Parent) -Force | Out-Null
+            [System.IO.File]::Copy($livePath, $rawCopy, $true)
+        }
         if ($case.LockSnapshot) { $locks.Add([System.IO.File]::Open((Join-Path $snapshotDir $case.Rel), "Open", "Read", "None")) }
         if ($case.LockLive) { $locks.Add([System.IO.File]::Open($livePath, "Open", "Read", "None")) }
         $destDir = Join-Path $OutputPath "Registry\Case$caseNumber"
@@ -193,6 +225,7 @@ try {
             $script:shadowPath = $null
             $script:shadowUnavailable = $true
         }
+        if ($case.RawRead) { $script:rawFileReaderUnavailable = $false }
 
         # The collector's own error preference: with Stop, Windows
         # PowerShell 5.1 turns stderr of the "cmd /c copy" fallback into a
@@ -204,6 +237,7 @@ try {
             $ErrorActionPreference = "Stop"
             $script:shadowPath = $savedShadowPath
             $script:shadowUnavailable = $false
+            $script:rawFileReaderUnavailable = $true
         }
 
         $logNew = @(Get-LogLines | Select-Object -Skip $logBefore.Count)
@@ -271,14 +305,14 @@ try {
     # just over the cap: Windows PowerShell 5.1 cannot create its source
     # file once the whole path passes MAX_PATH (deep TEMP folders)
     Write-Host "Case: Recent LNK count"
-    $recentRel = "Users\Case13\Recent"
+    $recentRel = "Users\Case15\Recent"
     $recentSource = Join-Path $targetDir $recentRel
     $longName = "Search results for " + ("a" * 80) + ".lnk"
     $null = New-TestFile -Root $targetDir -RelativePath "$recentRel\$longName" -Size 512
     $null = New-TestFile -Root $targetDir -RelativePath "$recentRel\Report [draft].lnk" -Size 512
     $null = New-TestFile -Root $targetDir -RelativePath "$recentRel\Plain.lnk" -Size 512
     $null = New-TestFile -Root $targetDir -RelativePath "$recentRel\Empty.lnk" -Size 0
-    $recentDest = Join-Path $OutputPath "UserActivity\Case13\RecentFiles"
+    $recentDest = Join-Path $OutputPath "UserActivity\Case15\RecentFiles"
     New-Item -ItemType Directory -Path $recentDest -Force | Out-Null
 
     $logBefore = Get-LogLines

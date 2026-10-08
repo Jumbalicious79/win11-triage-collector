@@ -429,6 +429,11 @@ function Get-TargetRelativePath {
 $script:fileCount = 0
 $script:errorCount = 0
 $script:totalBytes = 0
+# How the last Copy-ForensicFile call made its copy, for callers that report
+# the outcome themselves (Copy-HiveFile): "direct copy", or for a locked file
+# "shadow copy" / "raw NTFS read"; "" when it made none. Whether the copy was
+# kept (recorded in the manifest) shows in $script:fileCount
+$script:lastForensicCopyMethod = ""
 
 function Copy-ForensicFile {
     [OutputType([void])]
@@ -438,6 +443,7 @@ function Copy-ForensicFile {
         [string]$DestName = ""
     )
 
+    $script:lastForensicCopyMethod = ""
     # -LiteralPath: paths can contain [ ], which -Path treats as wildcards
     if (-not $SourcePath -or -not (Test-Path -LiteralPath $SourcePath)) {
         return
@@ -493,6 +499,7 @@ function Copy-ForensicFile {
     try {
         # Try direct copy first (also reads hidden/system files)
         [System.IO.File]::Copy($SourcePath, $destPath, $true)
+        $script:lastForensicCopyMethod = "direct copy"
         Record-Manifest -SourcePath $SourcePath -DestPath $destPath -SourceTimes $srcTimes
         return
     } catch {
@@ -505,6 +512,7 @@ function Copy-ForensicFile {
     # Try standard Copy-Item as fallback
     try {
         Copy-Item -LiteralPath $SourcePath -Destination $destPath -Force -ErrorAction Stop
+        $script:lastForensicCopyMethod = "direct copy"
         Record-Manifest -SourcePath $SourcePath -DestPath $destPath -SourceTimes $srcTimes
         return
     } catch { Write-Verbose "Copy-Item fallback for ${SourcePath}: $($_.Exception.Message)" }
@@ -516,12 +524,14 @@ function Copy-ForensicFile {
         $relPath = Get-TargetRelativePath $SourcePath
         if ($relPath) {
             if (Copy-FromShadow -RelativePath $relPath -DestDir $DestDir -DestName $DestName -Quiet) {
+                $script:lastForensicCopyMethod = "shadow copy"
                 Log "Collected from shadow copy (file in use): $SourcePath"
                 return
             }
             # Not in the shadow copy (created after it was taken) or no shadow
             # copy possible: read the file straight from the volume
             if (Copy-TriageRawFile -SourcePath $SourcePath -DestPath $destPath -SourceTimes $srcTimes) {
+                $script:lastForensicCopyMethod = "raw NTFS read"
                 Log "Collected by raw NTFS read (file in use, not available from a shadow copy): $SourcePath"
                 return
             }
@@ -802,8 +812,10 @@ function Copy-FromShadow {
 # which falls back to a raw NTFS read for a locked file). Logs one outcome
 # per file, so a shadow copy failure that the direct copy recovers is not
 # an error:
-#   OK      -- "Collected <Label> via shadow copy" / "via direct copy" (with
-#              the shadow copy's reason if it failed for this file)
+#   OK      -- "Collected <Label> via shadow copy" / "via direct copy" /
+#              "via raw NTFS read" (with the shadow copy's reason if it
+#              failed for this file); a locked file's fallback read also
+#              gets Copy-ForensicFile's own line, with the path
 #   info    -- empty (0 bytes): nothing to collect
 #   warning -- not found on the target (no error, as for the system hives)
 #   warning -- not collected; one error in all (Copy-ForensicFile may have
@@ -834,10 +846,13 @@ function Copy-HiveFile {
     $errorsBefore = $script:errorCount
     Copy-ForensicFile -SourcePath $sourcePath -DestDir $DestDir -DestName $destName
     if ($script:fileCount -gt $filesBefore) {
-        if ($shadowFailed) {
-            Log-Success "Collected $Label via direct copy (shadow copy: $shadowReason)"
+        # Copy-ForensicFile reads a locked file by raw NTFS read (or from
+        # the shadow copy, if a second try works: no failure to report then)
+        $method = $script:lastForensicCopyMethod
+        if ($shadowFailed -and $method -ne "shadow copy") {
+            Log-Success "Collected $Label via $method (shadow copy: $shadowReason)"
         } else {
-            Log-Success "Collected $Label via direct copy"
+            Log-Success "Collected $Label via $method"
         }
         return
     }

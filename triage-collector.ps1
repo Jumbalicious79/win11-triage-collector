@@ -3169,6 +3169,285 @@ function Copy-TriageChromiumNetworkCookies {
     }
 }
 
+# ----------------------------------------------------------
+# Helpers for the Browser section: extension, session, settings and
+# snapshot files (read by the timeline builder for installed extensions,
+# open and recently closed tabs, settings, and history that only a
+# pre-update snapshot or the Favicons database still holds). Every copy has
+# a size cap; what is skipped is logged.
+# ----------------------------------------------------------
+# Chromium profile folders collected (with the main browser files too)
+$script:triageChromiumProfilePattern = '^(Default|Profile \d+|Guest Profile)$'
+
+# Members blanked in the copies of Local State, Preferences and Secure
+# Preferences: the encrypted keys that protect saved passwords and cookies
+# (os_crypt), password hashes (password_hash_data_list), tokens and salts.
+# The timeline uses none of them. A text value becomes "", a list [] and an
+# object {}; numbers and true/false are kept.
+$script:triageChromiumSecretNames = '[A-Za-z0-9_]*(?:encrypted_key|_encrypted_data|token|_salt)|password_hash_data_list'
+# Firefox prefs.js: text values of prefs whose name has one of these words
+$script:triageFirefoxSecretPattern = '(?im)^(\s*user_pref\(\s*"[^"]*(?:token|secret|password|useragentid)[^"]*"\s*,\s*)"(?:[^"\\]|\\.)*"'
+
+# Copy a file unless it is larger than -MaxBytes (logged with its size).
+# Returns $true when the copy is in the collection.
+function Copy-TriageCappedFile {
+    [OutputType([bool])]
+    param(
+        [string]$SourcePath,
+        [string]$DestDir,
+        [string]$DestName,
+        [long]$MaxBytes
+    )
+    $size = Get-FileLength $SourcePath
+    if ($size -le 0) { return $false }
+    if ($size -gt $MaxBytes) {
+        Log "Skipped (larger than the $([math]::Round($MaxBytes / 1MB)) MB cap: $([math]::Round($size / 1MB, 1)) MB): $SourcePath"
+        return $false
+    }
+    Copy-ForensicFile -SourcePath $SourcePath -DestDir $DestDir -DestName $DestName
+    return (Test-Path -LiteralPath (Join-Path $DestDir $DestName))
+}
+
+# Copy files (already in the order of preference, e.g. newest first) to the
+# same paths relative to -SourceRoot under -DestRoot, while their total size
+# stays within -MaxTotalBytes; files that do not fit are skipped and listed
+# in the log. Returns the number of files collected.
+function Copy-TriageFilesWithinCap {
+    [OutputType([int])]
+    param(
+        [System.IO.FileInfo[]]$Files,
+        [string]$SourceRoot,
+        [string]$DestRoot,
+        [long]$MaxTotalBytes,
+        [string]$Label
+    )
+    $total = 0L
+    $copied = 0
+    $skipped = New-Object System.Collections.Generic.List[string]
+    $root = $SourceRoot.TrimEnd('\')
+    foreach ($file in $Files) {
+        if (-not $file -or $file.Length -le 0) { continue }
+        if ($total + $file.Length -gt $MaxTotalBytes) {
+            $skipped.Add("$($file.Name) ($([math]::Round($file.Length / 1MB, 1)) MB)")
+            continue
+        }
+        $relDir = Split-Path ($file.FullName.Substring($root.Length + 1)) -Parent
+        $destDir = if ($relDir) { Join-Path $DestRoot $relDir } else { $DestRoot }
+        Copy-ForensicFile -SourcePath $file.FullName -DestDir $destDir -DestName $file.Name
+        if (Test-Path -LiteralPath (Join-Path $destDir $file.Name)) {
+            $total += $file.Length
+            $copied++
+        }
+    }
+    if ($skipped.Count -gt 0) {
+        Log "Skipped $($skipped.Count) $Label(s) in $SourceRoot (over the $([math]::Round($MaxTotalBytes / 1MB)) MB total cap): $($skipped -join ', ')"
+    }
+    return $copied
+}
+
+# Copy a settings file with its secret values blanked (see the patterns
+# above): ChromiumJson for Local State / Preferences / Secure Preferences,
+# FirefoxPrefs for prefs.js. The copy is not byte-identical to the original
+# when something was blanked (the log says so); the manifest has the
+# original's path and times and the hash of the copy. Read with sharing, so
+# a file the browser has open is still read.
+function Copy-TriageRedactedTextFile {
+    [OutputType([bool])]
+    param(
+        [string]$SourcePath,
+        [string]$DestDir,
+        [string]$DestName,
+        [ValidateSet("ChromiumJson", "FirefoxPrefs")]
+        [string]$Format,
+        [long]$MaxBytes
+    )
+    $size = Get-FileLength $SourcePath
+    if ($size -le 0) { return $false }
+    if ($size -gt $MaxBytes) {
+        Log "Skipped (larger than the $([math]::Round($MaxBytes / 1MB)) MB cap: $([math]::Round($size / 1MB, 1)) MB): $SourcePath"
+        return $false
+    }
+    $srcTimes = Get-SourceFileTimesUtc $SourcePath
+    try {
+        $stream = New-Object System.IO.FileStream($SourcePath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete))
+        try {
+            $reader = New-Object System.IO.StreamReader($stream, (New-Object System.Text.UTF8Encoding($false)), $true)
+            $text = $reader.ReadToEnd()
+        } finally { $stream.Dispose() }
+    } catch {
+        Log-Warning "Could not read: $SourcePath -- $($_.Exception.Message)"
+        $script:errorCount++
+        return $false
+    }
+
+    $blanked = 0
+    if ($Format -eq "FirefoxPrefs") {
+        $blanked = ([regex]::Matches($text, $script:triageFirefoxSecretPattern)).Count
+        if ($blanked -gt 0) { $text = [regex]::Replace($text, $script:triageFirefoxSecretPattern, '$1""') }
+    } else {
+        # Every JSON string is matched in order, so a match always starts at
+        # a real string (never inside one); only a blanked member's value
+        # is consumed with it. Lists and objects: balanced brackets.
+        $valuePattern = '"(?:[^"\\]|\\.)*"|[\[{](?>"(?:[^"\\]|\\.)*"|[^\[\]{}"]+|[\[{](?<open>)|[\]}](?<-open>))*(?(open)(?!))[\]}]'
+        $pattern = '"(?<name>' + $script:triageChromiumSecretNames + ')"\s*:\s*(?<value>' + $valuePattern + ')|"(?:[^"\\]|\\.)*"'
+        $builder = New-Object System.Text.StringBuilder ($text.Length)
+        $position = 0
+        foreach ($match in [regex]::Matches($text, $pattern)) {
+            if (-not $match.Groups['name'].Success) { continue }
+            $value = $match.Groups['value']
+            $empty = switch ($value.Value.Substring(0, 1)) { '"' { '""' } '[' { '[]' } default { '{}' } }
+            [void]$builder.Append($text, $position, $value.Index - $position).Append($empty)
+            $position = $value.Index + $value.Length
+            $blanked++
+        }
+        [void]$builder.Append($text, $position, $text.Length - $position)
+        $text = $builder.ToString()
+    }
+
+    try {
+        Ensure-Directory $DestDir
+        $destPath = Join-Path $DestDir $DestName
+        [System.IO.File]::WriteAllText($destPath, $text, (New-Object System.Text.UTF8Encoding($false)))
+    } catch {
+        Log-Warning "Could not copy: $SourcePath -- $($_.Exception.Message)"
+        $script:errorCount++
+        return $false
+    }
+    Record-Manifest -SourcePath $SourcePath -DestPath $destPath -SourceTimes $srcTimes
+    if ($blanked -gt 0) { Log "Collected with $blanked secret value(s) blanked (keys, tokens, password hashes): $SourcePath" }
+    return $true
+}
+
+# Extension, session, settings and favicon files of one Chromium profile
+# folder (for Opera: its own folder), copied to the same relative paths
+# under -DestDir:
+#   Preferences, Secure Preferences   settings and installed extensions
+#                                     (secret values blanked, see above)
+#   Favicons (+ -journal)             icons of visited pages; can outlive a
+#                                     history clear (256 MB cap)
+#   Sessions\Session_*, Tabs_*        open and recently closed tabs (also the
+#                                     older Current/Last Session and Tabs
+#                                     files; newest first, 64 MB in all)
+#   Extensions\<id>\<version>\manifest.json, plus the
+#   _locales\<default_locale>\messages.json that resolves __MSG_ names
+#   (1 MB cap each; no extension code is collected)
+function Copy-TriageChromiumProfileExtras {
+    [OutputType([void])]
+    param(
+        [string]$ProfileDir,
+        [string]$DestDir,
+        [string]$Label
+    )
+    foreach ($prefsFile in @("Preferences", "Secure Preferences")) {
+        $null = Copy-TriageRedactedTextFile -SourcePath (Join-Path $ProfileDir $prefsFile) -DestDir $DestDir -DestName $prefsFile -Format ChromiumJson -MaxBytes 32MB
+    }
+    foreach ($iconFile in @("Favicons", "Favicons-journal")) {
+        $null = Copy-TriageCappedFile -SourcePath (Join-Path $ProfileDir $iconFile) -DestDir $DestDir -DestName $iconFile -MaxBytes 256MB
+    }
+
+    $sessionFiles = New-Object System.Collections.Generic.List[System.IO.FileInfo]
+    $sessionsDir = Join-Path $ProfileDir "Sessions"
+    if (Test-Path -LiteralPath $sessionsDir) {
+        foreach ($f in @(Get-ChildItem -LiteralPath $sessionsDir -File -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^(Session|Tabs)_\d+$' })) { $sessionFiles.Add($f) }
+    }
+    foreach ($legacyName in @("Current Session", "Current Tabs", "Last Session", "Last Tabs")) {
+        $legacyFile = Get-Item -LiteralPath (Join-Path $ProfileDir $legacyName) -Force -ErrorAction SilentlyContinue
+        if ($legacyFile -and -not $legacyFile.PSIsContainer) { $sessionFiles.Add($legacyFile) }
+    }
+    $sessionCount = 0
+    if ($sessionFiles.Count -gt 0) {
+        $sessionCount = Copy-TriageFilesWithinCap -Files @($sessionFiles | Sort-Object LastWriteTimeUtc -Descending) -SourceRoot $ProfileDir -DestRoot $DestDir -MaxTotalBytes 64MB -Label "session file"
+    }
+
+    # Extensions\<32-letter id>\<version>\: the manifest only
+    $manifestCount = 0
+    $extensionsDir = Join-Path $ProfileDir "Extensions"
+    if (Test-Path -LiteralPath $extensionsDir) {
+        $extensionDirs = @(Get-ChildItem -LiteralPath $extensionsDir -Directory -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^[a-p]{32}$' })
+        foreach ($extensionDir in $extensionDirs) {
+            foreach ($versionDir in @(Get-ChildItem -LiteralPath $extensionDir.FullName -Directory -Force -ErrorAction SilentlyContinue)) {
+                $versionDest = Join-Path $DestDir "Extensions\$($extensionDir.Name)\$($versionDir.Name)"
+                if (-not (Copy-TriageCappedFile -SourcePath (Join-Path $versionDir.FullName "manifest.json") -DestDir $versionDest -DestName "manifest.json" -MaxBytes 1MB)) { continue }
+                $manifestCount++
+                # A name such as "__MSG_appName__" is looked up in the default
+                # locale's messages.json (read from the copy just made)
+                $manifestText = ""
+                try { $manifestText = [System.IO.File]::ReadAllText((Join-Path $versionDest "manifest.json")) }
+                catch { Write-Verbose "Reading the copied manifest of $($extensionDir.Name): $($_.Exception.Message)" }
+                if ($manifestText -match '__MSG_' -and $manifestText -match '"default_locale"\s*:\s*"([A-Za-z0-9_-]+)"') {
+                    $locale = $Matches[1]
+                    $null = Copy-TriageCappedFile -SourcePath (Join-Path $versionDir.FullName "_locales\$locale\messages.json") `
+                        -DestDir (Join-Path $versionDest "_locales\$locale") -DestName "messages.json" -MaxBytes 1MB
+                }
+            }
+        }
+    }
+    if ($manifestCount -gt 0 -or $sessionCount -gt 0) {
+        Log "Collected $manifestCount extension manifest(s) and $sessionCount session file(s) for $Label"
+    }
+}
+
+# Once per Chromium browser (its User Data folder; for Opera, its own
+# folder): Local State (secret values blanked) and the snapshots the browser
+# keeps from before an update, Snapshots\<version>\<profile>\History and
+# Favicons with their journals -- they can hold history cleared since.
+# Newest versions first, 1 GB in all.
+function Copy-TriageChromiumUserDataExtras {
+    [OutputType([void])]
+    param(
+        [string]$UserDataDir,
+        [string]$DestDir
+    )
+    $null = Copy-TriageRedactedTextFile -SourcePath (Join-Path $UserDataDir "Local State") -DestDir $DestDir -DestName "Local State" -Format ChromiumJson -MaxBytes 32MB
+
+    $snapshotsDir = Join-Path $UserDataDir "Snapshots"
+    if (-not (Test-Path -LiteralPath $snapshotsDir)) { return }
+    $snapshotFiles = New-Object System.Collections.Generic.List[System.IO.FileInfo]
+    $versionDirs = @(Get-ChildItem -LiteralPath $snapshotsDir -Directory -Force -ErrorAction SilentlyContinue | Sort-Object LastWriteTimeUtc -Descending)
+    foreach ($versionDir in $versionDirs) {
+        $profileDirs = @(Get-ChildItem -LiteralPath $versionDir.FullName -Directory -Force -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match $script:triageChromiumProfilePattern })
+        foreach ($snapshotProfile in $profileDirs) {
+            foreach ($name in @("History", "History-journal", "Favicons", "Favicons-journal")) {
+                $snapshotFile = Get-Item -LiteralPath (Join-Path $snapshotProfile.FullName $name) -Force -ErrorAction SilentlyContinue
+                if ($snapshotFile -and -not $snapshotFile.PSIsContainer) { $snapshotFiles.Add($snapshotFile) }
+            }
+        }
+    }
+    if ($snapshotFiles.Count -eq 0) { return }
+    $copied = Copy-TriageFilesWithinCap -Files $snapshotFiles.ToArray() -SourceRoot $UserDataDir -DestRoot $DestDir -MaxTotalBytes 1GB -Label "history snapshot file"
+    Log "Collected $copied history snapshot file(s) from $snapshotsDir ($($versionDirs.Count) version(s))"
+}
+
+# Extensions, settings and sessions of one Firefox profile: extensions.json
+# and addons.json (installed add-ons), prefs.js (secret values blanked),
+# sessionstore.jsonlz4 and sessionstore-backups\ (recovery, previous and
+# upgrade session files; newest first, 64 MB in all)
+function Copy-TriageFirefoxProfileExtras {
+    [OutputType([void])]
+    param(
+        [string]$ProfileDir,
+        [string]$DestDir,
+        [string]$Label
+    )
+    foreach ($jsonFile in @("extensions.json", "addons.json")) {
+        $null = Copy-TriageCappedFile -SourcePath (Join-Path $ProfileDir $jsonFile) -DestDir $DestDir -DestName $jsonFile -MaxBytes 32MB
+    }
+    $null = Copy-TriageRedactedTextFile -SourcePath (Join-Path $ProfileDir "prefs.js") -DestDir $DestDir -DestName "prefs.js" -Format FirefoxPrefs -MaxBytes 16MB
+
+    $sessionFiles = New-Object System.Collections.Generic.List[System.IO.FileInfo]
+    $sessionStore = Get-Item -LiteralPath (Join-Path $ProfileDir "sessionstore.jsonlz4") -Force -ErrorAction SilentlyContinue
+    if ($sessionStore -and -not $sessionStore.PSIsContainer) { $sessionFiles.Add($sessionStore) }
+    $backupsDir = Join-Path $ProfileDir "sessionstore-backups"
+    if (Test-Path -LiteralPath $backupsDir) {
+        foreach ($f in @(Get-ChildItem -LiteralPath $backupsDir -File -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '\.(jsonlz4|baklz4)' })) { $sessionFiles.Add($f) }
+    }
+    if ($sessionFiles.Count -gt 0) {
+        $sessionCount = Copy-TriageFilesWithinCap -Files @($sessionFiles | Sort-Object LastWriteTimeUtc -Descending) -SourceRoot $ProfileDir -DestRoot $DestDir -MaxTotalBytes 64MB -Label "session file"
+        Log "Collected $sessionCount session file(s) for $Label"
+    }
+}
+
 # =============================================================
 # 7. Browser Artifacts
 # =============================================================
@@ -3188,9 +3467,9 @@ if ($Categories -contains "Browser") {
         $chromeBase = Join-Path $userDir.FullName "AppData\Local\Google\Chrome\User Data"
         if (Test-Path -LiteralPath $chromeBase) {
             Log "Collecting Chrome data for $userName..."
-            # Collect from Default and any numbered profiles
+            # Collect from Default, any numbered profiles and the Guest profile
             $chromeProfiles = Get-ChildItem -Path $chromeBase -Directory -Force -ErrorAction SilentlyContinue |
-                Where-Object { $_.Name -eq "Default" -or $_.Name -match "^Profile \d+$" }
+                Where-Object { $_.Name -match $script:triageChromiumProfilePattern }
 
             foreach ($browserProfile in $chromeProfiles) {
                 $destDir = Join-Path $browserDir "$userName\Chrome\$($browserProfile.Name)"
@@ -3205,7 +3484,9 @@ if ($Categories -contains "Browser") {
                     }
                 }
                 Copy-TriageChromiumNetworkCookies -ProfileDir $browserProfile.FullName -DestDir $destDir
+                Copy-TriageChromiumProfileExtras -ProfileDir $browserProfile.FullName -DestDir $destDir -Label "$userName Chrome\$($browserProfile.Name)"
             }
+            Copy-TriageChromiumUserDataExtras -UserDataDir $chromeBase -DestDir (Join-Path $browserDir "$userName\Chrome")
             Log-Success "Collected Chrome artifacts for $userName"
         }
 
@@ -3214,7 +3495,7 @@ if ($Categories -contains "Browser") {
         if (Test-Path -LiteralPath $edgeBase) {
             Log "Collecting Edge data for $userName..."
             $edgeProfiles = Get-ChildItem -Path $edgeBase -Directory -Force -ErrorAction SilentlyContinue |
-                Where-Object { $_.Name -eq "Default" -or $_.Name -match "^Profile \d+$" }
+                Where-Object { $_.Name -match $script:triageChromiumProfilePattern }
 
             foreach ($browserProfile in $edgeProfiles) {
                 $destDir = Join-Path $browserDir "$userName\Edge\$($browserProfile.Name)"
@@ -3226,7 +3507,9 @@ if ($Categories -contains "Browser") {
                     }
                 }
                 Copy-TriageChromiumNetworkCookies -ProfileDir $browserProfile.FullName -DestDir $destDir
+                Copy-TriageChromiumProfileExtras -ProfileDir $browserProfile.FullName -DestDir $destDir -Label "$userName Edge\$($browserProfile.Name)"
             }
+            Copy-TriageChromiumUserDataExtras -UserDataDir $edgeBase -DestDir (Join-Path $browserDir "$userName\Edge")
             Log-Success "Collected Edge artifacts for $userName"
         }
 
@@ -3235,7 +3518,7 @@ if ($Categories -contains "Browser") {
         if (Test-Path -LiteralPath $braveBase) {
             Log "Collecting Brave data for $userName..."
             $braveProfiles = Get-ChildItem -Path $braveBase -Directory -Force -ErrorAction SilentlyContinue |
-                Where-Object { $_.Name -eq "Default" -or $_.Name -match "^Profile \d+$" }
+                Where-Object { $_.Name -match $script:triageChromiumProfilePattern }
 
             foreach ($browserProfile in $braveProfiles) {
                 $destDir = Join-Path $browserDir "$userName\Brave\$($browserProfile.Name)"
@@ -3247,7 +3530,9 @@ if ($Categories -contains "Browser") {
                     }
                 }
                 Copy-TriageChromiumNetworkCookies -ProfileDir $browserProfile.FullName -DestDir $destDir
+                Copy-TriageChromiumProfileExtras -ProfileDir $browserProfile.FullName -DestDir $destDir -Label "$userName Brave\$($browserProfile.Name)"
             }
+            Copy-TriageChromiumUserDataExtras -UserDataDir $braveBase -DestDir (Join-Path $browserDir "$userName\Brave")
             Log-Success "Collected Brave artifacts for $userName"
         }
 
@@ -3269,6 +3554,9 @@ if ($Categories -contains "Browser") {
                     }
                 }
                 Copy-TriageChromiumNetworkCookies -ProfileDir $operaBase -DestDir $destDir
+                # Opera's folder is both its User Data folder and its profile
+                Copy-TriageChromiumProfileExtras -ProfileDir $operaBase -DestDir $destDir -Label "$userName $operaName"
+                Copy-TriageChromiumUserDataExtras -UserDataDir $operaBase -DestDir $destDir
                 Log-Success "Collected $operaName artifacts for $userName"
             }
         }
@@ -3278,7 +3566,7 @@ if ($Categories -contains "Browser") {
         if (Test-Path -LiteralPath $vivaldiBase) {
             Log "Collecting Vivaldi data for $userName..."
             $vivaldiProfiles = Get-ChildItem -Path $vivaldiBase -Directory -Force -ErrorAction SilentlyContinue |
-                Where-Object { $_.Name -eq "Default" -or $_.Name -match "^Profile \d+$" }
+                Where-Object { $_.Name -match $script:triageChromiumProfilePattern }
 
             foreach ($browserProfile in $vivaldiProfiles) {
                 $destDir = Join-Path $browserDir "$userName\Vivaldi\$($browserProfile.Name)"
@@ -3290,7 +3578,9 @@ if ($Categories -contains "Browser") {
                     }
                 }
                 Copy-TriageChromiumNetworkCookies -ProfileDir $browserProfile.FullName -DestDir $destDir
+                Copy-TriageChromiumProfileExtras -ProfileDir $browserProfile.FullName -DestDir $destDir -Label "$userName Vivaldi\$($browserProfile.Name)"
             }
+            Copy-TriageChromiumUserDataExtras -UserDataDir $vivaldiBase -DestDir (Join-Path $browserDir "$userName\Vivaldi")
             Log-Success "Collected Vivaldi artifacts for $userName"
         }
 
@@ -3311,6 +3601,7 @@ if ($Categories -contains "Browser") {
                         Copy-ForensicFile -SourcePath $sourcePath -DestDir $destDir -DestName $ff
                     }
                 }
+                Copy-TriageFirefoxProfileExtras -ProfileDir $browserProfile.FullName -DestDir $destDir -Label "$userName Firefox\$($browserProfile.Name)"
             }
             Log-Success "Collected Firefox artifacts for $userName"
         }

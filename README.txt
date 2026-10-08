@@ -646,7 +646,8 @@ they belong to. Entries of devices that are no longer connected stay in it.
                        _??_USBSTOR#Disk&Ven_...&Prod_...&Rev_...#<serial>&0#{...}
                        (a "/" in a name is stored as "#": Prod_SD#MMC is the
                        product "SD/MMC")
-  DataLength           Size of the value data in bytes
+  DataLength           Size of the value data in bytes (0 for a value that is
+                       not binary; its data is in HexData)
   HexData              The value data as hex (as text for a value that is
                        not binary)
   KeyLastWriteUtc      Last-write time of the key (the whole key, not the

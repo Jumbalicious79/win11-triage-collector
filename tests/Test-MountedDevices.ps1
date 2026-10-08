@@ -131,9 +131,12 @@ function Add-Result {
     })
 }
 
-# --- Synthetic values (no real serials or volume GUIDs) ---
+# --- Synthetic values (no real serials, disk signatures or volume GUIDs) ---
 # GPT: "DMIO:ID:" + the partition GUID in .NET byte order (the first three
 # fields little-endian)
+# MBR: the disk signature little-endian, then the partition offset as a
+# 64-bit little-endian number. 0A0B0C0D needs its leading zero and its
+# letters upper case; DEADBEEF has the high bit set
 $gptHex = "444D494F3A49443A" + "1D2C3B4A5F6E7D8C9BAAB9C8D7E6F504"
 # An SD card reader: the product name "SD/MMC" is stored as SD#MMC
 $usbPath = "_??_USBSTOR#Disk&Ven_Generic-&Prod_SD#MMC&Rev_1.00#TRIAGETEST0001&0#{53f56307-b6bf-11d0-94f2-00a0c91efb8b}"
@@ -149,10 +152,10 @@ $text = "TriageTest text value"
 $caseSpecs = @(
     @{ What = "GPT partition"; Name = "\DosDevices\C:"; Data = (ConvertFrom-HexText $gptHex); Kind = "GPT"
         PartitionGuid = "{4a3b2c1d-6e5f-8c7d-9baa-b9c8d7e6f504}"; DataLength = 24; HexData = $gptHex }
-    @{ What = "MBR B6 F0 13 A6 00 7E 00..."; Name = "\DosDevices\H:"; Data = (ConvertFrom-HexText "B6F013A6007E000000000000"); Kind = "MBR"
-        DiskSignature = "A613F0B6"; PartitionOffset = "32256"; DataLength = 12; HexData = "B6F013A6007E000000000000" }
-    @{ What = "MBR, offset above 4 GiB"; Name = "\DosDevices\I:"; Data = (ConvertFrom-HexText "B6F013A60000104001000000"); Kind = "MBR"
-        DiskSignature = "A613F0B6"; PartitionOffset = "5369757696"; DataLength = 12; HexData = "B6F013A60000104001000000" }
+    @{ What = "MBR 0D 0C 0B 0A 00 7E 00..."; Name = "\DosDevices\H:"; Data = (ConvertFrom-HexText "0D0C0B0A007E000000000000"); Kind = "MBR"
+        DiskSignature = "0A0B0C0D"; PartitionOffset = "32256"; DataLength = 12; HexData = "0D0C0B0A007E000000000000" }
+    @{ What = "MBR, offset above 4 GiB"; Name = "\DosDevices\I:"; Data = (ConvertFrom-HexText "EFBEADDE0000104001000000"); Kind = "MBR"
+        DiskSignature = "DEADBEEF"; PartitionOffset = "5369757696"; DataLength = 12; HexData = "EFBEADDE0000104001000000" }
     @{ What = "USB SD#MMC path, trailing NUL"; Name = "\??\Volume{6c0f8a52-3d41-4b7e-9c2a-51e0d3b4a601}"; Data = $usbNulBytes; Kind = "DevicePath"
         DevicePath = $usbPath; DataLength = $usbNulBytes.Length; HexData = (Get-HexText $usbNulBytes) }
     @{ What = "USB SD#MMC path, no NUL"; Name = "\??\Volume{6c0f8a52-3d41-4b7e-9c2a-51e0d3b4a602}"; Data = $usbBytes; Kind = "DevicePath"

@@ -81,6 +81,10 @@ jobs:
       - name: Run shadow copy test
         run: ./tests/Test-ShadowCopy.ps1
 
+      - name: Run collection logging test
+        if: ${{ !cancelled() }}
+        run: ./tests/Test-CollectionLogging.ps1
+
   analyze:
     name: PSScriptAnalyzer
     runs-on: windows-latest

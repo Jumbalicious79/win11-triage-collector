@@ -10,8 +10,8 @@ param(
     [switch]$NoCompress,
     [ValidatePattern('^[A-Za-z]$')]
     [string]$TargetDrive = "",
-    [ValidateSet("Memory","FileSystem","Registry","EventLogs","Execution","Network","UserActivity","Browser","USB","Persistence","AntiVirus")]
-    [string[]]$Categories = @("FileSystem","Registry","EventLogs","Execution","Network","UserActivity","Browser","USB","Persistence","AntiVirus"),
+    [ValidateSet("Memory","FileSystem","Registry","EventLogs","Execution","Network","UserActivity","Browser","USB","Persistence","AntiVirus","Email")]
+    [string[]]$Categories = @("FileSystem","Registry","EventLogs","Execution","Network","UserActivity","Browser","USB","Persistence","AntiVirus","Email"),
     # No prompts (scripts and tests): the target is the live system drive unless
     # -TargetDrive is given, memory is captured only when -Categories includes
     # Memory, and there is no "Press any key" at the end

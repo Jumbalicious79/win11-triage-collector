@@ -114,7 +114,8 @@ is not the live system drive and switches to MOUNTED IMAGE mode:
   Skipped (requires live system):
     - Network state (DNS, ARP, TCP connections, firewall, Wi-Fi)
     - Live registry queries (Run keys, BAM, RecentApps, USB registry,
-      mounted devices) -- the same data is in the collected hives
+      mounted devices) -- the same data is in the collected hives (the
+      timeline builder reads MountedDevices from the SYSTEM hive)
     - USB PnP device timestamps (usb_storage_devices.csv)
     - Scheduled task run times (scheduled_tasks.csv)
     - WMI queries (services, startup commands, drivers, WMI subscriptions)
@@ -296,7 +297,11 @@ Inside the zip:
                                          times (UTC)
       usb_storage_devices.txt         -- USB storage device registry entries
       usb_devices.txt                 -- all USB device entries
-      mounted_devices.txt             -- volume GUID to drive letter mapping
+      mounted_devices.csv             -- MountedDevices, decoded: each drive
+                                         letter and volume GUID with its GPT
+                                         partition, MBR disk and offset, or
+                                         device path
+      mounted_devices.txt             -- same rows as text
     Persistence\
       scheduled_tasks.csv             -- all scheduled tasks (incl. disabled) with
                                          run-as account, actions, triggers,
@@ -456,7 +461,13 @@ Inside the zip:
                              not connected, with first install, install, last
                              arrival and last removal times. Live system only.
   USB storage/device registry  Serial numbers, vendor IDs, mount points.
-  Mounted devices            Volume GUID to drive letter mapping.
+  Mounted devices            MountedDevices, decoded (mounted_devices.csv):
+                             each drive letter and volume GUID with the GPT
+                             partition GUID, the MBR disk signature and
+                             partition offset, or the device path (for a USB
+                             disk with vendor, product and serial). Live
+                             system only; for a mounted image the timeline
+                             builder reads the collected SYSTEM hive.
 
 ### Persistence
 
@@ -614,6 +625,37 @@ run_keys.txt lists the same keys plus Shell Folders / User Shell Folders.
   LastRemovalUtc       Last time the device was removed
 
 Devices that are no longer connected are included.
+
+### USB\mounted_devices.csv  (live system only)
+
+One row per value of HKLM\SYSTEM\MountedDevices, the key that maps drive
+letters (\DosDevices\E:) and volume GUIDs (\??\Volume{...}) to the volumes
+they belong to. Entries of devices that are no longer connected stay in it.
+
+  Name                 Value name, e.g. \DosDevices\E: or \??\Volume{...}
+  Kind                 How the data was decoded:
+                         GPT         a GPT partition (also dynamic volumes)
+                         MBR         a partition on an MBR disk
+                         DevicePath  a device path, e.g. a USB disk
+                         Other       none of these (see HexData)
+  DiskSignature        MBR: disk signature, 8 hex digits
+  PartitionOffset      MBR: start of the partition, in bytes from the start
+                       of the disk
+  PartitionGuid        GPT: partition GUID, {...}
+  DevicePath           DevicePath: the path as stored, e.g.
+                       _??_USBSTOR#Disk&Ven_...&Prod_...&Rev_...#<serial>&0#{...}
+                       (a "/" in a name is stored as "#": Prod_SD#MMC is the
+                       product "SD/MMC")
+  DataLength           Size of the value data in bytes
+  HexData              The value data as hex (as text for a value that is
+                       not binary)
+  KeyLastWriteUtc      Last-write time of the key (the whole key, not the
+                       single value)
+
+mounted_devices.txt lists the same rows as text. Earlier versions wrote only
+mounted_devices.txt, which showed the first 4 bytes of each value. The
+volume GUIDs also appear under each user's MountPoints2 key (NTUSER.DAT);
+MountedDevices is what links them to a disk or a device.
 
 
 ## Analyzing the Output
@@ -916,6 +958,19 @@ capture before collection begins.
     PowerShell 5.1 it also checks that ZipFile.CreateFromDirectory, used by
     earlier versions, writes "\" there.
       powershell -ExecutionPolicy Bypass -File tests\Test-CollectionZip.ps1
+
+  tests\Test-MountedDevices.ps1 (no admin needed; also runs in CI)
+    Decodes synthetic MountedDevices values: GPT, MBR (one offset above 4
+    GiB), USB and "\??\" device paths with and without a trailing NUL, and
+    values that are none of these. Then saves the same values from a test
+    key under HKCU (removed afterwards) and checks mounted_devices.csv (the
+    columns the timeline builder reads, the key's last-write time),
+    mounted_devices.txt (every value whole), the manifest and the log line;
+    a missing key gives a header-only CSV and a warning. Also checks that
+    the collector lifts $FormatEnumerationLimit for the run, so lists in
+    the .txt files are not cut after 4 items, also when it is run from an
+    open PowerShell window, and restores it afterwards.
+      powershell -ExecutionPolicy Bypass -File tests\Test-MountedDevices.ps1
 
   Planted-activity test (both tools, end to end, on a live machine)
     1. In a normal (not elevated) PowerShell window, as the user to test:

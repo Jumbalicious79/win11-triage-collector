@@ -4167,8 +4167,12 @@ function New-CollectionZip {
             $entryName = $item.FullName.Substring($prefixLen).Replace('\', '/')
             if ($item -is [System.IO.FileInfo]) {
                 [void][System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($archive, $item.FullName, $entryName, [System.IO.Compression.CompressionLevel]::Optimal)
-            } elseif (-not (@($item.EnumerateFileSystemInfos() | Select-Object -First 1).Count)) {
-                [void]$archive.CreateEntry($entryName + '/')   # empty folder
+            } else {
+                # Empty folder? The probe is disposed: an open one keeps the
+                # folder open until the GC runs, and the caller deletes it next
+                $probe = $item.EnumerateFileSystemInfos().GetEnumerator()
+                try { $isEmpty = -not $probe.MoveNext() } finally { $probe.Dispose() }
+                if ($isEmpty) { [void]$archive.CreateEntry($entryName + '/') }
             }
         }
         $archive.Dispose()   # writes the central directory; can throw (disk full)
@@ -4200,6 +4204,15 @@ if (-not $NoCompress) {
         if ($memDirContents.Count -eq 0) {
             Remove-Item -LiteralPath $memDir -Recurse -Force -ErrorAction SilentlyContinue
         }
+    }
+
+    # A file already at the zip path (an earlier run with the same
+    # -OutputPath) is replaced; its time tells it apart from this run's
+    # incomplete zip if compression fails
+    $oldZipTime = $null
+    if ((Get-FileLength $zipPath) -ge 0) {
+        $oldZipTime = [System.IO.File]::GetLastWriteTimeUtc($zipPath)
+        Log-Warning "A file is already at the zip path and will be replaced: $zipPath"
     }
 
     Log "Compressing to: $zipPath"
@@ -4235,11 +4248,16 @@ if (-not $NoCompress) {
             Log-Warning "Compression failed, no zip created: $($_.Exception.Message)"
             Log "The collection is kept at: $OutputPath"
             if ((Get-FileLength $zipPath) -ge 0) {
-                Log-Warning "Could not delete the incomplete zip, delete it by hand: $zipPath"
+                if ($null -ne $oldZipTime -and [System.IO.File]::GetLastWriteTimeUtc($zipPath) -eq $oldZipTime) {
+                    Log-Warning "The file already at the zip path could not be replaced; it is not from this run, check it before deleting it: $zipPath"
+                } else {
+                    Log-Warning "Could not delete the incomplete zip, delete it by hand: $zipPath"
+                }
             }
         }
-        # Move dump back if compression failed
-        if ($memDumpMovedTo -and (Test-Path -LiteralPath $memDumpMovedTo)) {
+        # Move dump back if compression failed. Not after a complete zip: the
+        # folder is then to be deleted, and the dump stays next to the zip
+        if (-not $zipCompleted -and $memDumpMovedTo -and (Test-Path -LiteralPath $memDumpMovedTo)) {
             $memDir = Join-Path $OutputPath "Memory"
             Ensure-Directory $memDir
             Move-Item -LiteralPath $memDumpMovedTo -Destination $memDumpFile -Force

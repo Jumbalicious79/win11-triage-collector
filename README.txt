@@ -221,9 +221,10 @@ Use -NoCompress to keep the uncompressed folder instead.
 Entry names in the zip use "/" as the ZIP format requires, so tools on Linux
 and macOS (unzip, Python zipfile) extract the folders too. Zips from earlier
 versions run by the .bat launcher (Windows PowerShell 5.1) use "\"; Windows
-tools and the timeline builder read both. If compression fails, the
-incomplete zip is deleted, the uncompressed folder is kept and the log says
-why.
+tools and the timeline builder read both. A file already at the zip path
+(an earlier run with the same -OutputPath) is replaced, and the log says so.
+If compression fails, the incomplete zip is deleted, the uncompressed folder
+is kept and the log says why.
 
 Inside the zip:
 

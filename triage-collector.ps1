@@ -3244,6 +3244,607 @@ function Copy-TriageChromiumNetworkCookies {
     }
 }
 
+# ----------------------------------------------------------
+# Helpers for the Browser section: extension, session, settings and
+# snapshot files (read by the timeline builder for installed extensions,
+# open and recently closed tabs, settings, and history that only a
+# pre-update snapshot or the Favicons database still holds). Every copy has
+# a size cap; what is skipped is logged.
+# ----------------------------------------------------------
+# Chromium profile folders collected (with the main browser files too)
+$script:triageChromiumProfilePattern = '^(Default|Profile \d+|Guest Profile)$'
+
+# Members blanked in the copies of Local State, Preferences and Secure
+# Preferences (names matched whole, case-insensitive, at any depth): the
+# encrypted keys that protect saved passwords and cookies (os_crypt),
+# password hashes (password_hash_data_list), tokens, salts and the sync
+# encryption keys (sync.encryption_bootstrap_token_per_account,
+# sync.keystore_encryption_key_state). The timeline uses none of them. A
+# text value becomes "", a list [] and an object {}; numbers and true/false
+# are kept.
+$script:triageChromiumSecretNames = '[A-Za-z0-9_]*(?:encrypted_key|_encrypted_data|token|_salt)[A-Za-z0-9_]*|password_hash_data_list|keystore_encryption_key_state'
+# Firefox prefs.js: text values of prefs whose name has one of these words
+$script:triageFirefoxSecretPattern = '(?im)^(\s*user_pref\(\s*"[^"]*(?:token|secret|password|useragentid)[^"]*"\s*,\s*)"(?:[^"\\]|\\.)*"'
+# Firefox session files: members blanked in the copies -- the values of
+# session cookies (including HttpOnly ones, which cookies.sqlite does not
+# hold), form data, session storage, POST data, page state (history.state)
+# and text typed in the address bar
+$script:triageFirefoxSessionPrivateNames = 'formdata|cookies|storage|postdata_b64|structuredCloneState|userTypedValue'
+
+# Blanking code for the browser files above, compiled on first use (C# 5
+# only, see the NTFS reader):
+#   BlankJsonMembers     JSON text: the values of the members whose names
+#                        match emptied, scanning string by string (a name
+#                        inside a string value is never taken for a
+#                        member). A value cut off by the end of a damaged
+#                        file is dropped with the rest of the file.
+#   RedactMozLz4Json     Firefox session file ("mozLz40\0", uint32 data
+#                        size, one LZ4 block): decompressed, blanked as
+#                        above, and written back as a valid mozLz4 file
+#                        whose block holds the data uncompressed (literals
+#                        only)
+#   BlankSnssPageState   Chromium Session_* / Tabs_* file (SNSS: "SNSS",
+#                        int32 version, then uint16 size + uint8 id +
+#                        payload per command): in each navigation entry
+#                        (UpdateTabNavigation, a base::Pickle: tab id,
+#                        index, URL, title, page state, ...) the page state
+#                        -- form contents and POST data of the page -- is
+#                        overwritten with zeros, in place, so the file keeps
+#                        its layout. Bytes after a damaged command are
+#                        zeroed too. Encrypted files (versions 2 and 4) are
+#                        refused.
+$script:triageRedactorSource = @'
+using System;
+using System.IO;
+using System.Text;
+using System.Text.RegularExpressions;
+
+namespace TriageBrowser
+{
+    public static class Redactor
+    {
+        const int MaxDecompressedSize = 256 * 1024 * 1024;
+
+        public static string BlankJsonMembers(string json, string namePattern, out int blanked, out bool damaged)
+        {
+            Regex names = new Regex("^(?:" + namePattern + ")$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+            StringBuilder sb = new StringBuilder(json.Length);
+            blanked = 0;
+            damaged = false;
+            int n = json.Length;
+            int i = 0;
+            while (i < n)
+            {
+                char c = json[i];
+                if (c != '"') { sb.Append(c); i++; continue; }
+                int keyStart = i;
+                bool open = false;
+                int end = SkipString(json, keyStart, ref open);
+                sb.Append(json, keyStart, end - keyStart);
+                i = end;
+                if (open) { break; }
+                int j = end;
+                while (j < n && char.IsWhiteSpace(json[j])) { j++; }
+                if (j >= n || json[j] != ':' || !names.IsMatch(json.Substring(keyStart + 1, end - keyStart - 2)))
+                {
+                    continue;
+                }
+                int v = j + 1;
+                while (v < n && char.IsWhiteSpace(json[v])) { v++; }
+                sb.Append(json, end, v - end);
+                i = v;
+                if (v >= n) { break; }
+                char first = json[v];
+                if (first != '"' && first != '[' && first != '{') { continue; }
+                bool valueOpen = false;
+                int valueEnd = SkipValue(json, v, ref valueOpen);
+                sb.Append(first == '"' ? "\"\"" : (first == '[' ? "[]" : "{}"));
+                blanked++;
+                if (valueOpen) { damaged = true; }
+                i = valueEnd;
+            }
+            return sb.ToString();
+        }
+
+        // Index after the string that starts at s[i] (a quote); open is set
+        // when the text ends inside it
+        static int SkipString(string s, int i, ref bool open)
+        {
+            i++;
+            while (i < s.Length)
+            {
+                char c = s[i];
+                if (c == '\\') { i += 2; continue; }
+                if (c == '"') { return i + 1; }
+                i++;
+            }
+            open = true;
+            return s.Length;
+        }
+
+        // Index after the string, list or object that starts at s[i]
+        static int SkipValue(string s, int i, ref bool open)
+        {
+            if (s[i] == '"') { return SkipString(s, i, ref open); }
+            int depth = 0;
+            while (i < s.Length)
+            {
+                char d = s[i];
+                if (d == '"')
+                {
+                    i = SkipString(s, i, ref open);
+                    if (open) { return s.Length; }
+                    continue;
+                }
+                if (d == '{' || d == '[') { depth++; }
+                else if (d == '}' || d == ']')
+                {
+                    depth--;
+                    if (depth == 0) { return i + 1; }
+                }
+                i++;
+            }
+            open = true;
+            return s.Length;
+        }
+
+        public static byte[] RedactMozLz4Json(byte[] data, string namePattern, out int blanked, out bool damaged)
+        {
+            string json = Encoding.UTF8.GetString(DecompressMozLz4(data));
+            byte[] text = Encoding.UTF8.GetBytes(BlankJsonMembers(json, namePattern, out blanked, out damaged));
+            MemoryStream o = new MemoryStream(text.Length + text.Length / 255 + 16);
+            o.Write(Encoding.ASCII.GetBytes("mozLz40\0"), 0, 8);
+            o.Write(BitConverter.GetBytes(text.Length), 0, 4);
+            // One sequence of literals: a token, the extra length bytes, the data
+            o.WriteByte((byte)(Math.Min(text.Length, 15) << 4));
+            if (text.Length >= 15)
+            {
+                int rest = text.Length - 15;
+                while (rest >= 255) { o.WriteByte(255); rest -= 255; }
+                o.WriteByte((byte)rest);
+            }
+            o.Write(text, 0, text.Length);
+            return o.ToArray();
+        }
+
+        static byte[] DecompressMozLz4(byte[] data)
+        {
+            byte[] magic = Encoding.ASCII.GetBytes("mozLz40\0");
+            if (data == null || data.Length < 12) { throw new InvalidDataException("file too small"); }
+            for (int i = 0; i < magic.Length; i++)
+            {
+                if (data[i] != magic[i]) { throw new InvalidDataException("no mozLz40 header"); }
+            }
+            int size = BitConverter.ToInt32(data, 8);
+            // LZ4 cannot expand data more than about 255 times
+            if (size < 0 || size > MaxDecompressedSize || (long)size > (long)(data.Length - 12) * 255 + 64)
+            {
+                throw new InvalidDataException("implausible data size " + size);
+            }
+            byte[] output = new byte[size];
+            int ip = 12;
+            int op = 0;
+            while (ip < data.Length)
+            {
+                int token = data[ip++];
+                int literals = token >> 4;
+                if (literals == 15) { literals += ReadLength(data, ref ip); }
+                if (literals > data.Length - ip || literals > size - op) { throw new InvalidDataException("LZ4 literals out of range"); }
+                Buffer.BlockCopy(data, ip, output, op, literals);
+                ip += literals;
+                op += literals;
+                if (ip >= data.Length) { break; }
+                if (data.Length - ip < 2) { throw new InvalidDataException("LZ4 data ends inside a match offset"); }
+                int offset = data[ip] | (data[ip + 1] << 8);
+                ip += 2;
+                if (offset == 0 || offset > op) { throw new InvalidDataException("LZ4 match offset out of range"); }
+                int matchLength = token & 15;
+                if (matchLength == 15) { matchLength += ReadLength(data, ref ip); }
+                matchLength += 4;
+                if (matchLength > size - op) { throw new InvalidDataException("LZ4 match runs past the data size"); }
+                int from = op - offset;
+                for (int k = 0; k < matchLength; k++) { output[op++] = output[from++]; }
+            }
+            if (op != size) { throw new InvalidDataException("LZ4 data shorter than its stated size"); }
+            return output;
+        }
+
+        static int ReadLength(byte[] data, ref int ip)
+        {
+            int total = 0;
+            int b;
+            do
+            {
+                if (ip >= data.Length) { throw new InvalidDataException("LZ4 data ends inside a length"); }
+                b = data[ip++];
+                total += b;
+                if (total > MaxDecompressedSize) { throw new InvalidDataException("implausible LZ4 length"); }
+            } while (b == 255);
+            return total;
+        }
+
+        // Returns the number of page states overwritten
+        public static int BlankSnssPageState(byte[] data, bool tabRestore)
+        {
+            if (data == null || data.Length < 8 || data[0] != 0x53 || data[1] != 0x4E || data[2] != 0x53 || data[3] != 0x53)
+            {
+                throw new InvalidDataException("no SNSS header");
+            }
+            int version = BitConverter.ToInt32(data, 4);
+            if (version == 2 || version == 4) { throw new InvalidDataException("encrypted session file (SNSS version " + version + ")"); }
+            int navigationCommand = tabRestore ? 1 : 6;
+            int blanked = 0;
+            int pos = 8;
+            while (pos < data.Length)
+            {
+                int size = data.Length - pos >= 2 ? BitConverter.ToUInt16(data, pos) : 0;
+                if (size == 0 || size > data.Length - pos - 2)
+                {
+                    // Damaged or cut off: nothing after this can be read
+                    Array.Clear(data, pos, data.Length - pos);
+                    break;
+                }
+                int id = data[pos + 2];
+                int start = pos + 3;
+                int length = size - 1;
+                pos += 2 + size;
+                if (id == navigationCommand && BlankNavigationPageState(data, start, length)) { blanked++; }
+            }
+            return blanked;
+        }
+
+        // Pickle: uint32 payload size, then 4-byte aligned fields: int tab
+        // id, int index, string URL (int32 byte count + bytes), string16
+        // title (int32 character count + UTF-16), string page state. When
+        // the entry cannot be read that far, the rest of it is zeroed.
+        static bool BlankNavigationPageState(byte[] data, int start, int length)
+        {
+            int end = start + length;
+            int pos = start + 12;
+            for (int field = 0; field < 3; field++)
+            {
+                if (end - pos < 4) { break; }
+                int count = BitConverter.ToInt32(data, pos);
+                long bytes = field == 1 ? (long)count * 2 : count;
+                if (count < 0 || bytes > end - pos - 4) { break; }
+                pos += 4;
+                if (field == 2)
+                {
+                    Array.Clear(data, pos, (int)bytes);
+                    return bytes > 0;
+                }
+                pos += (int)((bytes + 3) & ~3L);
+            }
+            if (pos >= end) { return false; }
+            Array.Clear(data, pos, end - pos);
+            return true;
+        }
+    }
+}
+'@
+
+$script:triageRedactorReady = $null
+function Initialize-TriageRedactor {
+    if ($null -ne $script:triageRedactorReady) { return $script:triageRedactorReady }
+    if ('TriageBrowser.Redactor' -as [type]) {
+        $script:triageRedactorReady = $true
+        return $true
+    }
+    try {
+        Add-Type -TypeDefinition $script:triageRedactorSource -ErrorAction Stop
+        $script:triageRedactorReady = $true
+    } catch {
+        Log-Warning "Browser file redaction code could not be compiled (settings and session files not collected): $($_.Exception.Message)"
+        $script:errorCount++
+        $script:triageRedactorReady = $false
+    }
+    return $script:triageRedactorReady
+}
+
+# Copy a file unless it is larger than -MaxBytes (logged with its size).
+# Returns $true when the copy is in the collection.
+function Copy-TriageCappedFile {
+    [OutputType([bool])]
+    param(
+        [string]$SourcePath,
+        [string]$DestDir,
+        [string]$DestName,
+        [long]$MaxBytes
+    )
+    $size = Get-FileLength $SourcePath
+    if ($size -le 0) { return $false }
+    if ($size -gt $MaxBytes) {
+        Log "Skipped (larger than the $([math]::Round($MaxBytes / 1MB)) MB cap: $([math]::Round($size / 1MB, 1)) MB): $SourcePath"
+        return $false
+    }
+    Copy-ForensicFile -SourcePath $SourcePath -DestDir $DestDir -DestName $DestName
+    return (Test-Path -LiteralPath (Join-Path $DestDir $DestName))
+}
+
+# Copy files (already in the order of preference, e.g. newest first) to the
+# same paths relative to -SourceRoot under -DestRoot, while the total size of
+# the copies stays within -MaxTotalBytes; files that do not fit are skipped
+# and listed in the log. -Format: copy with private values blanked (see
+# Copy-TriageRedactedFile). Returns the number of files collected.
+function Copy-TriageFilesWithinCap {
+    [OutputType([int])]
+    param(
+        [System.IO.FileInfo[]]$Files,
+        [string]$SourceRoot,
+        [string]$DestRoot,
+        [long]$MaxTotalBytes,
+        [string]$Label,
+        [string]$Format = ""
+    )
+    $total = 0L
+    $copied = 0
+    $skipped = New-Object System.Collections.Generic.List[string]
+    $root = $SourceRoot.TrimEnd('\')
+    foreach ($file in $Files) {
+        if (-not $file -or $file.Length -le 0) { continue }
+        if ($total + $file.Length -gt $MaxTotalBytes) {
+            $skipped.Add("$($file.Name) ($([math]::Round($file.Length / 1MB, 1)) MB)")
+            continue
+        }
+        $relDir = Split-Path ($file.FullName.Substring($root.Length + 1)) -Parent
+        $destDir = if ($relDir) { Join-Path $DestRoot $relDir } else { $DestRoot }
+        if ($Format) {
+            # A blanked Firefox session copy is stored uncompressed: its own
+            # size counts (it must fit in what is left)
+            $null = Copy-TriageRedactedFile -SourcePath $file.FullName -DestDir $destDir -DestName $file.Name -Format $Format `
+                -MaxBytes ($MaxTotalBytes - $total) -MaxOutputBytes ($MaxTotalBytes - $total) -CapLabel "the $([math]::Round($MaxTotalBytes / 1MB)) MB total cap for $Label(s)"
+        }
+        else {
+            Copy-ForensicFile -SourcePath $file.FullName -DestDir $destDir -DestName $file.Name
+        }
+        $copyLength = Get-FileLength (Join-Path $destDir $file.Name)
+        if ($copyLength -gt 0) {
+            $total += $copyLength
+            $copied++
+        }
+    }
+    if ($skipped.Count -gt 0) {
+        Log "Skipped $($skipped.Count) $Label(s) in $SourceRoot (over the $([math]::Round($MaxTotalBytes / 1MB)) MB total cap): $($skipped -join ', ')"
+    }
+    return $copied
+}
+
+# Copy a browser file with its secret or private values blanked:
+#   ChromiumJson     Local State, Preferences, Secure Preferences (secret
+#                    members, see above)
+#   FirefoxPrefs     prefs.js (text values of secret-named prefs)
+#   ChromiumSession  Session_* / Tabs_* (page state of each navigation entry)
+#   FirefoxSession   sessionstore.jsonlz4 and its backups (cookies, form
+#                    data, session storage, POST data, page state, typed text)
+# The copy is not byte-identical to the original when something was blanked
+# (the log says so); the manifest has the original's path and times and the
+# hash of the copy. Read with sharing, so a file the browser has open is
+# still read. A file that cannot be read well enough to blank it (damaged,
+# encrypted) is not collected. -MaxOutputBytes: the copy is not kept when it
+# is larger (a blanked Firefox session file is stored uncompressed).
+function Copy-TriageRedactedFile {
+    [OutputType([bool])]
+    param(
+        [string]$SourcePath,
+        [string]$DestDir,
+        [string]$DestName,
+        [ValidateSet("ChromiumJson", "FirefoxPrefs", "ChromiumSession", "FirefoxSession")]
+        [string]$Format,
+        [long]$MaxBytes,
+        [long]$MaxOutputBytes = 0,
+        [string]$CapLabel = ""
+    )
+    $size = Get-FileLength $SourcePath
+    if ($size -le 0) { return $false }
+    if ($size -gt $MaxBytes) {
+        Log "Skipped (larger than the $([math]::Round($MaxBytes / 1MB)) MB cap: $([math]::Round($size / 1MB, 1)) MB): $SourcePath"
+        return $false
+    }
+    if ($Format -ne "FirefoxPrefs" -and -not (Initialize-TriageRedactor)) {
+        Log "Not collected (its private values could not be blanked): $SourcePath"
+        return $false
+    }
+    $srcTimes = Get-SourceFileTimesUtc $SourcePath
+    try {
+        $stream = New-Object System.IO.FileStream($SourcePath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete))
+        try {
+            $buffer = New-Object System.IO.MemoryStream
+            $stream.CopyTo($buffer)
+            $bytes = $buffer.ToArray()
+        } finally { $stream.Dispose() }
+    } catch {
+        Log-Warning "Could not read: $SourcePath -- $(Get-TriageErrorMessage $_)"
+        $script:errorCount++
+        return $false
+    }
+
+    $blanked = 0
+    $damaged = $false
+    try {
+        if ($Format -eq "ChromiumSession") {
+            $blanked = [TriageBrowser.Redactor]::BlankSnssPageState($bytes, ($DestName -match '^(Tabs_|Current Tabs$|Last Tabs$)'))
+        }
+        elseif ($Format -eq "FirefoxSession") {
+            $bytes = [TriageBrowser.Redactor]::RedactMozLz4Json($bytes, $script:triageFirefoxSessionPrivateNames, [ref]$blanked, [ref]$damaged)
+        }
+        else {
+            # Text (UTF-8, or the encoding its byte order mark names)
+            $reader = New-Object System.IO.StreamReader((New-Object System.IO.MemoryStream(, $bytes)), (New-Object System.Text.UTF8Encoding($false)), $true)
+            $text = $reader.ReadToEnd()
+            if ($Format -eq "FirefoxPrefs") {
+                $blanked = ([regex]::Matches($text, $script:triageFirefoxSecretPattern)).Count
+                if ($blanked -gt 0) { $text = [regex]::Replace($text, $script:triageFirefoxSecretPattern, '$1""') }
+            }
+            else {
+                $text = [TriageBrowser.Redactor]::BlankJsonMembers($text, $script:triageChromiumSecretNames, [ref]$blanked, [ref]$damaged)
+            }
+            $bytes = (New-Object System.Text.UTF8Encoding($false)).GetBytes($text)
+        }
+    } catch {
+        Log "Not collected (could not be read to blank its private values -- $(Get-TriageErrorMessage $_)): $SourcePath"
+        return $false
+    }
+    if ($MaxOutputBytes -gt 0 -and $bytes.Length -gt $MaxOutputBytes) {
+        Log "Skipped (its blanked copy, $([math]::Round($bytes.Length / 1MB, 1)) MB, is over what is left of $CapLabel): $SourcePath"
+        return $false
+    }
+
+    try {
+        Ensure-Directory $DestDir
+        $destPath = Join-Path $DestDir $DestName
+        [System.IO.File]::WriteAllBytes($destPath, $bytes)
+    } catch {
+        Log-Warning "Could not copy: $SourcePath -- $($_.Exception.Message)"
+        $script:errorCount++
+        return $false
+    }
+    Record-Manifest -SourcePath $SourcePath -DestPath $destPath -SourceTimes $srcTimes
+    if ($damaged) { Log "Damaged file (cut off inside a private value; everything from there on was dropped): $SourcePath" }
+    if ($blanked -gt 0) {
+        $what = switch ($Format) {
+            "ChromiumSession" { "page state(s) (form contents) blanked" }
+            "FirefoxSession"  { "private value(s) (cookies, form data, session storage) blanked" }
+            default           { "secret value(s) blanked (keys, tokens, password hashes)" }
+        }
+        Log "Collected with $blanked $($what): $SourcePath"
+    }
+    return $true
+}
+
+# Extension, session, settings and favicon files of one Chromium profile
+# folder (for Opera: its own folder), copied to the same relative paths
+# under -DestDir:
+#   Preferences, Secure Preferences   settings and installed extensions
+#                                     (secret values blanked, see above)
+#   Favicons (+ -journal)             icons of visited pages; can outlive a
+#                                     history clear (256 MB cap)
+#   Sessions\Session_*, Tabs_*        open and recently closed tabs (also the
+#                                     older Current/Last Session and Tabs
+#                                     files; newest first, 64 MB in all), with
+#                                     the page state (form contents) of every
+#                                     entry blanked
+#   Extensions\<id>\<version>\manifest.json, plus the
+#   _locales\<default_locale>\messages.json that resolves __MSG_ names
+#   (1 MB cap each; no extension code is collected)
+function Copy-TriageChromiumProfileExtras {
+    [OutputType([void])]
+    param(
+        [string]$ProfileDir,
+        [string]$DestDir,
+        [string]$Label
+    )
+    foreach ($prefsFile in @("Preferences", "Secure Preferences")) {
+        $null = Copy-TriageRedactedFile -SourcePath (Join-Path $ProfileDir $prefsFile) -DestDir $DestDir -DestName $prefsFile -Format ChromiumJson -MaxBytes 32MB
+    }
+    foreach ($iconFile in @("Favicons", "Favicons-journal")) {
+        $null = Copy-TriageCappedFile -SourcePath (Join-Path $ProfileDir $iconFile) -DestDir $DestDir -DestName $iconFile -MaxBytes 256MB
+    }
+
+    $sessionFiles = New-Object System.Collections.Generic.List[System.IO.FileInfo]
+    $sessionsDir = Join-Path $ProfileDir "Sessions"
+    if (Test-Path -LiteralPath $sessionsDir) {
+        foreach ($f in @(Get-ChildItem -LiteralPath $sessionsDir -File -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^(Session|Tabs)_\d+$' })) { $sessionFiles.Add($f) }
+    }
+    foreach ($legacyName in @("Current Session", "Current Tabs", "Last Session", "Last Tabs")) {
+        $legacyFile = Get-Item -LiteralPath (Join-Path $ProfileDir $legacyName) -Force -ErrorAction SilentlyContinue
+        if ($legacyFile -and -not $legacyFile.PSIsContainer) { $sessionFiles.Add($legacyFile) }
+    }
+    $sessionCount = 0
+    if ($sessionFiles.Count -gt 0) {
+        $sessionCount = Copy-TriageFilesWithinCap -Files @($sessionFiles | Sort-Object LastWriteTimeUtc -Descending) -SourceRoot $ProfileDir -DestRoot $DestDir -MaxTotalBytes 64MB -Label "session file" -Format ChromiumSession
+    }
+
+    # Extensions\<32-letter id>\<version>\: the manifest only
+    $manifestCount = 0
+    $extensionsDir = Join-Path $ProfileDir "Extensions"
+    if (Test-Path -LiteralPath $extensionsDir) {
+        $extensionDirs = @(Get-ChildItem -LiteralPath $extensionsDir -Directory -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^[a-p]{32}$' })
+        foreach ($extensionDir in $extensionDirs) {
+            foreach ($versionDir in @(Get-ChildItem -LiteralPath $extensionDir.FullName -Directory -Force -ErrorAction SilentlyContinue)) {
+                $versionDest = Join-Path $DestDir "Extensions\$($extensionDir.Name)\$($versionDir.Name)"
+                if (-not (Copy-TriageCappedFile -SourcePath (Join-Path $versionDir.FullName "manifest.json") -DestDir $versionDest -DestName "manifest.json" -MaxBytes 1MB)) { continue }
+                $manifestCount++
+                # A name such as "__MSG_appName__" is looked up in the default
+                # locale's messages.json (read from the copy just made)
+                $manifestText = ""
+                try { $manifestText = [System.IO.File]::ReadAllText((Join-Path $versionDest "manifest.json")) }
+                catch { Write-Verbose "Reading the copied manifest of $($extensionDir.Name): $($_.Exception.Message)" }
+                if ($manifestText -match '__MSG_' -and $manifestText -match '"default_locale"\s*:\s*"([A-Za-z0-9_-]+)"') {
+                    $locale = $Matches[1]
+                    $null = Copy-TriageCappedFile -SourcePath (Join-Path $versionDir.FullName "_locales\$locale\messages.json") `
+                        -DestDir (Join-Path $versionDest "_locales\$locale") -DestName "messages.json" -MaxBytes 1MB
+                }
+            }
+        }
+    }
+    if ($manifestCount -gt 0 -or $sessionCount -gt 0) {
+        Log "Collected $manifestCount extension manifest(s) and $sessionCount session file(s) for $Label"
+    }
+}
+
+# Once per Chromium browser (its User Data folder; for Opera, its own
+# folder): Local State (secret values blanked) and the snapshots the browser
+# keeps from before an update, Snapshots\<version>\<profile>\History and
+# Favicons with their journals -- they can hold history cleared since.
+# Newest versions first, 1 GB in all.
+function Copy-TriageChromiumUserDataExtras {
+    [OutputType([void])]
+    param(
+        [string]$UserDataDir,
+        [string]$DestDir
+    )
+    $null = Copy-TriageRedactedFile -SourcePath (Join-Path $UserDataDir "Local State") -DestDir $DestDir -DestName "Local State" -Format ChromiumJson -MaxBytes 32MB
+
+    $snapshotsDir = Join-Path $UserDataDir "Snapshots"
+    if (-not (Test-Path -LiteralPath $snapshotsDir)) { return }
+    $snapshotFiles = New-Object System.Collections.Generic.List[System.IO.FileInfo]
+    $versionDirs = @(Get-ChildItem -LiteralPath $snapshotsDir -Directory -Force -ErrorAction SilentlyContinue | Sort-Object LastWriteTimeUtc -Descending)
+    foreach ($versionDir in $versionDirs) {
+        $profileDirs = @(Get-ChildItem -LiteralPath $versionDir.FullName -Directory -Force -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match $script:triageChromiumProfilePattern })
+        foreach ($snapshotProfile in $profileDirs) {
+            foreach ($name in @("History", "History-journal", "Favicons", "Favicons-journal")) {
+                $snapshotFile = Get-Item -LiteralPath (Join-Path $snapshotProfile.FullName $name) -Force -ErrorAction SilentlyContinue
+                if ($snapshotFile -and -not $snapshotFile.PSIsContainer) { $snapshotFiles.Add($snapshotFile) }
+            }
+        }
+    }
+    if ($snapshotFiles.Count -eq 0) { return }
+    $copied = Copy-TriageFilesWithinCap -Files $snapshotFiles.ToArray() -SourceRoot $UserDataDir -DestRoot $DestDir -MaxTotalBytes 1GB -Label "history snapshot file"
+    Log "Collected $copied history snapshot file(s) from $snapshotsDir ($($versionDirs.Count) version(s))"
+}
+
+# Extensions, settings and sessions of one Firefox profile: extensions.json
+# and addons.json (installed add-ons), prefs.js (secret values blanked),
+# sessionstore.jsonlz4 and sessionstore-backups\ (recovery, previous and
+# upgrade session files, with session cookies, form data, session storage,
+# POST data, page state and typed text blanked; stored uncompressed as
+# mozLz4; newest first, 64 MB in all)
+function Copy-TriageFirefoxProfileExtras {
+    [OutputType([void])]
+    param(
+        [string]$ProfileDir,
+        [string]$DestDir,
+        [string]$Label
+    )
+    foreach ($jsonFile in @("extensions.json", "addons.json")) {
+        $null = Copy-TriageCappedFile -SourcePath (Join-Path $ProfileDir $jsonFile) -DestDir $DestDir -DestName $jsonFile -MaxBytes 32MB
+    }
+    $null = Copy-TriageRedactedFile -SourcePath (Join-Path $ProfileDir "prefs.js") -DestDir $DestDir -DestName "prefs.js" -Format FirefoxPrefs -MaxBytes 16MB
+
+    $sessionFiles = New-Object System.Collections.Generic.List[System.IO.FileInfo]
+    $sessionStore = Get-Item -LiteralPath (Join-Path $ProfileDir "sessionstore.jsonlz4") -Force -ErrorAction SilentlyContinue
+    if ($sessionStore -and -not $sessionStore.PSIsContainer) { $sessionFiles.Add($sessionStore) }
+    $backupsDir = Join-Path $ProfileDir "sessionstore-backups"
+    if (Test-Path -LiteralPath $backupsDir) {
+        foreach ($f in @(Get-ChildItem -LiteralPath $backupsDir -File -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '\.(jsonlz4|baklz4)' })) { $sessionFiles.Add($f) }
+    }
+    if ($sessionFiles.Count -gt 0) {
+        $sessionCount = Copy-TriageFilesWithinCap -Files @($sessionFiles | Sort-Object LastWriteTimeUtc -Descending) -SourceRoot $ProfileDir -DestRoot $DestDir -MaxTotalBytes 64MB -Label "session file" -Format FirefoxSession
+        Log "Collected $sessionCount session file(s) for $Label"
+    }
+}
+
 # =============================================================
 # 7. Browser Artifacts
 # =============================================================
@@ -3263,9 +3864,9 @@ if ($Categories -contains "Browser") {
         $chromeBase = Join-Path $userDir.FullName "AppData\Local\Google\Chrome\User Data"
         if (Test-Path -LiteralPath $chromeBase) {
             Log "Collecting Chrome data for $userName..."
-            # Collect from Default and any numbered profiles
+            # Collect from Default, any numbered profiles and the Guest profile
             $chromeProfiles = Get-ChildItem -Path $chromeBase -Directory -Force -ErrorAction SilentlyContinue |
-                Where-Object { $_.Name -eq "Default" -or $_.Name -match "^Profile \d+$" }
+                Where-Object { $_.Name -match $script:triageChromiumProfilePattern }
 
             foreach ($browserProfile in $chromeProfiles) {
                 $destDir = Join-Path $browserDir "$userName\Chrome\$($browserProfile.Name)"
@@ -3280,7 +3881,9 @@ if ($Categories -contains "Browser") {
                     }
                 }
                 Copy-TriageChromiumNetworkCookies -ProfileDir $browserProfile.FullName -DestDir $destDir
+                Copy-TriageChromiumProfileExtras -ProfileDir $browserProfile.FullName -DestDir $destDir -Label "$userName Chrome\$($browserProfile.Name)"
             }
+            Copy-TriageChromiumUserDataExtras -UserDataDir $chromeBase -DestDir (Join-Path $browserDir "$userName\Chrome")
             Log-Success "Collected Chrome artifacts for $userName"
         }
 
@@ -3289,7 +3892,7 @@ if ($Categories -contains "Browser") {
         if (Test-Path -LiteralPath $edgeBase) {
             Log "Collecting Edge data for $userName..."
             $edgeProfiles = Get-ChildItem -Path $edgeBase -Directory -Force -ErrorAction SilentlyContinue |
-                Where-Object { $_.Name -eq "Default" -or $_.Name -match "^Profile \d+$" }
+                Where-Object { $_.Name -match $script:triageChromiumProfilePattern }
 
             foreach ($browserProfile in $edgeProfiles) {
                 $destDir = Join-Path $browserDir "$userName\Edge\$($browserProfile.Name)"
@@ -3301,7 +3904,9 @@ if ($Categories -contains "Browser") {
                     }
                 }
                 Copy-TriageChromiumNetworkCookies -ProfileDir $browserProfile.FullName -DestDir $destDir
+                Copy-TriageChromiumProfileExtras -ProfileDir $browserProfile.FullName -DestDir $destDir -Label "$userName Edge\$($browserProfile.Name)"
             }
+            Copy-TriageChromiumUserDataExtras -UserDataDir $edgeBase -DestDir (Join-Path $browserDir "$userName\Edge")
             Log-Success "Collected Edge artifacts for $userName"
         }
 
@@ -3310,7 +3915,7 @@ if ($Categories -contains "Browser") {
         if (Test-Path -LiteralPath $braveBase) {
             Log "Collecting Brave data for $userName..."
             $braveProfiles = Get-ChildItem -Path $braveBase -Directory -Force -ErrorAction SilentlyContinue |
-                Where-Object { $_.Name -eq "Default" -or $_.Name -match "^Profile \d+$" }
+                Where-Object { $_.Name -match $script:triageChromiumProfilePattern }
 
             foreach ($browserProfile in $braveProfiles) {
                 $destDir = Join-Path $browserDir "$userName\Brave\$($browserProfile.Name)"
@@ -3322,7 +3927,9 @@ if ($Categories -contains "Browser") {
                     }
                 }
                 Copy-TriageChromiumNetworkCookies -ProfileDir $browserProfile.FullName -DestDir $destDir
+                Copy-TriageChromiumProfileExtras -ProfileDir $browserProfile.FullName -DestDir $destDir -Label "$userName Brave\$($browserProfile.Name)"
             }
+            Copy-TriageChromiumUserDataExtras -UserDataDir $braveBase -DestDir (Join-Path $browserDir "$userName\Brave")
             Log-Success "Collected Brave artifacts for $userName"
         }
 
@@ -3344,6 +3951,9 @@ if ($Categories -contains "Browser") {
                     }
                 }
                 Copy-TriageChromiumNetworkCookies -ProfileDir $operaBase -DestDir $destDir
+                # Opera's folder is both its User Data folder and its profile
+                Copy-TriageChromiumProfileExtras -ProfileDir $operaBase -DestDir $destDir -Label "$userName $operaName"
+                Copy-TriageChromiumUserDataExtras -UserDataDir $operaBase -DestDir $destDir
                 Log-Success "Collected $operaName artifacts for $userName"
             }
         }
@@ -3353,7 +3963,7 @@ if ($Categories -contains "Browser") {
         if (Test-Path -LiteralPath $vivaldiBase) {
             Log "Collecting Vivaldi data for $userName..."
             $vivaldiProfiles = Get-ChildItem -Path $vivaldiBase -Directory -Force -ErrorAction SilentlyContinue |
-                Where-Object { $_.Name -eq "Default" -or $_.Name -match "^Profile \d+$" }
+                Where-Object { $_.Name -match $script:triageChromiumProfilePattern }
 
             foreach ($browserProfile in $vivaldiProfiles) {
                 $destDir = Join-Path $browserDir "$userName\Vivaldi\$($browserProfile.Name)"
@@ -3365,7 +3975,9 @@ if ($Categories -contains "Browser") {
                     }
                 }
                 Copy-TriageChromiumNetworkCookies -ProfileDir $browserProfile.FullName -DestDir $destDir
+                Copy-TriageChromiumProfileExtras -ProfileDir $browserProfile.FullName -DestDir $destDir -Label "$userName Vivaldi\$($browserProfile.Name)"
             }
+            Copy-TriageChromiumUserDataExtras -UserDataDir $vivaldiBase -DestDir (Join-Path $browserDir "$userName\Vivaldi")
             Log-Success "Collected Vivaldi artifacts for $userName"
         }
 
@@ -3386,6 +3998,7 @@ if ($Categories -contains "Browser") {
                         Copy-ForensicFile -SourcePath $sourcePath -DestDir $destDir -DestName $ff
                     }
                 }
+                Copy-TriageFirefoxProfileExtras -ProfileDir $browserProfile.FullName -DestDir $destDir -Label "$userName Firefox\$($browserProfile.Name)"
             }
             Log-Success "Collected Firefox artifacts for $userName"
         }

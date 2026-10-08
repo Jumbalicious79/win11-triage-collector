@@ -765,6 +765,10 @@ the mounted image for a non-invasive collection.
                    Note: Memory is opt-in. On live systems, the script prompts
                    if a capture tool is found in tools\. For automation, pass
                    -Categories "Memory","FileSystem","Registry",...
+  -Unattended      No prompts, for scripts and tests: the target is the live
+                   system drive unless -TargetDrive is given, memory is
+                   captured only when -Categories includes Memory, and there
+                   is no "Press any key" at the end.
 
 
 ## Optional Tools (tools\ directory)

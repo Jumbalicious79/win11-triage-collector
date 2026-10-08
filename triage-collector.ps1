@@ -11,7 +11,11 @@ param(
     [ValidatePattern('^[A-Za-z]$')]
     [string]$TargetDrive = "",
     [ValidateSet("Memory","FileSystem","Registry","EventLogs","Execution","Network","UserActivity","Browser","USB","Persistence","AntiVirus")]
-    [string[]]$Categories = @("FileSystem","Registry","EventLogs","Execution","Network","UserActivity","Browser","USB","Persistence","AntiVirus")
+    [string[]]$Categories = @("FileSystem","Registry","EventLogs","Execution","Network","UserActivity","Browser","USB","Persistence","AntiVirus"),
+    # No prompts (scripts and tests): the target is the live system drive unless
+    # -TargetDrive is given, memory is captured only when -Categories includes
+    # Memory, and there is no "Press any key" at the end
+    [switch]$Unattended
 )
 
 # --- Require Administrator ---
@@ -23,7 +27,7 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
     Write-Host "  Option 1: Double-click Run-TriageCollector.bat (recommended)" -ForegroundColor Yellow
     Write-Host "  Option 2: powershell -ExecutionPolicy Bypass -NoProfile -File `"$PSCommandPath`"" -ForegroundColor Yellow
     Write-Host ""
-    pause
+    if (-not $Unattended) { pause }
     exit 1
 }
 
@@ -54,6 +58,10 @@ function Find-WindowsRoot {
 }
 
 # --- Resolve target drive: interactive menu if not specified ---
+if (-not $TargetDrive -and $Unattended) {
+    $TargetDrive = ($env:SystemDrive)[0]
+    $script:TargetRootOverride = $null
+}
 if (-not $TargetDrive) {
     # Detect available drives that look like Windows volumes
     $systemDriveLetter = ($env:SystemDrive)[0]
@@ -157,7 +165,7 @@ $script:IsLive = ("${TargetDrive}:" -eq $env:SystemDrive)
 # Validate target drive
 if (-not (Test-Path $script:TargetRoot)) {
     Write-Host "ERROR: Drive ${TargetDrive}: does not exist or is not accessible." -ForegroundColor Red
-    pause
+    if (-not $Unattended) { pause }
     exit 1
 }
 if (-not (Test-Path "${script:TargetRoot}Windows\System32")) {
@@ -229,8 +237,9 @@ function Find-MemoryCaptureTool {
 }
 
 # --- Interactive memory capture prompt ---
-# Only show if: live system, Memory not already in Categories, and a tool exists
-if ($script:IsLive -and ($Categories -notcontains "Memory")) {
+# Only show if: live system, Memory not already in Categories, a tool exists,
+# and not -Unattended
+if ($script:IsLive -and ($Categories -notcontains "Memory") -and -not $Unattended) {
     $memCaptureTool = Find-MemoryCaptureTool
     foreach ($skipped in $script:skippedMemTools) {
         Write-Host "Memory capture: $skipped -- skipped (this is an ARM64 machine)." -ForegroundColor DarkGray
@@ -4118,6 +4127,8 @@ if ($memDumpMovedTo -and (Test-Path -LiteralPath $memDumpMovedTo)) {
     Write-Host "  Memory dump:    $memDumpMovedTo ($dumpGB GB)"
 }
 
-Write-Host ""
-Write-Host "Press any key to exit..." -ForegroundColor Cyan
-$null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+if (-not $Unattended) {
+    Write-Host ""
+    Write-Host "Press any key to exit..." -ForegroundColor Cyan
+    $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+}

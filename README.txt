@@ -1335,9 +1335,13 @@ capture before collection begins.
        (PERSIST-RUNKEY-STAGING), the program run from Downloads
        (EXEC-STAGING), the disabled task whose action is in Downloads
        (PERSIST-TASK-STAGING) and, with -Eicar, the EICAR detection
-       (AV-DETECTION-EICAR). These are required checks; they are skipped
-       (not failed) when there is no findings.csv, for example after a
-       builder run with -NoReport.
+       (AV-DETECTION-EICAR). A planted row counts when it is one of the
+       finding's evidence rows in findings.csv, or one of all its rows in
+       report-model.json next to it (findings.csv lists only the first
+       rows of a finding, so on a machine with many older timestomp
+       candidates the planted file can be beyond them). These are required
+       checks; they are skipped (not failed) when there is no findings.csv,
+       for example after a builder run with -NoReport.
        -PlantedFile <planted.json>  which planting to check (default: the
                                     newest TriageE2E_* folder in Downloads)
        -TimelinePath <timeline.csv> which timeline to check (default: the

@@ -67,26 +67,39 @@ Write-Host "Timeline:         $TimelinePath"
 
 # --- Timeline rows that mention the marker -----------------------
 # The timeline can hold hundreds of thousands of rows: only lines with the
-# marker (or EICAR) are parsed as CSV
+# marker (or EICAR) are parsed as CSV. Each kept line that starts a record
+# gets its row number as Excel and the report count it (header = row 1); a
+# quoted field can hold line breaks, so a record may span several lines.
 $eicarPlanted = $planted.Steps.Eicar -and $planted.Steps.Eicar.Status -eq "Planted"
 $keptLines = New-Object System.Collections.Generic.List[string]
+$keptNumbers = New-Object System.Collections.Generic.List[int]
 $reader = New-Object System.IO.StreamReader($TimelinePath, [System.Text.Encoding]::UTF8)
 try {
     $header = $reader.ReadLine()
+    $recordNumber = 1
+    $inQuotes = $false
     while ($null -ne ($line = $reader.ReadLine())) {
+        $startsRecord = -not $inQuotes
+        if ($startsRecord) { $recordNumber++ }
+        # An odd number of quote characters opens or closes a quoted field
+        if (($line.Length - $line.Replace('"', '').Length) % 2 -eq 1) { $inQuotes = -not $inQuotes }
         if ($line.IndexOf($planted.Id, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 -or
             ($eicarPlanted -and $line.IndexOf("EICAR", [System.StringComparison]::OrdinalIgnoreCase) -ge 0)) {
             $keptLines.Add($line)
+            $keptNumbers.Add($(if ($startsRecord) { $recordNumber } else { 0 }))
         }
     }
 } finally { $reader.Dispose() }
-$rows = @()
-if ($keptLines.Count -gt 0) {
-    $rows = @((@($header) + $keptLines) | ConvertFrom-Csv | ForEach-Object {
-        $_ | Add-Member -NotePropertyName Utc -NotePropertyValue ([datetime]::ParseExact($_.Timestamp, "yyyy-MM-dd HH:mm:ss.fff", $inv,
-            [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor [System.Globalization.DateTimeStyles]::AssumeUniversal)) -PassThru
-    })
-}
+$rows = @(for ($k = 0; $k -lt $keptLines.Count; $k++) {
+    # One line at a time, so each row keeps its own row number (a line that
+    # continues a multi-line record does not parse as a row and is skipped)
+    $row = @(@($header, $keptLines[$k]) | ConvertFrom-Csv) | Select-Object -First 1
+    $utc = [datetime]::MinValue
+    if (-not $row -or -not [datetime]::TryParseExact("$($row.Timestamp)", "yyyy-MM-dd HH:mm:ss.fff", $inv,
+            [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$utc)) { continue }
+    $row | Add-Member -NotePropertyName Utc -NotePropertyValue $utc
+    $row | Add-Member -NotePropertyName RowNumber -NotePropertyValue $keptNumbers[$k] -PassThru
+})
 Write-Host "Rows with the marker: $($rows.Count)"
 Write-Host ""
 
@@ -192,6 +205,18 @@ if (Test-Path -LiteralPath $FindingsPath) {
     # findings.csv: one row per evidence line (RowNumber filled) plus a
     # summary line per finding (RowNumber blank); match evidence rows only
     $findingRows = @(Import-Csv -LiteralPath $FindingsPath)
+    # findings.csv lists only the first evidence rows of a finding (up to its
+    # rule's limit); report-model.json next to it has all of them
+    # (RowNumbers), so a planted row beyond that limit is still found
+    $modelPath = Join-Path (Split-Path $FindingsPath -Parent) "report-model.json"
+    $modelFindings = @()
+    if (Test-Path -LiteralPath $modelPath) {
+        try {
+            $reportModel = Get-Content -LiteralPath $modelPath -Raw | ConvertFrom-Json
+            $modelFindings = @(@($reportModel.Findings) + @($reportModel.InfoFindings) | Where-Object { $_ })
+        }
+        catch { Write-Host "Could not read $modelPath ($($_.Exception.Message)); checking findings.csv only" -ForegroundColor DarkYellow }
+    }
     # Step: the planted action; RuleId: the report rule that must flag it;
     # Text: a regex that must appear in the finding evidence row's Description
     $reportChecks = @(
@@ -213,14 +238,28 @@ if (Test-Path -LiteralPath $FindingsPath) {
         $hit = @($findingRows | Where-Object {
             $_.RuleId -eq $rc.RuleId -and "$($_.RowNumber)".Trim() -ne "" -and ("$($_.Description)" -match $rc.Text)
         })
+        # Not among the listed evidence: is a planted row among all the rows of
+        # a finding of that rule (report-model.json)?
+        $modelHit = $null
+        if ($hit.Count -eq 0) {
+            $plantedRows = @($rows | Where-Object { $_.RowNumber -gt 0 -and "$($_.Description)" -match $rc.Text } | ForEach-Object { [int]$_.RowNumber })
+            foreach ($mf in @($modelFindings | Where-Object { $_.RuleId -eq $rc.RuleId })) {
+                $numbers = @($mf.RowNumbers | ForEach-Object { [int]$_ })
+                $common = @($plantedRows | Where-Object { $numbers -contains $_ })
+                if ($common.Count -gt 0) { $modelHit = [PSCustomObject]@{ Finding = $mf; Row = $common[0] }; break }
+            }
+        }
         if ($hit.Count -gt 0) {
             $f0 = $hit[0]
             $text = "$($f0.Description)"
             if ($text.Length -gt 80) { $text = $text.Substring(0, 77) + "..." }
             Write-Host "  PASS  $label $($f0.FindingId)/$($f0.Severity) row $($f0.RowNumber)  $text" -ForegroundColor Green
             $requiredPassed++
+        } elseif ($modelHit) {
+            Write-Host "  PASS  $label $($modelHit.Finding.Id)/$($modelHit.Finding.Severity) row $($modelHit.Row)  (beyond the evidence rows findings.csv lists; in the finding's rows in report-model.json)" -ForegroundColor Green
+            $requiredPassed++
         } else {
-            $reason = "no $($rc.RuleId) finding evidence row matching the planted marker"
+            $reason = "no $($rc.RuleId) finding holds a row with the planted marker (evidence rows in findings.csv, or all rows in report-model.json)"
             Write-Host "  FAIL  $label $reason" -ForegroundColor Red
             if ($env:GITHUB_ACTIONS) { Write-Host "::error::$($rc.Name): $reason" }
         }

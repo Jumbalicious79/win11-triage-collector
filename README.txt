@@ -700,14 +700,21 @@ The fastest path from collection to analysis:
 
   - NTUSER.DAT and UsrClass.dat for the active user are locked. The script
     tries reg save via HKU\SID (works for logged-in users), then VSS shadow
-    copy, then direct copy. On most systems reg save succeeds.
+    copy, then direct copy. On most systems reg save succeeds. Each hive
+    gets one line naming the method that collected it.
+    Log: "Collected NTUSER.DAT for <user> via reg save" (or "via shadow
+    copy", "via direct copy")
 
   - Hives of system service accounts (e.g., WsiAccount) are usually not
     loaded, so reg save does not apply; they are taken from the shadow copy.
     These are not real user accounts and contain minimal forensic data. If
-    the shadow copy cannot provide a hive, the warning gives the reason and
-    the direct copy is tried next.
-    Warning: "Shadow copy of Users\WsiAccount\NTUSER.DAT did not produce output file -- <reason>"
+    the shadow copy cannot provide a hive, the direct copy is tried next
+    (for a locked file it falls back to a raw NTFS read). When the direct
+    copy succeeds, nothing is counted as an error (if the shadow copy
+    failed, the line gives its reason); only a hive that no method
+    collects gives a warning and counts as one error.
+    Log: "Collected NTUSER.DAT for WsiAccount via shadow copy"
+    Warning: "Could not collect NTUSER.DAT for WsiAccount -- shadow copy: <reason>"
 
   - Hidden files are collected, including the Amcache.hve transaction logs
     (.LOG1/.LOG2) and the hidden NTUSER.DAT / UsrClass.dat of users who are
@@ -715,14 +722,17 @@ The fastest path from collection to analysis:
     jump lists, browser profiles, scheduled task XML, Defender and
     third-party AV logs) include hidden and system files. (Earlier versions
     skipped those in listings, and copied hidden files and then deleted
-    them as "empty".) Locked Amcache logs are taken from the shadow copy or
-    by raw NTFS read; if the hive is still dirty without its logs, the
-    timeline builder skips Amcache parsing for that collection. It is
-    normal for one of .LOG1/.LOG2 to be 0 bytes (Windows can write only one
-    of them for long periods): an empty log holds nothing to collect and is
-    skipped, not counted as an error (logged as info when it comes from the
-    shadow copy).
+    them as "empty".) Amcache.hve and its logs are taken from the shadow
+    copy, else by direct copy (raw NTFS read for a locked file), with one
+    line per file as for the user hives; if the hive is still dirty without
+    its logs, the timeline builder skips Amcache parsing for that
+    collection. It is normal for one of .LOG1/.LOG2 to be 0 bytes (Windows
+    can write only one of them for long periods): an empty log holds
+    nothing to collect, is logged as skipped (info) and is not counted as an
+    error. A hive or log missing from the target altogether (e.g. no
+    Amcache in an image of an older Windows) is a warning, not an error.
     Log: "Skipped empty file (0 bytes in the shadow copy): Windows\AppCompat\Programs\Amcache.hve.LOG2"
+    Warning: "Amcache.hve not found at <path>"
 
   - A file is reported as not collected only when the normal copy, the
     shadow copy and the raw NTFS read all fail.
@@ -865,6 +875,17 @@ capture before collection begins.
     one gives a warning with the reason and counts one error; with -Quiet
     nothing is logged or counted.
       powershell -ExecutionPolicy Bypass -File tests\Test-ShadowCopy.ps1
+
+  tests\Test-CollectionLogging.ps1 (no admin needed; also runs in CI)
+    Checks what is logged and counted when a hive (Amcache.hve and its
+    logs, NTUSER.DAT, UsrClass.dat) is taken from the shadow copy or by
+    direct copy, with folders standing in for the snapshot and the volume:
+    one line per hive naming the method; an empty one is info; a shadow
+    copy failure that the direct copy recovers is no error; a hive that no
+    method collects is one warning and one error. Also checks that the
+    LNK, jump-list, Prefetch and task XML counts include a file saved under
+    a shortened name or with [ ] in its name.
+      powershell -ExecutionPolicy Bypass -File tests\Test-CollectionLogging.ps1
 
   Planted-activity test (both tools, end to end, on a live machine)
     1. In a normal (not elevated) PowerShell window, as the user to test:

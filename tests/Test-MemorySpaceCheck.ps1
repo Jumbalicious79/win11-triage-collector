@@ -16,10 +16,13 @@
 #   - the memory section, run with a stand-in capture tool: no room (an
 #     error, no capture), low reserve (a warning, capture), a complete dump
 #     (recorded), a failed, empty or missing one (an error; set aside out of
-#     the collection or deleted), -MemoryOutputPath;
+#     the collection or deleted; left and named when it is locked),
+#     -MemoryOutputPath;
 #   - the summary and compression step with a dump: moved next to the zip,
-#     kept with the folder (no zip) when it cannot be moved, left where
-#     -MemoryOutputPath put it.
+#     kept with the folder (no zip, the summary corrected) when it cannot be
+#     moved, left where -MemoryOutputPath put it (the -MemoryDumpPath hint
+#     only when that is not next to the zip); a failed dump still in the
+#     folder: set aside then, or no zip.
 # No admin rights needed. Exit code 0 = pass, 1 = fail.
 #
 #   powershell -ExecutionPolicy Bypass -File tests\Test-MemorySpaceCheck.ps1
@@ -330,9 +333,13 @@ try {
     $script:testRamBytes = [long]0
     function Get-PhysicalMemoryBytes { return $script:testRamBytes }
     # The capture tool: a function run as "& $memTool /TYPE DMP ... /OUTPUT
-    # <file>" that writes a dump of DumpBytes (-1: none) and prints Lines
+    # <file>" that writes a dump of DumpBytes (-1: none) and prints Lines.
+    # With $script:lockDump it leaves the dump open for reading only (no
+    # rename, no delete) in $script:testLock, as a scanner could
     $script:standIn = $null
     $script:toolCalls = 0
+    $script:lockDump = $false
+    $script:testLock = $null
     function Invoke-TestCaptureTool {
         $script:toolCalls++
         $outFile = $null
@@ -340,6 +347,7 @@ try {
         if ($script:standIn.DumpBytes -ge 0) {
             $stream = [System.IO.File]::Create($outFile)
             try { $stream.SetLength($script:standIn.DumpBytes) } finally { $stream.Dispose() }
+            if ($script:lockDump) { $script:testLock = [System.IO.File]::Open($outFile, "Open", "Read", "Read") }
         }
         foreach ($line in $script:standIn.Lines) { $line }
         if ($script:standIn.Throw) { throw $script:standIn.Throw }
@@ -423,11 +431,13 @@ try {
     if ($run.Accepted) { $problems.Add("marked as accepted anyway") }
     Add-Result "prompt: run 2, other drive chosen" $problems -Info "D:\TriageMemory"
 
-    $run = Invoke-Prompt -Answers @("0", "4", "two", "2")
+    # Bad answers are asked again: also one too large for an [int] and an
+    # empty one (neither may end the question or count as a choice)
+    $run = Invoke-Prompt -Answers @("0", "4", "two", "99999999999", "", "2")
     $problems = New-Problems
     if ($run.Thrown) { $problems.Add("prompt threw: $($run.Thrown)") }
     Test-LinesInOrder -Lines $run.Screen -Expected ($runTwoLines + @('^Memory capture enabled\. Will run first\.$')) -Problems $problems -Where "screen"
-    if ($run.Prompts.Count -ne 4 -or $run.AnswersLeft -ne 0) { $problems.Add("$($run.Prompts.Count) question(s), $($run.AnswersLeft) answer(s) left") }
+    if ($run.Prompts.Count -ne 6 -or $run.AnswersLeft -ne 0) { $problems.Add("$($run.Prompts.Count) question(s), $($run.AnswersLeft) answer(s) left") }
     if ($run.Categories[0] -ne "Memory" -or $run.MemoryOutputPath) { $problems.Add("Categories $($run.Categories -join ','), MemoryOutputPath '$($run.MemoryOutputPath)'") }
     if (-not $run.Accepted) { $problems.Add("not marked as accepted anyway") }
     Add-Result "prompt: run 2, here anyway (after bad answers)" $problems -Info "asked $($run.Prompts.Count) times"
@@ -554,9 +564,12 @@ try {
     }
 
     # Runs the memory section for a new collection folder; returns what it
-    # logged and left behind
+    # logged and left behind. LockDump: the dump stays open (see
+    # Invoke-TestCaptureTool) until the section is done; BlockIncomplete: a
+    # file at <dump>.incomplete, open the same way, so the dump cannot be
+    # renamed to it
     function Invoke-MemorySection {
-        param([string]$Name, [object]$StandIn, [string]$DumpDir = "", [object]$Volume = "default", [switch]$Accepted, [switch]$EarlierDump)
+        param([string]$Name, [object]$StandIn, [string]$DumpDir = "", [object]$Volume = "default", [switch]$Accepted, [switch]$EarlierDump, [switch]$LockDump, [switch]$BlockIncomplete)
         $script:OutputPath = Join-Path $workDir "$Name\TriageCollection_2026-01-02_03-04"
         New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null
         $script:logFile = Join-Path $OutputPath "collection_log.txt"
@@ -580,6 +593,13 @@ try {
             New-Item -ItemType Directory -Path (Split-Path $dumpPath -Parent) -Force | Out-Null
             [System.IO.File]::WriteAllText($dumpPath, "earlier dump")
         }
+        $blocker = $null
+        if ($BlockIncomplete) {
+            New-Item -ItemType Directory -Path (Split-Path $dumpPath -Parent) -Force | Out-Null
+            [System.IO.File]::WriteAllText("$dumpPath.incomplete", "blocker")
+            $blocker = [System.IO.File]::Open("$dumpPath.incomplete", "Open", "Read", "Read")
+        }
+        $script:lockDump = [bool]$LockDump
         $thrown = ""
         try {
             & {
@@ -587,6 +607,11 @@ try {
                 . $sectionBlock
             } 6>$null
         } catch { $thrown = $_.Exception.Message }
+        finally {
+            if ($script:testLock) { $script:testLock.Dispose(); $script:testLock = $null }
+            if ($blocker) { $blocker.Dispose() }
+            $script:lockDump = $false
+        }
         $rows = @()
         if (Test-Path -LiteralPath $manifestFile) {
             $rows = @(Import-Csv -LiteralPath $manifestFile)
@@ -735,6 +760,33 @@ try {
     if ($run.Incomplete -ne "$($run.DumpPath).incomplete" -or (Get-FileLength $run.Incomplete) -ne 4096 -or (Get-FileLength $run.DumpPath) -ge 0) { $problems.Add("incomplete '$($run.Incomplete)'") }
     Add-Result "section: -MemoryOutputPath, failed -> renamed" $problems
 
+    # ... and when it cannot be renamed: deleted, not left under the name
+    # the timeline builder looks for
+    $run = Invoke-MemorySection -Name "dumpdirblocked" -StandIn (New-StandIn -DumpBytes 4096 -ReportedBytes 4096) -DumpDir (Join-Path $workDir "dumps3") -BlockIncomplete
+    $problems = New-Problems
+    $dumpText = [regex]::Escape((ConvertTo-LogText $run.DumpPath))
+    Test-SectionRun $run @(
+        'ERROR: Memory capture failed: ',
+        "WARNING: Could not set the incomplete memory dump aside as $dumpText\.incomplete, deleting it so it is not taken for a good dump: ",
+        "Deleted the incomplete memory dump: $dumpText$"
+    ) 1 1 $problems
+    if ((Get-FileLength $run.DumpPath) -ge 0 -or $run.Incomplete -or $run.MemDumpPath) { $problems.Add("dump left ($(Get-FileLength $run.DumpPath) bytes), incomplete '$($run.Incomplete)'") }
+    if ((Get-FileLength "$($run.DumpPath).incomplete") -ne 7) { $problems.Add("the file already at .incomplete was changed") }
+    Add-Result "section: -MemoryOutputPath, failed, not renamed -> deleted" $problems
+
+    # A failed dump in Memory\ that can be neither moved nor deleted (open
+    # elsewhere): left, named; the compression step must not zip it (below)
+    $run = Invoke-MemorySection -Name "failedlocked" -StandIn (New-StandIn -DumpBytes 4096 -ReportedBytes 4096) -LockDump
+    $problems = New-Problems
+    $dumpText = [regex]::Escape((ConvertTo-LogText $run.DumpPath))
+    Test-SectionRun $run @(
+        'ERROR: Memory capture failed: ',
+        ("WARNING: Could not set the incomplete memory dump aside as " + [regex]::Escape((ConvertTo-LogText "${OutputPath}_memory_dump.dmp.incomplete")) + ", deleting it"),
+        "WARNING: Could not delete the incomplete memory dump, delete it by hand \(it is not complete, do not analyze it\): $dumpText$"
+    ) 1 1 $problems -Absent @('Incomplete memory dump kept outside', 'Deleted the incomplete')
+    if ($run.Incomplete -ne $run.DumpPath -or (Get-FileLength $run.DumpPath) -ne 4096 -or $run.MemDumpPath) { $problems.Add("incomplete '$($run.Incomplete)', $(Get-FileLength $run.DumpPath) bytes") }
+    Add-Result "section: failed, locked -> left, named" $problems
+
     # =========================================================
     # 7. Summary and compression with a dump
     # =========================================================
@@ -742,9 +794,13 @@ try {
     $script:startTime = Get-Date
     $script:TargetDrive = "C"
     # Runs the summary and compression steps on a small collection with a
-    # dump; returns the screen, the files left and the zip's entries
+    # dump; returns the screen, the log, the files left and the zip's
+    # entries. Incomplete: a failed dump the memory section set aside (at
+    # SetAside); IncompleteLeft: one it could neither set aside nor delete,
+    # still at the dump's path. LockDump: the file at the dump's path is
+    # open for reading only (no move, no delete) during the run
     function Invoke-Final {
-        param([string]$Name, [string]$DumpDir = "", [switch]$NoZip, [switch]$LockDump, [switch]$Incomplete)
+        param([string]$Name, [string]$DumpDir = "", [switch]$NoZip, [switch]$LockDump, [switch]$Incomplete, [switch]$IncompleteLeft)
         $script:OutputPath = Join-Path $workDir "$Name\TriageCollection_2026-01-02_03-04"
         New-Item -ItemType Directory -Path (Join-Path $OutputPath "Memory") -Force | Out-Null
         $script:logFile = Join-Path $OutputPath "collection_log.txt"
@@ -756,11 +812,19 @@ try {
         $script:errorCount = 0
         $script:totalBytes = 1000
         $dump = Get-MemoryDumpPath -ToolName "DumpIt" -DumpDir $DumpDir
+        $setAside = "$dump.incomplete"
+        if (-not $DumpDir) { $setAside = "${OutputPath}_memory_dump.dmp.incomplete" }
         New-Item -ItemType Directory -Path (Split-Path $dump -Parent) -Force | Out-Null
-        [System.IO.File]::WriteAllText($dump, "DUMP")
         $script:memDumpPath = $dump
         $script:memDumpIncompletePath = $null
-        if ($Incomplete) { $script:memDumpPath = $null; $script:memDumpIncompletePath = "$dump.incomplete" }
+        if ($Incomplete) {
+            [System.IO.File]::WriteAllText($setAside, "DUMP")
+            $script:memDumpPath = $null
+            $script:memDumpIncompletePath = $setAside
+        } else {
+            [System.IO.File]::WriteAllText($dump, "DUMP")
+        }
+        if ($IncompleteLeft) { $script:memDumpPath = $null; $script:memDumpIncompletePath = $dump }
         $lock = $null
         if ($LockDump) { $lock = [System.IO.File]::Open($dump, "Open", "Read", "Read") }
         try {
@@ -776,13 +840,17 @@ try {
             $zip = [System.IO.Compression.ZipFile]::OpenRead("$OutputPath.zip")
             try { $entries = @($zip.Entries | ForEach-Object { $_.FullName }) } finally { $zip.Dispose() }
         }
+        $logged = @()
+        if (Test-Path -LiteralPath $logFile) { $logged = @(Get-Content -LiteralPath $logFile) }
         return [PSCustomObject]@{
-            Screen  = $screen
-            Dump    = $dump
-            Next    = "${OutputPath}_memory_dump.dmp"
-            Folder  = Test-Path -LiteralPath $OutputPath
-            Zip     = Test-Path -LiteralPath "$OutputPath.zip"
-            Entries = $entries
+            Screen   = $screen
+            Log      = $logged
+            Dump     = $dump
+            SetAside = $setAside
+            Next     = "${OutputPath}_memory_dump.dmp"
+            Folder   = Test-Path -LiteralPath $OutputPath
+            Zip      = Test-Path -LiteralPath "$OutputPath.zip"
+            Entries  = $entries
         }
     }
 
@@ -800,17 +868,57 @@ try {
     if (@($final.Entries | Where-Object { $_ -like "*/Memory/memory_acquisition_log.txt" }).Count -ne 1) { $problems.Add("acquisition log not in the zip") }
     Add-Result "compression: dump moved next to the zip" $problems
 
+    # The summary, logged before compression, named the path next to the
+    # zip: corrected in the log, and on screen at the end
     $final = Invoke-Final -Name "locked" -LockDump
     $problems = New-Problems
+    $correctedLine = '  Memory dump:    ' + [regex]::Escape($final.Dump) + ' \(not moved out, the folder is not zipped\)$'
     Test-LinesInOrder -Lines $final.Screen -Expected @(
         'WARNING: Could not move the memory dump out of the collection folder, so the folder is not compressed: ',
         'The collection is kept at: ',
+        ('\] ' + $correctedLine),
+        '^  COLLECTION SUMMARY$',
+        ('^' + $correctedLine),
         'Zip NOT created -- collection left at: ',
         ('^  Memory dump:    ' + [regex]::Escape($final.Dump) + ' \(')
     ) -Problems $problems -Where "screen"
+    if (@($final.Screen | Where-Object { $_ -match '^  Memory dump:.*kept outside the zip' }).Count -gt 0) { $problems.Add("the summary on screen names the path next to the zip") }
+    $correctedLog = '\] ' + [regex]::Escape('  Memory dump:    ' + (ConvertTo-LogText $final.Dump) + ' (not moved out, the folder is not zipped)') + '$'
+    Test-LinesInOrder -Lines $final.Log -Expected @('kept outside the zip\)$', 'WARNING: Could not move the memory dump out', $correctedLog) -Problems $problems -Where "collection_log.txt"
     if (@($final.Screen | Where-Object { $_ -match 'Compressing to:' }).Count -gt 0) { $problems.Add("compression started") }
     if ($final.Zip -or -not $final.Folder -or (Get-FileLength $final.Dump) -ne 4) { $problems.Add("zip $($final.Zip), folder kept $($final.Folder), dump in it $((Get-FileLength $final.Dump) -eq 4)") }
     Add-Result "compression: dump not movable -> no zip, folder kept" $problems
+
+    # A failed dump still in Memory\ (the section could neither set it
+    # aside nor delete it): tried again; still locked -> no zip
+    $final = Invoke-Final -Name "incompleteleft" -IncompleteLeft -LockDump
+    $problems = New-Problems
+    Test-LinesInOrder -Lines $final.Screen -Expected @(
+        'WARNING: Could not set the incomplete memory dump aside as ',
+        ('WARNING: Could not delete the incomplete memory dump, delete it by hand \(it is not complete, do not analyze it\): ' + [regex]::Escape($final.Dump) + '$'),
+        ('\]   Memory dump:    INCOMPLETE, not for analysis: ' + [regex]::Escape($final.Dump) + '$'),
+        ('WARNING: The incomplete memory dump is still in the collection folder, so the folder is not compressed: ' + [regex]::Escape($final.Dump) + '$'),
+        'The collection is kept at: ',
+        'Zip NOT created -- collection left at: '
+    ) -Problems $problems -Where "screen"
+    if (@($final.Screen | Where-Object { $_ -match 'Compressing to:|Memory dump detected' }).Count -gt 0) { $problems.Add("compression started, or the dump taken for a good one") }
+    if ($final.Zip -or -not $final.Folder -or (Get-FileLength $final.Dump) -ne 4) { $problems.Add("zip $($final.Zip), folder kept $($final.Folder), dump in it $((Get-FileLength $final.Dump) -eq 4)") }
+    Add-Result "compression: failed dump still in the folder -> no zip" $problems
+
+    # ... and when it can be moved by then: set aside, the folder zipped
+    # without it
+    $final = Invoke-Final -Name "incompleteretry" -IncompleteLeft
+    $problems = New-Problems
+    Test-LinesInOrder -Lines $final.Screen -Expected @(
+        ('WARNING: Incomplete memory dump kept outside the collection \(not zipped, not for analysis\): ' + [regex]::Escape($final.SetAside)),
+        ('\]   Memory dump:    INCOMPLETE, not for analysis: ' + [regex]::Escape($final.SetAside) + '$'),
+        'OK: Compressed to ',
+        ('^  Memory dump:    INCOMPLETE, not for analysis: ' + [regex]::Escape($final.SetAside) + '$')
+    ) -Problems $problems -Where "screen"
+    if (-not $final.Zip -or $final.Folder) { $problems.Add("zip $($final.Zip), folder kept $($final.Folder)") }
+    if ((Get-FileLength $final.SetAside) -ne 4) { $problems.Add("not set aside at $($final.SetAside)") }
+    if (@($final.Entries | Where-Object { $_ -like "*memory_dump*" }).Count -gt 0) { $problems.Add("dump in the zip") }
+    Add-Result "compression: failed dump set aside at the end -> zip" $problems
 
     $final = Invoke-Final -Name "dumpdir" -DumpDir (Join-Path $workDir "dumpdir-final")
     $problems = New-Problems
@@ -834,8 +942,20 @@ try {
 
     $final = Invoke-Final -Name "incomplete" -NoZip -Incomplete
     $problems = New-Problems
-    Test-LinesInOrder -Lines $final.Screen -Expected @(('^  Memory dump:    INCOMPLETE, not for analysis: ' + [regex]::Escape("$($final.Dump).incomplete") + '$')) -Problems $problems -Where "screen"
+    Test-LinesInOrder -Lines $final.Screen -Expected @(('^  Memory dump:    INCOMPLETE, not for analysis: ' + [regex]::Escape($final.SetAside) + '$')) -Problems $problems -Where "screen"
+    if (@($final.Screen | Where-Object { $_ -match 'WARNING' }).Count -gt 0) { $problems.Add("a warning for a dump already set aside") }
+    if ((Get-FileLength $final.SetAside) -ne 4) { $problems.Add("set-aside dump moved") }
     Add-Result "summary: incomplete dump named" $problems
+
+    # -MemoryOutputPath = the folder that holds the collection and its zip:
+    # the dump is where the timeline builder looks, so no -MemoryDumpPath hint
+    $final = Invoke-Final -Name "dumpdirparent" -DumpDir (Join-Path $workDir "dumpdirparent")
+    $problems = New-Problems
+    if ($final.Dump -ne $final.Next) { $problems.Add("dump path '$($final.Dump)', expected '$($final.Next)'") }
+    Test-LinesInOrder -Lines $final.Screen -Expected @(('\]   Memory dump:    ' + [regex]::Escape($final.Dump) + '$'), 'OK: Compressed to ', ('^  Memory dump:    ' + [regex]::Escape($final.Dump) + '$')) -Problems $problems -Where "screen"
+    if (@($final.Screen | Where-Object { $_ -match 'timeline builder|Memory dump detected' }).Count -gt 0) { $problems.Add("-MemoryDumpPath hint, or the dump moved") }
+    if (-not $final.Zip -or (Get-FileLength $final.Dump) -ne 4 -or @($final.Entries | Where-Object { $_ -like "*memory_dump*" }).Count -gt 0) { $problems.Add("zip $($final.Zip), dump left $((Get-FileLength $final.Dump) -eq 4)") }
+    Add-Result "summary: -MemoryOutputPath next to the zip, no hint" $problems
 }
 catch {
     $failures++

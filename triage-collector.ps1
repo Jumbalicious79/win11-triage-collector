@@ -602,13 +602,15 @@ if ($script:IsLive -and ($Categories -notcontains "Memory")) {
                 Write-Host "  [$($i + 1)] $($memChoices[$i].Label)" -ForegroundColor $choiceColor
             }
             Write-Host ""
+            # The answers as text: no cast that can fail on a long number
+            $memAnswers = @(1..$memChoices.Count | ForEach-Object { "$_" })
             do {
                 $memAnswer = Read-Host "Include memory capture? (1-$($memChoices.Count))"
-            } while (-not ($memAnswer -match '^\d+$' -and [int]$memAnswer -ge 1 -and [int]$memAnswer -le $memChoices.Count))
+            } while ($memAnswer -notin $memAnswers)
             $memChoice = $memChoices[[int]$memAnswer - 1]
         }
 
-        if ($memChoice.Action -eq "Skip") {
+        if (-not $memChoice -or $memChoice.Action -eq "Skip") {
             Write-Host ""
             Write-Host "Memory capture skipped." -ForegroundColor DarkGray
             Write-Host ""
@@ -1096,31 +1098,28 @@ function Get-MemoryCaptureResult {
 # A memory dump that failed the checks must not be zipped or taken for a
 # good one. An empty file is deleted. Anything else is kept for a look but
 # renamed to <name>.incomplete; one in the collection folder is moved out
-# of it, next to it (<collection>_memory_dump.dmp.incomplete), and if that
-# fails it is deleted. Returns the path the file is left at, or $null.
+# of it, next to it (<collection>_memory_dump.dmp.incomplete). If that
+# fails it is deleted: left under the dump's name, the zip or the timeline
+# builder would take it. Returns the path the file is left at (the dump's
+# own path when it could be neither set aside nor deleted), or $null.
 function Move-IncompleteMemoryDump {
     param([string]$DumpPath)
     $length = Get-FileLength $DumpPath
     if ($length -lt 0) { return $null }
-    $inCollection = [bool](Get-CollectionRelativePath $DumpPath)
     if ($length -gt 0) {
         $target = "$DumpPath.incomplete"
-        if ($inCollection) { $target = "${OutputPath}_$([System.IO.Path]::GetFileName($DumpPath)).incomplete" }
+        if (Get-CollectionRelativePath $DumpPath) { $target = "${OutputPath}_$([System.IO.Path]::GetFileName($DumpPath)).incomplete" }
         try {
             Move-Item -LiteralPath $DumpPath -Destination $target -Force -ErrorAction Stop
             Log-Warning "Incomplete memory dump kept outside the collection (not zipped, not for analysis): $target ($([math]::Round($length / 1GB, 2)) GB)"
             return $target
         } catch {
-            if (-not $inCollection) {
-                Log-Warning "Could not rename the incomplete memory dump ($($_.Exception.Message)); it is not complete, do not analyze it: $DumpPath"
-                return $DumpPath
-            }
-            Log-Warning "Could not move the incomplete memory dump out of the collection, deleting it so it is not zipped: $($_.Exception.Message)"
+            Log-Warning "Could not set the incomplete memory dump aside as $target, deleting it so it is not taken for a good dump: $($_.Exception.Message)"
         }
     }
     Remove-Item -LiteralPath $DumpPath -Force -ErrorAction SilentlyContinue
     if ((Get-FileLength $DumpPath) -ge 0) {
-        Log-Warning "Could not delete the incomplete memory dump, delete it by hand: $DumpPath"
+        Log-Warning "Could not delete the incomplete memory dump, delete it by hand (it is not complete, do not analyze it): $DumpPath"
         return $DumpPath
     }
     if ($length -eq 0) { Log "Deleted the empty memory dump file: $DumpPath" }
@@ -4735,7 +4734,14 @@ $zipCompleted = $false   # set once New-CollectionZip has written the whole zip
 # complete dump (in Memory\, or with -MemoryOutputPath outside the folder)
 $memDumpInCollection = [bool]($script:memDumpPath -and (Get-CollectionRelativePath $script:memDumpPath))
 $memDumpMovedTo = $null
-$memDumpMoveFailed = $false   # the dump could not be moved out: no zip
+$memDumpMoveFailed = $false   # a dump could not be moved out of the folder: no zip
+# A failed dump the memory section could neither set aside nor delete (a
+# lock) is still under the dump's name: try once more. One still in the
+# collection folder then keeps the folder from being zipped
+if ($script:memDumpIncompletePath -and -not $script:memDumpIncompletePath.EndsWith(".incomplete", [System.StringComparison]::OrdinalIgnoreCase)) {
+    $script:memDumpIncompletePath = Move-IncompleteMemoryDump -DumpPath $script:memDumpIncompletePath
+}
+$memDumpIncompleteInCollection = [bool]($script:memDumpIncompletePath -and (Get-CollectionRelativePath $script:memDumpIncompletePath))
 
 $summaryLines = @(
     "============================================================="
@@ -4755,12 +4761,16 @@ if ($NoCompress) {
 } else {
     $summaryLines += "  Output:         $zipPath"
 }
+$memDumpSummaryIndex = -1   # the line to correct if the dump cannot be moved
 if ($memDumpInCollection -and -not $NoCompress) {
+    $memDumpSummaryIndex = $summaryLines.Count
     $summaryLines += "  Memory dump:    ${OutputPath}_$([System.IO.Path]::GetFileName($script:memDumpPath)) (kept outside the zip)"
 } elseif ($script:memDumpPath) {
     $summaryLines += "  Memory dump:    $($script:memDumpPath)"
-    # Not in the collection and not next to it, where the builder looks
-    if (-not $memDumpInCollection -and $script:memDumpPath -ne "${OutputPath}_$([System.IO.Path]::GetFileName($script:memDumpPath))") {
+    # Not in the collection and not next to it (in the folder that holds
+    # the collection and its zip, under <collection>_memory_dump.<ext>, as
+    # -MemoryOutputPath names it), where the builder looks
+    if (-not $memDumpInCollection -and [System.IO.Path]::GetDirectoryName($script:memDumpPath) -ne [System.IO.Path]::GetDirectoryName($OutputPath)) {
         $summaryLines += "                  (timeline builder: pass it as -MemoryDumpPath)"
     }
 }
@@ -4854,6 +4864,10 @@ if (-not $NoCompress) {
             Log "The collection is kept at: $OutputPath"
             $memDumpMovedTo = $null
             $memDumpMoveFailed = $true
+            # The summary (logged above, shown again at the end) names the
+            # path next to the zip: correct it
+            $summaryLines[$memDumpSummaryIndex] = "  Memory dump:    $($script:memDumpPath) (not moved out, the folder is not zipped)"
+            Log $summaryLines[$memDumpSummaryIndex]
         }
         # Remove empty Memory folder if only the dump was in it
         $memDir = Join-Path $OutputPath "Memory"
@@ -4861,6 +4875,14 @@ if (-not $NoCompress) {
         if ($memDirContents.Count -eq 0) {
             Remove-Item -LiteralPath $memDir -Recurse -Force -ErrorAction SilentlyContinue
         }
+    }
+    # A failed dump still in the folder (neither set aside nor deleted, also
+    # not on the second try before the summary) would be zipped under the
+    # dump's name and taken for a good one
+    if ($memDumpIncompleteInCollection) {
+        Log-Warning "The incomplete memory dump is still in the collection folder, so the folder is not compressed: $($script:memDumpIncompletePath)"
+        Log "The collection is kept at: $OutputPath (delete the incomplete dump from it before analysis)"
+        $memDumpMoveFailed = $true
     }
 }
 

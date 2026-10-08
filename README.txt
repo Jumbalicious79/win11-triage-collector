@@ -241,7 +241,10 @@ versions run by the .bat launcher (Windows PowerShell 5.1) use "\"; Windows
 tools and the timeline builder read both. A file already at the zip path
 (an earlier run with the same -OutputPath) is replaced, and the log says so.
 If compression fails, the incomplete zip is deleted, the uncompressed folder
-is kept and the log says why.
+is kept and the log says why. If the memory dump cannot be moved out of the
+collection folder (another program has it open), the folder is not zipped,
+so the dump does not end up in the zip; the log and the summary say where it
+is.
 
 Inside the zip:
 
@@ -752,17 +755,29 @@ The fastest path from collection to analysis:
 
   - Memory capture is skipped, and counted as an error, when the dump would
     not fit where it goes: less than 1 GB would be left, or the drive is
-    FAT32 and the dump is 4 GB or more. The other artifacts are still
-    collected. With less than the system drive's reserve left it runs with
-    a warning (on a run without the prompt, e.g. -Categories Memory).
+    FAT32 and the dump is 4 GB or more. It is also skipped as an error when
+    a file is already at the dump's path (an earlier dump is never
+    overwritten). The other artifacts are still collected. With less than
+    the system drive's reserve left it runs with a warning (on a run
+    without the prompt, e.g. -Categories Memory).
     Error: "Memory capture skipped: less than 1 GB would be left free on C:\. ..."
+    Error: "Memory capture skipped: a file is already at <dump path> (an earlier run?). ..."
     Warning: "Capturing anyway: C:\ would be left with ~3.9 GB free, less than the 20 GB to keep free on the system drive. ..."
 
   - A memory dump that fails the checks after the capture (see Memory
-    Capture Setup) is an error and is never zipped or used: an empty one
-    is deleted, anything else is renamed to
-    <collection>_memory_dump.dmp.incomplete next to the collection folder.
+    Capture Setup) is an error, is not recorded in the manifest and is not
+    zipped: an empty one is deleted, anything else is renamed to
+    <name>.incomplete -- for a dump in Memory\, next to the collection
+    folder (<collection>_memory_dump.dmp.incomplete); for one written with
+    -MemoryOutputPath (or to a drive chosen at the prompt), in that folder
+    (<collection>_memory_dump.dmp.incomplete there). If it cannot be
+    renamed it is deleted. One that can be neither renamed nor deleted
+    (another program has it open) is tried again at the end of the run; if
+    it is then still in the collection folder, the folder is not zipped.
+    The summary names a failed dump as INCOMPLETE; one still under the
+    dump's name must be deleted by hand before the collection is analyzed.
     Error: "Memory capture failed: DumpIt reported NtStatus 0xC000007F; ..."
+    Warning: "Could not delete the incomplete memory dump, delete it by hand (it is not complete, do not analyze it): ..."
 
   - Per-user live registry data (Run/RunOnce keys, RecentApps) covers every
     user whose hive is loaded, i.e. users logged in at collection time, not
@@ -1083,9 +1098,13 @@ capture before collection begins.
     (nonzero NtStatus, short file, an "Error:" line). The memory section
     with a stand-in tool: no room (an error, no capture), low reserve (a
     warning), a complete, failed, empty or missing dump, an earlier dump at
-    the path, -MemoryOutputPath. The summary and compression step: the
-    dump moved next to the zip, or the folder kept unzipped when it cannot
-    be moved.
+    the path, -MemoryOutputPath, a failed dump that cannot be renamed or is
+    held open. The summary and compression step: the dump moved next to the
+    zip, or the folder kept unzipped (and the summary corrected) when it
+    cannot be moved; the -MemoryDumpPath hint only for a dump that is not
+    next to the zip; a failed dump still in the folder set aside then, or
+    the folder not zipped. The prompt asks again after a bad answer (also a
+    number too large for an [int]).
       powershell -ExecutionPolicy Bypass -File tests\Test-MemorySpaceCheck.ps1
 
   Planted-activity test (both tools, end to end, on a live machine)

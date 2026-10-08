@@ -691,7 +691,10 @@ The fastest path from collection to analysis:
     A raw read is not a point-in-time snapshot: a file being written during
     the read can come out inconsistent. NTFS-compressed and EFS-encrypted
     files cannot be read this way. Empty files are skipped (there is nothing
-    to collect; Chromium browsers keep 0-byte SQLite journals open).
+    to collect; Chromium browsers keep 0-byte SQLite journals open). A file
+    that is 0 bytes in the shadow copy is skipped the same way and is not
+    counted as an error; the live file is still tried next, in case it has
+    grown since the snapshot.
     Log: "Collected by raw NTFS read (file in use, not available from a
     shadow copy)"
 
@@ -699,10 +702,12 @@ The fastest path from collection to analysis:
     tries reg save via HKU\SID (works for logged-in users), then VSS shadow
     copy, then direct copy. On most systems reg save succeeds.
 
-  - System service accounts (e.g., WsiAccount) may have locked or inaccessible
-    hive files. Shadow copy attempts will fail for these. This is normal --
-    these are not real user accounts and contain minimal forensic data.
-    Warning: "Shadow copy of Users\WsiAccount\NTUSER.DAT did not produce output"
+  - Hives of system service accounts (e.g., WsiAccount) are usually not
+    loaded, so reg save does not apply; they are taken from the shadow copy.
+    These are not real user accounts and contain minimal forensic data. If
+    the shadow copy cannot provide a hive, the warning gives the reason and
+    the direct copy is tried next.
+    Warning: "Shadow copy of Users\WsiAccount\NTUSER.DAT did not produce output file -- <reason>"
 
   - Hidden files are collected, including the Amcache.hve transaction logs
     (.LOG1/.LOG2) and the hidden NTUSER.DAT / UsrClass.dat of users who are
@@ -712,7 +717,11 @@ The fastest path from collection to analysis:
     skipped those in listings, and copied hidden files and then deleted
     them as "empty".) Locked Amcache logs are taken from the shadow copy or
     by raw NTFS read; if the hive is still dirty without its logs, the
-    timeline builder skips Amcache parsing for that collection.
+    timeline builder skips Amcache parsing for that collection. It is
+    normal for one of .LOG1/.LOG2 to be 0 bytes (Windows can write only one
+    of them for long periods): an empty log holds nothing to collect and is
+    logged as info, not counted as an error.
+    Log: "Skipped empty file (0 bytes in the shadow copy): Windows\AppCompat\Programs\Amcache.hve.LOG2"
 
   - A file is reported as not collected only when the normal copy, the
     shadow copy and the raw NTFS read all fail.
@@ -846,6 +855,15 @@ capture before collection begins.
     files in clusters and inside the MFT record, a non-ASCII name, a sparse
     file, a file extended past its written data, and an NTFS-compressed
     file, which the raw read must decline cleanly.
+
+  tests\Test-ShadowCopy.ps1 (no admin needed; also runs in CI)
+    Checks how a copy from the shadow copy is reported, with a folder
+    standing in for the snapshot: a hidden file is copied and listed in the
+    manifest with its hash and original time; an empty one is logged as
+    skipped and is not an error; a missing one is "Not present"; a locked
+    one gives a warning with the reason and counts one error; with -Quiet
+    nothing is logged or counted.
+      powershell -ExecutionPolicy Bypass -File tests\Test-ShadowCopy.ps1
 
   Planted-activity test (both tools, end to end, on a live machine)
     1. In a normal (not elevated) PowerShell window, as the user to test:

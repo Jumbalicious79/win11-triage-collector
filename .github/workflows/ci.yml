@@ -61,6 +61,26 @@ jobs:
       - name: Run raw copy test
         run: ./tests/Test-RawCopy.ps1
 
+  unit-tests:
+    # Tests of single collector functions, loaded from the script's syntax
+    # tree: no collection runs and no admin rights are needed. Steps after
+    # the first run under !cancelled(), so one failing test does not hide
+    # the results of the others
+    name: Unit tests (${{ matrix.shell }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shell: [powershell, pwsh]
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Run shadow copy test
+        run: ./tests/Test-ShadowCopy.ps1
+
   analyze:
     name: PSScriptAnalyzer
     runs-on: windows-latest

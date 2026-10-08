@@ -85,6 +85,10 @@ jobs:
         if: ${{ !cancelled() }}
         run: ./tests/Test-CollectionLogging.ps1
 
+      - name: Run collection zip test
+        if: ${{ !cancelled() }}
+        run: ./tests/Test-CollectionZip.ps1
+
   analyze:
     name: PSScriptAnalyzer
     runs-on: windows-latest

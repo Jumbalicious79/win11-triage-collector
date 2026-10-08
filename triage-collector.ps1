@@ -277,6 +277,12 @@ if (-not $OutputPath) {
 # Use an absolute path: .NET file APIs resolve relative paths against the
 # process directory, not the PowerShell location
 $OutputPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputPath)
+# No trailing '\' (except for a root such as D:\ or \\server\share\): the zip
+# and a memory dump are written next to the folder as "<folder>.zip" and
+# "<folder>_memory_dump.dmp", and D:\out\ would put them inside it
+if ($OutputPath.TrimEnd('\') -ne [System.IO.Path]::GetPathRoot($OutputPath).TrimEnd('\')) {
+    $OutputPath = $OutputPath.TrimEnd('\')
+}
 
 # Create output directory structure
 New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null
@@ -4086,6 +4092,7 @@ try {
 $endTime = Get-Date
 $duration = $endTime - $script:startTime
 $zipPath = "$OutputPath.zip"
+$zipCompleted = $false   # set once New-CollectionZip has written the whole zip
 # Memory dump, if captured: memory_dump.dmp (DumpIt) or memory_dump.raw
 $memDumpFile = $null
 foreach ($dumpExt in @("dmp", "raw")) {
@@ -4126,6 +4133,54 @@ Log "=== Windows Forensic Triage Collection Complete ==="
 # =============================================================
 # Compression
 # =============================================================
+
+# Zips a folder with '/' in every entry name, as the ZIP format requires
+# (APPNOTE 4.4.17.1); entries start with "<folder>/". Not
+# ZipFile.CreateFromDirectory: powershell.exe has no target framework, so
+# .NET Framework applies its 4.0 default for
+# Switch.System.IO.Compression.ZipFile.UseBackslash (true) and writes '\'
+# (turning the switch off is ignored once anything has read it). Same
+# writer as CreateFromDirectory (CreateEntryFromFile): Zip64 when needed,
+# Optimal, file times, every file (hidden ones too), and an entry per
+# empty folder. On any failure the partial zip is deleted and the error
+# is rethrown (the caller keeps the folder).
+function New-CollectionZip {
+    [OutputType([void])]
+    param(
+        [Parameter(Mandatory = $true)][string]$SourceDir,
+        [Parameter(Mandatory = $true)][string]$ZipPath
+    )
+    Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
+    $root = New-Object System.IO.DirectoryInfo ([System.IO.Path]::GetFullPath($SourceDir))
+    $rootPath = $root.FullName.TrimEnd('\')
+    $ZipPath = [System.IO.Path]::GetFullPath($ZipPath)
+    if ($ZipPath.StartsWith($rootPath + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Zip path $ZipPath is inside the folder being zipped"
+    }
+    if (-not $root.Parent) { throw "Cannot zip a drive root: $($root.FullName)" }
+    $prefixLen = $root.Parent.FullName.TrimEnd('\').Length + 1   # entries start with "<folder>/"
+    if ([System.IO.File]::Exists($ZipPath)) { [System.IO.File]::Delete($ZipPath) }
+    $archive = [System.IO.Compression.ZipFile]::Open($ZipPath, [System.IO.Compression.ZipArchiveMode]::Create)
+    $done = $false
+    try {
+        foreach ($item in $root.EnumerateFileSystemInfos('*', [System.IO.SearchOption]::AllDirectories)) {
+            $entryName = $item.FullName.Substring($prefixLen).Replace('\', '/')
+            if ($item -is [System.IO.FileInfo]) {
+                [void][System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($archive, $item.FullName, $entryName, [System.IO.Compression.CompressionLevel]::Optimal)
+            } elseif (-not (@($item.EnumerateFileSystemInfos() | Select-Object -First 1).Count)) {
+                [void]$archive.CreateEntry($entryName + '/')   # empty folder
+            }
+        }
+        $archive.Dispose()   # writes the central directory; can throw (disk full)
+        $done = $true
+    } finally {
+        if (-not $done) {
+            try { $archive.Dispose() } catch { Write-Verbose "Zip dispose after failure: $($_.Exception.Message)" }
+            try { [System.IO.File]::Delete($ZipPath) } catch { Write-Verbose "Could not delete partial zip: $($_.Exception.Message)" }
+        }
+    }
+}
+
 if (-not $NoCompress) {
     Log "============================================================="
     Log "  COMPRESSING OUTPUT"
@@ -4149,12 +4204,14 @@ if (-not $NoCompress) {
 
     Log "Compressing to: $zipPath"
     try {
-        # ZipFile instead of Compress-Archive: Compress-Archive in Windows
-        # PowerShell 5.1 fails on files over 2 GB (a large raw $MFT) and skips
-        # hidden files; ZipFile writes Zip64 and includes everything
-        Add-Type -AssemblyName System.IO.Compression.FileSystem
-        if ([System.IO.File]::Exists($zipPath)) { [System.IO.File]::Delete($zipPath) }
-        [System.IO.Compression.ZipFile]::CreateFromDirectory($OutputPath, $zipPath, [System.IO.Compression.CompressionLevel]::Optimal, $true)
+        # New-CollectionZip instead of Compress-Archive: Compress-Archive in
+        # Windows PowerShell 5.1 fails on files over 2 GB (a large raw $MFT)
+        # and skips hidden files. New-CollectionZip writes Zip64 when needed,
+        # includes everything and names entries with '/' in both editions; a
+        # zip it does not finish is deleted, so no incomplete zip is left for
+        # the timeline builder to pick up
+        New-CollectionZip -SourceDir $OutputPath -ZipPath $zipPath
+        $zipCompleted = $true
         $zipSize = [math]::Round((Get-FileLength $zipPath) / 1MB, 2)
         Log-Success "Compressed to $zipPath ($zipSize MB)"
 
@@ -4171,8 +4228,16 @@ if (-not $NoCompress) {
             Log "  (Not included in zip due to size. Transfer separately.)"
         }
     } catch {
-        Log-Warning "Compression or cleanup issue: $($_.Exception.Message)"
-        Log "Output may remain at: $OutputPath"
+        if ($zipCompleted) {
+            Log-Warning "Zip complete, but the uncompressed folder was not fully removed: $($_.Exception.Message)"
+            Log "Delete the rest of it by hand: $OutputPath"
+        } else {
+            Log-Warning "Compression failed, no zip created: $($_.Exception.Message)"
+            Log "The collection is kept at: $OutputPath"
+            if ((Get-FileLength $zipPath) -ge 0) {
+                Log-Warning "Could not delete the incomplete zip, delete it by hand: $zipPath"
+            }
+        }
         # Move dump back if compression failed
         if ($memDumpMovedTo -and (Test-Path -LiteralPath $memDumpMovedTo)) {
             $memDir = Join-Path $OutputPath "Memory"
@@ -4188,7 +4253,7 @@ if (-not $NoCompress) {
 Write-Host ""
 foreach ($summaryLine in $summaryLines) { Write-Host $summaryLine }
 if (-not $NoCompress) {
-    if ((Get-FileLength $zipPath) -gt 0) {
+    if ($zipCompleted) {
         Write-Host "  Zip created:    $zipPath ($([math]::Round((Get-FileLength $zipPath) / 1MB, 2)) MB)" -ForegroundColor Green
     } else {
         Write-Host "  Zip NOT created -- collection left at: $OutputPath" -ForegroundColor Yellow

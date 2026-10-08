@@ -18,9 +18,14 @@
 #   - every collected file has a manifest row with its original path and
 #     the hash of the copy
 #   - Local State, Preferences, Secure Preferences and prefs.js are copied
-#     with their secret values (encrypted keys, password hashes, tokens)
-#     blanked: a canary string in each must appear nowhere in the
-#     collection, while the other settings are kept
+#     with their secret values (encrypted keys, password hashes, tokens,
+#     sync keys; also in a Preferences file cut off inside a secret value)
+#     blanked, Chromium session files with the page state (form contents)
+#     of every entry blanked, and Firefox session files with their cookies,
+#     form data, session storage and POST data blanked: a canary string in
+#     each must appear nowhere in the collection, while the other settings,
+#     URLs and titles are kept; a Firefox session file that cannot be
+#     decompressed is not collected
 # The image and the collection are removed afterwards and the drive letter
 # is unmapped.
 #
@@ -78,14 +83,110 @@ function New-TestTextFile {
     [System.IO.File]::WriteAllText($Path, $Text, (New-Object System.Text.UTF8Encoding($false)))
 }
 
-# A file of -Size bytes that starts with -Text (the rest zeros), last
-# written at -Time (newest-first ordering of session files)
+# A file of -Size bytes that starts with -Text or -Bytes (the rest zeros),
+# last written at -Time (newest-first ordering of session files)
 function New-TestSizedFile {
-    param([string]$Path, [string]$Text, [long]$Size, [datetime]$Time)
-    New-TestTextFile -Path $Path -Text $Text
+    param([string]$Path, [string]$Text, [byte[]]$Bytes, [long]$Size, [datetime]$Time)
+    if ($Bytes) {
+        New-Item -ItemType Directory -Path (Split-Path $Path -Parent) -Force | Out-Null
+        [System.IO.File]::WriteAllBytes($Path, $Bytes)
+    }
+    else { New-TestTextFile -Path $Path -Text $Text }
     $stream = [System.IO.File]::Open($Path, "Open", "ReadWrite", "None")
     try { $stream.SetLength($Size) } finally { $stream.Dispose() }
     if ($Time) { [System.IO.File]::SetLastWriteTimeUtc($Path, $Time) }
+}
+
+# base::Pickle as Chromium writes it: uint32 payload size, then 4-byte
+# aligned fields. Each field: @("int", n), @("int64", n), @("str", text)
+# (UTF-8, int32 byte count) or @("str16", text) (UTF-16, int32 char count).
+function New-TestPickle {
+    param([object[]]$Fields)
+    $stream = New-Object System.IO.MemoryStream
+    $writer = New-Object System.IO.BinaryWriter($stream)
+    $writer.Write([int32]0)
+    foreach ($field in $Fields) {
+        switch ($field[0]) {
+            "int"   { $writer.Write([int32]$field[1]) }
+            "int64" { $writer.Write([int64]$field[1]) }
+            default {
+                if ($field[0] -eq "str16") { $bytes = [System.Text.Encoding]::Unicode.GetBytes([string]$field[1]) }
+                else { $bytes = [System.Text.Encoding]::UTF8.GetBytes([string]$field[1]) }
+                $length = if ($field[0] -eq "str16") { ([string]$field[1]).Length } else { $bytes.Length }
+                $writer.Write([int32]$length)
+                $writer.Write($bytes)
+                while (($stream.Length % 4) -ne 0) { $writer.Write([byte]0) }
+            }
+        }
+    }
+    $writer.Flush()
+    $data = $stream.ToArray()
+    [System.BitConverter]::GetBytes([int32]($data.Length - 4)).CopyTo($data, 0)
+    return , $data
+}
+
+# SNSS file (version 3) with one navigation entry per URL: command id 6
+# (Session files) or 1 (Tabs files), and page state that holds -PageState
+function New-TestSnss {
+    param([int]$CommandId, [string[]]$Urls, [string]$PageState)
+    $stream = New-Object System.IO.MemoryStream
+    $writer = New-Object System.IO.BinaryWriter($stream)
+    $writer.Write([System.Text.Encoding]::ASCII.GetBytes("SNSS"))
+    $writer.Write([int32]3)
+    $index = 0
+    foreach ($url in $Urls) {
+        $payload = New-TestPickle @(@("int", 1), @("int", $index), @("str", $url), @("str16", "Title $index"), @("str", $PageState),
+            @("int", 1), @("int", 0), @("str", ""), @("int", 1), @("str", $url), @("int", 0), @("int64", 13418000000000000), @("str16", ""), @("int", 200))
+        $writer.Write([uint16]($payload.Length + 1))
+        $writer.Write([byte]$CommandId)
+        $writer.Write($payload)
+        $index++
+    }
+    $writer.Flush()
+    return , $stream.ToArray()
+}
+
+# mozLz4 file whose LZ4 block holds the text uncompressed (one sequence of
+# literals), as Firefox reads any LZ4 block
+function New-TestMozLz4 {
+    param([string]$Text)
+    $data = [System.Text.Encoding]::UTF8.GetBytes($Text)
+    $out = New-Object System.Collections.Generic.List[byte]
+    $out.AddRange([System.Text.Encoding]::ASCII.GetBytes("mozLz40" + [char]0))
+    $out.AddRange([System.BitConverter]::GetBytes([int32]$data.Length))
+    $out.Add([byte]([Math]::Min($data.Length, 15) * 16))
+    if ($data.Length -ge 15) {
+        $rest = $data.Length - 15
+        while ($rest -ge 255) { $out.Add([byte]255); $rest -= 255 }
+        $out.Add([byte]$rest)
+    }
+    $out.AddRange($data)
+    return , $out.ToArray()
+}
+
+# Text of a mozLz4 file (any LZ4 block: literals and back-references)
+function Read-TestMozLz4 {
+    param([byte[]]$Bytes)
+    $size = [System.BitConverter]::ToInt32($Bytes, 8)
+    $output = New-Object byte[] $size
+    $ip = 12
+    $op = 0
+    while ($ip -lt $Bytes.Length) {
+        $token = $Bytes[$ip]; $ip++
+        $literals = $token -shr 4
+        if ($literals -eq 15) { do { $b = $Bytes[$ip]; $ip++; $literals += $b } while ($b -eq 255) }
+        [System.Array]::Copy($Bytes, $ip, $output, $op, $literals)
+        $ip += $literals
+        $op += $literals
+        if ($ip -ge $Bytes.Length) { break }
+        $offset = $Bytes[$ip] + 256 * $Bytes[$ip + 1]
+        $ip += 2
+        $matchLength = $token -band 15
+        if ($matchLength -eq 15) { do { $b = $Bytes[$ip]; $ip++; $matchLength += $b } while ($b -eq 255) }
+        $matchLength += 4
+        for ($k = 0; $k -lt $matchLength; $k++) { $output[$op] = $output[$op - $offset]; $op++ }
+    }
+    return [System.Text.Encoding]::UTF8.GetString($output, 0, $op)
 }
 
 # Run a console tool and return its exit code (error action Continue: with
@@ -120,7 +221,9 @@ try {
         '"app_bound_encrypted_key":"' + $canary + '-2"},"private_key_encrypted_data":"' + $canary + '-3","profile":{"info_cache":{"Default":{"name":"Person 1"}}}}'
     $preferences = '{"download":{"default_directory":"D:\\Drop"},"homepage":"https://home.example.com/","password_hash_data_list":[{"hash":"' + $canary + '-4",' +
         '"salt":"' + $canary + '-5","username":"alice"}],"edge":{"services":{"signin_scoped_device_id":"device"}},"gcm":{"cached_target_token":"' + $canary + '-6"},' +
-        '"media":{"device_id_salt":"' + $canary + '-7"},"counts":{"n_salt":5}}'
+        '"media":{"device_id_salt":"' + $canary + '-7"},"counts":{"n_salt":5},' +
+        '"sync":{"encryption_bootstrap_token_per_account":{"Qm9vdA==":"' + $canary + '-12"},"keystore_encryption_key_state":"' + $canary + '-13"},' +
+        '"note":"a \"encrypted_key\": text value, not a member"}'
     $securePreferences = '{"extensions":{"settings":{"abcdefghijklmnopabcdefghijklmnop":{"location":1,"manifest":{"name":"__MSG_extName__"}}}},' +
         '"edge":{"policy_recovery_token":"' + $canary + '-8"},"protection":{"macs":{"homepage":"ABCDEF"}}}'
 
@@ -131,13 +234,16 @@ try {
     New-TestTextFile -Path (Join-Path $chromeDefault "Favicons") -Text $sqliteHeader
     New-TestTextFile -Path (Join-Path $chromeDefault "Favicons-journal") -Text "journal"
     # Sessions: newest first within 64 MB -- Session_2 (30 MB) and Tabs_3
-    # fit, the older Session_1 (40 MB) does not
+    # fit, the older Session_1 (40 MB) does not. The page state of every
+    # entry (the canary) is blanked in the copies; URLs and titles are kept.
     $now = [datetime]::UtcNow
     New-TestSizedFile -Path (Join-Path $chromeDefault "Sessions\Session_13418000000000001") -Text "SNSS" -Size 40MB -Time $now.AddHours(-3)
-    New-TestSizedFile -Path (Join-Path $chromeDefault "Sessions\Session_13418000000000002") -Text "SNSS" -Size 30MB -Time $now.AddHours(-1)
-    New-TestSizedFile -Path (Join-Path $chromeDefault "Sessions\Tabs_13418000000000003") -Text "SNSS" -Size 1KB -Time $now.AddHours(-2)
+    New-TestSizedFile -Path (Join-Path $chromeDefault "Sessions\Session_13418000000000002") -Size 30MB -Time $now.AddHours(-1) `
+        -Bytes (New-TestSnss -CommandId 6 -Urls @("https://session-one.example.com/", "https://session-two.example.com/") -PageState "$canary-14 form contents")
+    New-TestSizedFile -Path (Join-Path $chromeDefault "Sessions\Tabs_13418000000000003") -Size 1KB -Time $now.AddHours(-2) `
+        -Bytes (New-TestSnss -CommandId 1 -Urls @("https://closed-tab.example.com/") -PageState "$canary-15")
     New-TestTextFile -Path (Join-Path $chromeDefault "Sessions\notes.txt") -Text "not a session file"
-    New-TestTextFile -Path (Join-Path $chromeDefault "Current Session") -Text "SNSS-legacy"
+    [System.IO.File]::WriteAllBytes((Join-Path $chromeDefault "Current Session"), (New-TestSnss -CommandId 6 -Urls @("https://legacy.example.com/") -PageState "$canary-16"))
     # Extensions: a manifest with __MSG_ names (its default locale's
     # messages.json is collected, not the other locale or the code), one
     # without (no _locales), an oversized manifest, and a folder that is not
@@ -170,12 +276,14 @@ try {
     # Edge: a numbered profile
     New-TestTextFile -Path (Join-Path $edgeUserData "Profile 1\History") -Text $sqliteHeader
     New-TestTextFile -Path (Join-Path $edgeUserData "Profile 1\Secure Preferences") -Text '{"extensions":{"settings":{}}}'
+    # A Preferences file cut off inside a secret value: blanked to the end
+    New-TestTextFile -Path (Join-Path $edgeUserData "Profile 1\Preferences") -Text ('{"homepage":"https://edge.example.com/","password_hash_data_list":[{"hash":"' + $canary + '-17","salt":"x')
     New-TestTextFile -Path (Join-Path $edgeUserData "Local State") -Text '{"browser":{}}'
     # Opera: its folder is the profile and holds Local State
     New-TestTextFile -Path (Join-Path $operaDir "History") -Text $sqliteHeader
     New-TestTextFile -Path (Join-Path $operaDir "Preferences") -Text '{"homepage":"https://opera.example.com/"}'
     New-TestTextFile -Path (Join-Path $operaDir "Local State") -Text '{"browser":{}}'
-    New-TestTextFile -Path (Join-Path $operaDir "Sessions\Session_13418000000000009") -Text "SNSS"
+    New-TestSizedFile -Path (Join-Path $operaDir "Sessions\Session_13418000000000009") -Bytes (New-TestSnss -CommandId 6 -Urls @("https://opera.example.com/") -PageState "") -Size 512
 
     # Firefox
     New-TestTextFile -Path (Join-Path $firefoxProfile "places.sqlite") -Text $sqliteHeader
@@ -189,11 +297,19 @@ try {
         ('user_pref("dom.push.userAgentID", "' + $canary + '-10");'),
         ('user_pref("extensions.example.secret", "' + $canary + '-11");')
     ) -join "`r`n")
-    $mozLz4 = "mozLz40" + [char]0 + "data"
-    New-TestTextFile -Path (Join-Path $firefoxProfile "sessionstore.jsonlz4") -Text $mozLz4
-    foreach ($name in @("recovery.jsonlz4", "recovery.baklz4", "previous.jsonlz4", "upgrade.jsonlz4-20260101000000")) {
-        New-TestTextFile -Path (Join-Path $firefoxProfile "sessionstore-backups\$name") -Text $mozLz4
+    # Session files: session cookies, form data, session storage and POST
+    # data (the canary) are blanked in the copies; previous.jsonlz4 cannot
+    # be decompressed and is not collected
+    $sessionJson = '{"windows":[{"tabs":[{"entries":[{"url":"https://ff-open.example.org/","title":"FF Open","formdata":{"id":{"q":"' + $canary + '-18"}},' +
+        '"postdata_b64":"' + $canary + '-19"}],"index":1,"storage":{"https://ff-open.example.org":{"k":"' + $canary + '-20"}}}],' +
+        '"cookies":[{"host":".example.org","name":"sid","value":"' + $canary + '-21","httponly":true}]}],"session":{"lastUpdate":1}}'
+    $mozLz4 = New-TestMozLz4 $sessionJson
+    New-Item -ItemType Directory -Path (Join-Path $firefoxProfile "sessionstore-backups") -Force | Out-Null
+    [System.IO.File]::WriteAllBytes((Join-Path $firefoxProfile "sessionstore.jsonlz4"), $mozLz4)
+    foreach ($name in @("recovery.jsonlz4", "recovery.baklz4", "upgrade.jsonlz4-20260101000000")) {
+        [System.IO.File]::WriteAllBytes((Join-Path $firefoxProfile "sessionstore-backups\$name"), $mozLz4)
     }
+    New-TestTextFile -Path (Join-Path $firefoxProfile "sessionstore-backups\previous.jsonlz4") -Text ("mozLz40" + [char]0 + "data")
     New-TestTextFile -Path (Join-Path $firefoxProfile "sessionstore-backups\readme.txt") -Text "other"
 
     # --- Map the image to a free drive letter ---
@@ -246,6 +362,7 @@ try {
         "$browser\Chrome\Snapshots\120.0.6099.71\Default\Favicons"        = "Users\alice\AppData\Local\Google\Chrome\User Data\Snapshots\120.0.6099.71\Default\Favicons"
         "$browser\Edge\Profile 1\History"                     = "Users\alice\AppData\Local\Microsoft\Edge\User Data\Profile 1\History"
         "$browser\Edge\Profile 1\Secure Preferences"          = "Users\alice\AppData\Local\Microsoft\Edge\User Data\Profile 1\Secure Preferences"
+        "$browser\Edge\Profile 1\Preferences"                 = "Users\alice\AppData\Local\Microsoft\Edge\User Data\Profile 1\Preferences"
         "$browser\Edge\Local State"                           = "Users\alice\AppData\Local\Microsoft\Edge\User Data\Local State"
         "$browser\Opera\History"                              = "Users\alice\AppData\Roaming\Opera Software\Opera Stable\History"
         "$browser\Opera\Preferences"                          = "Users\alice\AppData\Roaming\Opera Software\Opera Stable\Preferences"
@@ -257,7 +374,7 @@ try {
         "$browser\Firefox\abcd1234.default-release\prefs.js"        = "Users\alice\AppData\Roaming\Mozilla\Firefox\Profiles\abcd1234.default-release\prefs.js"
         "$browser\Firefox\abcd1234.default-release\sessionstore.jsonlz4" = "Users\alice\AppData\Roaming\Mozilla\Firefox\Profiles\abcd1234.default-release\sessionstore.jsonlz4"
     }
-    foreach ($name in @("recovery.jsonlz4", "recovery.baklz4", "previous.jsonlz4", "upgrade.jsonlz4-20260101000000")) {
+    foreach ($name in @("recovery.jsonlz4", "recovery.baklz4", "upgrade.jsonlz4-20260101000000")) {
         $expected["$browser\Firefox\abcd1234.default-release\sessionstore-backups\$name"] = "Users\alice\AppData\Roaming\Mozilla\Firefox\Profiles\abcd1234.default-release\sessionstore-backups\$name"
     }
     foreach ($rel in $expected.Keys) {
@@ -285,7 +402,8 @@ try {
         "$browser\Chrome\Snapshots\120.0.6099.71\Default\Login Data",
         "$browser\Chrome\Snapshots\120.0.6099.71\Default\Preferences",
         "$browser\Chrome\Snapshots\120.0.6099.71\Local State",
-        "$browser\Firefox\abcd1234.default-release\sessionstore-backups\readme.txt"
+        "$browser\Firefox\abcd1234.default-release\sessionstore-backups\readme.txt",
+        "$browser\Firefox\abcd1234.default-release\sessionstore-backups\previous.jsonlz4"
     )
     foreach ($rel in $notExpected) {
         $present = (Test-Path -LiteralPath (Join-Path $outDir $rel)) -or @($manifest | Where-Object { $_.RelativePath -like "$rel*" }).Count -gt 0
@@ -295,11 +413,13 @@ try {
     Write-TestResult -Succeeded ($logText -match 'Skipped 1 session file\(s\)[^\r\n]*64 MB total cap\): Session_13418000000000001') -Message "the session file over the 64 MB total cap is logged as skipped"
 
     # --- Secret values blanked, other settings kept ---
-    $leaks = @(Get-ChildItem -LiteralPath $outDir -Recurse -File | Where-Object { [System.IO.File]::ReadAllText($_.FullName).Contains($canary) } | ForEach-Object { $_.Name })
-    Write-TestResult -Succeeded ($leaks.Count -eq 0) -Message "no secret value (canary) anywhere in the collection$(if ($leaks.Count) { ': ' + ($leaks -join ', ') })"
+    # (ASCII bytes: also finds the canary in binary session files)
+    $leaks = @(Get-ChildItem -LiteralPath $outDir -Recurse -File | Where-Object { [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($_.FullName)).Contains($canary) } | ForEach-Object { $_.Name })
+    Write-TestResult -Succeeded ($leaks.Count -eq 0) -Message "no secret or private value (canary) anywhere in the collection$(if ($leaks.Count) { ': ' + ($leaks -join ', ') })"
     $checks = @(
         @{ Rel = "$browser\Chrome\Local State"; Has = @('"enabled_labs_experiments":["enable-quic@2"]', '"encrypted_key":""', '"app_bound_encrypted_key":""', '"audit_enabled":true', '"private_key_encrypted_data":""') }
-        @{ Rel = "$browser\Chrome\Default\Preferences"; Has = @('"default_directory":"D:\\Drop"', '"password_hash_data_list":[]', '"cached_target_token":""', '"device_id_salt":""', '"n_salt":5', '"signin_scoped_device_id":"device"') }
+        @{ Rel = "$browser\Chrome\Default\Preferences"; Has = @('"default_directory":"D:\\Drop"', '"password_hash_data_list":[]', '"cached_target_token":""', '"device_id_salt":""', '"n_salt":5',
+            '"signin_scoped_device_id":"device"', '"encryption_bootstrap_token_per_account":{}', '"keystore_encryption_key_state":""', '"note":"a \"encrypted_key\": text value, not a member"') }
         @{ Rel = "$browser\Chrome\Default\Secure Preferences"; Has = @('"policy_recovery_token":""', '"name":"__MSG_extName__"', '"homepage":"ABCDEF"') }
         @{ Rel = "$browser\Firefox\abcd1234.default-release\prefs.js"; Has = @('user_pref("network.proxy.type", 1);', 'user_pref("network.proxy.http", "10.0.0.5");', 'user_pref("services.sync.tokenserver.token", "");', 'user_pref("dom.push.userAgentID", "");') }
     )
@@ -315,6 +435,37 @@ try {
         Write-TestResult -Succeeded ($missing.Count -eq 0 -and $valid) -Message "secret values blanked, settings kept: $($check.Rel)$(if ($missing.Count) { ' -- lacks ' + ($missing -join ' ') })$(if (-not $valid) { ' -- not valid JSON' })"
     }
     Write-TestResult -Succeeded ($logText -match 'Collected with 3 secret value\(s\) blanked[^\r\n]*Chrome\\User Data\\Local State') -Message "the log says which copies had secret values blanked"
+    Write-TestResult -Succeeded ($logText -match 'Damaged file[^\r\n]*Edge\\User Data\\Profile 1\\Preferences') -Message "the Preferences file cut off inside a secret value is logged as damaged"
+
+    # Session files: the URLs and titles are kept, the private parts blanked
+    $sessionChecks = @(
+        @{ Rel = "$browser\Chrome\Default\Sessions\Session_13418000000000002"; Has = @("https://session-one.example.com/", "https://session-two.example.com/"); Title = "Title 1" }
+        @{ Rel = "$browser\Chrome\Default\Sessions\Tabs_13418000000000003"; Has = @("https://closed-tab.example.com/"); Title = "Title 0" }
+        @{ Rel = "$browser\Chrome\Default\Current Session"; Has = @("https://legacy.example.com/"); Title = "Title 0" }
+    )
+    foreach ($check in $sessionChecks) {
+        $path = Join-Path $outDir $check.Rel
+        if (-not (Test-Path -LiteralPath $path)) { continue }
+        $bytes = [System.IO.File]::ReadAllBytes($path)
+        $ascii = [System.Text.Encoding]::ASCII.GetString($bytes)
+        $unicode = [System.Text.Encoding]::Unicode.GetString($bytes) + [System.Text.Encoding]::Unicode.GetString($bytes, 1, $bytes.Length - 1)
+        $missing = @($check.Has | Where-Object { -not $ascii.Contains($_) })
+        $ok = $ascii.StartsWith("SNSS") -and $missing.Count -eq 0 -and $unicode.Contains($check.Title)
+        Write-TestResult -Succeeded $ok -Message "page state blanked, URLs and titles kept: $($check.Rel)$(if ($missing.Count) { ' -- lacks ' + ($missing -join ' ') })"
+    }
+    $ffCopy = Join-Path $outDir "$browser\Firefox\abcd1234.default-release\sessionstore.jsonlz4"
+    if (Test-Path -LiteralPath $ffCopy) {
+        $ffText = ""
+        try { $ffText = Read-TestMozLz4 ([System.IO.File]::ReadAllBytes($ffCopy)) } catch { $ffText = "" }
+        $ffValid = $true
+        try { $null = $ffText | ConvertFrom-Json -ErrorAction Stop } catch { $ffValid = $false }
+        $ffOk = $ffValid -and $ffText.Contains('"url":"https://ff-open.example.org/"') -and $ffText.Contains('"title":"FF Open"') -and
+            $ffText.Contains('"cookies":[]') -and $ffText.Contains('"formdata":{}') -and $ffText.Contains('"storage":{}') -and $ffText.Contains('"postdata_b64":""')
+        Write-TestResult -Succeeded $ffOk -Message "Firefox session copy is a valid mozLz4 file with cookies, form data, session storage and POST data blanked, URLs and titles kept"
+    }
+    else { Write-TestResult -Succeeded $false -Message "Firefox session copy missing" }
+    Write-TestResult -Succeeded ($logText -match 'Not collected \(could not be read to blank its private values[^\r\n]*previous\.jsonlz4') -Message "the Firefox session file that cannot be decompressed is logged as not collected"
+    Write-TestResult -Succeeded ($logText -match 'Collected with 2 page state\(s\) \(form contents\) blanked[^\r\n]*Session_13418000000000002') -Message "the log says which session copies had page state blanked"
 
     if ($script:failures -gt 0) {
         Write-Host "FAIL: $($script:failures) check(s) failed" -ForegroundColor Red

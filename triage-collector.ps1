@@ -2332,8 +2332,37 @@ if ($Categories -contains "EventLogs") {
         "Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational",
         "Microsoft-Windows-TerminalServices-RemoteConnectionManager%4Operational",
         "Microsoft-Windows-Windows Defender%4Operational",
-        "Microsoft-Windows-Bits-Client%4Operational"
+        "Microsoft-Windows-Bits-Client%4Operational",
+        # Windows PowerShell (classic log): engine starts with the command
+        # line, PowerShell 2.0 downgrades
+        "Windows PowerShell",
+        # WMI event subscriptions (permanent and temporary)
+        "Microsoft-Windows-WMI-Activity%4Operational",
+        # Outbound RDP connections made with the Remote Desktop client
+        "Microsoft-Windows-TerminalServices-RDPClient%4Operational",
+        # NTLM authentication (written only when NTLM auditing is enabled)
+        "Microsoft-Windows-NTLM%4Operational",
+        # Firewall rule and setting changes
+        "Microsoft-Windows-Windows Firewall With Advanced Security%4Firewall",
+        # Run / RunOnce commands started at logon
+        "Microsoft-Windows-Shell-Core%4Operational",
+        # Office alert dialogs (exists only where Office is installed)
+        "OAlerts"
     )
+    # Size limit for the logs above that are added context rather than core
+    # evidence. Their default maximum sizes are 1 MB (15 MB for Windows
+    # PowerShell); one an administrator made much larger is skipped, with a
+    # warning, instead of slowing the collection down.
+    $limitedEventLogs = @(
+        "Windows PowerShell",
+        "Microsoft-Windows-WMI-Activity%4Operational",
+        "Microsoft-Windows-TerminalServices-RDPClient%4Operational",
+        "Microsoft-Windows-NTLM%4Operational",
+        "Microsoft-Windows-Windows Firewall With Advanced Security%4Firewall",
+        "Microsoft-Windows-Shell-Core%4Operational",
+        "OAlerts"
+    )
+    $maxLimitedEventLogBytes = 256MB
 
     $evtxRoot = "${script:TargetRoot}Windows\System32\winevt\Logs"
 
@@ -2341,6 +2370,11 @@ if ($Categories -contains "EventLogs") {
         $fileName = "$logName.evtx"
         $sourcePath = Join-Path $evtxRoot $fileName
         if (Test-Path $sourcePath) {
+            $logBytes = Get-FileLength $sourcePath
+            if ($limitedEventLogs -contains $logName -and $logBytes -gt $maxLimitedEventLogBytes) {
+                Log-Warning "Skipping $fileName ($([math]::Round($logBytes / 1MB)) MB, over the $([math]::Round($maxLimitedEventLogBytes / 1MB)) MB limit for this log)"
+                continue
+            }
             Log "Collecting $fileName..."
             $destFile = Join-Path $evtDir $fileName
             if ($script:IsLive) {

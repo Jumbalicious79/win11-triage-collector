@@ -5,16 +5,18 @@
 # selection that pauses every console write, and so the run) and puts the
 # console's mode back, without running a collection and without touching
 # the console this test runs in:
-#   - Get-ConsoleModeWithoutQuickEdit: QuickEdit on, already off, the
-#     ENABLE_EXTENDED_FLAGS bit missing, no bits, all bits;
+#   - Get-ConsoleModeWithoutQuickEdit: QuickEdit and mouse input cleared
+#     (with mouse input on and QuickEdit off, the mouse wheel no longer
+#     scrolls the window), a mode with QuickEdit already off unchanged, the
+#     ENABLE_EXTENDED_FLAGS bit missing, other bits kept, no bits, all bits;
 #   - Disable-ConsoleQuickEdit and Restore-ConsoleMode in child processes
 #     this test starts (same PowerShell edition, no window, the caller's
 #     error preference Stop): with input redirected, with no standard input
 #     handle, and with a type of the helper's name that lacks its methods,
 #     nothing is changed or returned and nothing is written (no error, no
-#     warning); in a console of the child's own, QuickEdit is turned off
-#     and the mode put back exactly, once, and a console with QuickEdit
-#     already off is left as it was;
+#     warning); in a console of the child's own, QuickEdit and mouse input
+#     are turned off and the mode put back exactly, once, and a console
+#     with QuickEdit already off is left as it was;
 #   - the collector's code: the helper runs right after the Administrator
 #     check (before the first prompt and the collection); every exit after
 #     it puts the mode back first; the main finally block puts it back,
@@ -162,7 +164,7 @@ public static extern bool SetConsoleMode(IntPtr hConsoleHandle, uint dwMode);
             Invoke-Restore
             $lines.Add("on.after=" + (Get-TestMode))
             # A second restore does nothing
-            Set-TestMode 0x01B7
+            Set-TestMode 0x01A7
             Invoke-Restore
             $lines.Add("on.secondRestore=" + (Get-TestMode))
             # QuickEdit already off: left as it was
@@ -265,12 +267,16 @@ function Test-Value {
 try {
     # --- 1. The mode without QuickEdit (pure) ---
     $modeCases = @(
-        @{ What = "QuickEdit on (the usual default)"; Old = 0x01F7; New = 0x01B7 }
-        @{ What = "QuickEdit already off: unchanged"; Old = 0x01B7; New = 0x01B7 }
+        @{ What = "QuickEdit on (default): mouse off too"; Old = 0x01F7; New = 0x01A7 }
+        @{ What = "QuickEdit on, mouse input already off"; Old = 0x01E7; New = 0x01A7 }
+        @{ What = "QuickEdit off: unchanged, mouse too"; Old = 0x01B7; New = 0x01B7 }
+        @{ What = "QuickEdit and mouse off: unchanged"; Old = 0x01A7; New = 0x01A7 }
         @{ What = "extended flags missing: flag set"; Old = 0x0007; New = 0x0087 }
+        @{ What = "flags missing, mouse on: mouse off"; Old = 0x0017; New = 0x0087 }
         @{ What = "QuickEdit bit without the flag"; Old = 0x0047; New = 0x0087 }
+        @{ What = "other bits kept (VT input)"; Old = 0x03F7; New = 0x03A7 }
         @{ What = "no bits"; Old = 0x0000; New = 0x0080 }
-        @{ What = "all 32 bits"; Old = [uint32]::MaxValue; New = [uint32]0xFFFFFFBFL }
+        @{ What = "all 32 bits"; Old = [uint32]::MaxValue; New = [uint32]0xFFFFFFAFL }
     )
     foreach ($case in $modeCases) {
         $problems = New-Problems
@@ -308,13 +314,13 @@ try {
     Test-Child -Run $run -Problems $problems
     if ($run.Values["initial"] -eq "fail") { $problems.Add("the child has no console of its own (GetConsoleMode failed)") }
     foreach ($expected in @(
-            @("on.returned", "0x01F7"), @("on.during", "0x01B7"), @("on.again", "none"), @("on.duringAgain", "0x01B7"),
-            @("on.after", "0x01F7"), @("on.secondRestore", "0x01B7"),
+            @("on.returned", "0x01F7"), @("on.during", "0x01A7"), @("on.again", "none"), @("on.duringAgain", "0x01A7"),
+            @("on.after", "0x01F7"), @("on.secondRestore", "0x01A7"),
             @("off.returned", "none"), @("off.during", "0x01B7"), @("off.after", "0x01B7"),
             @("noext.returned", "0x0007"), @("noext.during", "0x0087"), @("noext.after", "0x0007"))) {
         Test-Value -Run $run -Key $expected[0] -Expected $expected[1] -Problems $problems
     }
-    Add-Result "own console: off, then put back once" $problems -Info "0x01F7 -> 0x01B7 -> 0x01F7 (child's console was $($run.Values['initial']))"
+    Add-Result "own console: off, then put back once" $problems -Info "0x01F7 -> 0x01A7 -> 0x01F7 (child's console was $($run.Values['initial']))"
 
     # --- 3. The collector's code ---
     $commands = @($ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.CommandAst] }, $true) |

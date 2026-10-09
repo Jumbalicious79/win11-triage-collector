@@ -61,28 +61,35 @@ $timestamp = Get-Date -Format "yyyy-MM-dd_HH-mm"
 # and while it lasts every write to the console waits. Log writes to the
 # console before it writes to the log file, so the whole run stops (no CPU,
 # the log file stops too) until the selection ends. QuickEdit is turned off
-# here, and Restore-ConsoleMode puts the console's mode back: before an
-# early exit, in the main finally block when the run is stopped (Ctrl+C),
-# and before the last prompt. Text can still be copied with the window menu
-# (Edit > Mark). With no console, or with input redirected (tests, CI),
-# nothing is changed, and nothing here can stop the run.
+# here, mouse input with it, and Restore-ConsoleMode puts the console's
+# mode back: before an early exit, in the main finally block when the run
+# is stopped (Ctrl+C), and before the last prompt. Text can still be copied
+# with the window menu (Edit > Mark). With no console, or with input
+# redirected (tests, CI), nothing is changed, and nothing here can stop the
+# run.
 $script:consoleModeSaved = $null   # the mode before the run, while this script has it changed
 
-# The console input mode with QuickEdit off: ENABLE_QUICK_EDIT_MODE (0x40)
-# cleared and ENABLE_EXTENDED_FLAGS (0x80) set (SetConsoleMode changes
-# QuickEdit only with that flag). Unchanged when QuickEdit is already off
-# and the flag is set
+# The console input mode for the run: ENABLE_QUICK_EDIT_MODE (0x0040) and
+# ENABLE_MOUSE_INPUT (0x0010) cleared and ENABLE_EXTENDED_FLAGS (0x0080)
+# set, without which SetConsoleMode leaves QuickEdit as it is. Mouse input
+# goes with QuickEdit: with mouse input on and QuickEdit off, the console
+# passes the mouse wheel and clicks to the script, which never reads them,
+# so the wheel stops scrolling the window, and Windows Terminal switches
+# to mouse reporting (a drag no longer selects text). Every other bit is
+# kept. A mode with QuickEdit already off (and that flag set) comes back
+# as it is.
 function Get-ConsoleModeWithoutQuickEdit {
     [OutputType([uint32])]
     param([uint32]$Mode)
-    return [uint32](([long]$Mode -band (-bnot [long]0x40)) -bor [long]0x80)
+    if (([long]$Mode -band [long]0x00C0) -eq [long]0x0080) { return $Mode }
+    return [uint32](([long]$Mode -band (-bnot [long]0x0050)) -bor [long]0x0080)
 }
 
-# Turns QuickEdit off in the console of standard input and returns the mode
-# it had, or $null when nothing was changed: no console or input redirected
-# (GetConsoleMode fails), QuickEdit already off, or an error (Write-Verbose
-# only). The type is compiled once per session; a second run in the same
-# window reuses it
+# Turns QuickEdit (and mouse input) off in the console of standard input
+# and returns the mode it had, or $null when nothing was changed: no
+# console or input redirected (GetConsoleMode fails), QuickEdit already
+# off, or an error (Write-Verbose only). The type is compiled once per
+# session; a second run in the same window reuses it
 function Disable-ConsoleQuickEdit {
     try {
         if (-not ('TriageNative.ConsoleMode' -as [type])) {

@@ -181,12 +181,15 @@ needed -- plug in, double-click, collect, analyze.
   While it runs, QuickEdit is off in its console window, so a click in the
   window cannot pause the run. (With QuickEdit on, a click starts a text
   selection, and while it lasts every write to the window waits: the run
-  stops, and its log file with it, until the selection ends.) To copy text
-  during the run, open the window menu (Alt+Space, or right-click the
-  title bar), choose Edit > Mark, select, and press Enter; marking pauses
-  the run the same way until Enter or Esc. QuickEdit is turned back on at
-  the end of the run, before "Press any key to exit", so the summary can
-  be selected with the mouse.
+  stops, and its log file with it, until the selection ends.) The
+  console's mouse input is turned off with it, so the mouse wheel still
+  scrolls the window. To copy text during the run, open the window menu
+  (Alt+Space, or right-click the title bar), choose Edit > Mark, select,
+  and press Enter; marking pauses the run the same way until Enter or
+  Esc. QuickEdit is turned back on at the end of the run, before "Press
+  any key to exit", so the summary can be selected with the mouse. In
+  Windows Terminal a selection does not pause the run, and text is
+  selected and copied as usual.
 
 ### PowerShell (Admin)
 
@@ -1109,16 +1112,19 @@ The fastest path from collection to analysis:
     to run: check Windows Security exclusions and "vssadmin list shadows".
 
   - QuickEdit (see Quick Start) is off in the console window while the
-    script runs. It is turned back on at the end of the run, after an error
-    that stops the script before the collection, after Cancel at the drive
-    prompt, and when the collection is stopped with Ctrl+C. When the run is
-    stopped with Ctrl+C at a prompt before the collection starts, or during
-    the summary and zip step, it stays off in that window. The window of
-    Run-TriageCollector.bat closes right after; in a PowerShell window you
-    opened yourself, turn it back on in the window's Properties, or open a
-    new window. Only that window's setting changes, not the saved console
-    defaults. With QuickEdit already off, no console, or input redirected
-    (scripts, CI), nothing is changed and the line below is not logged.
+    script runs, and the console's mouse input with it. The console's mode
+    is put back at the end of the run, after an error that stops the
+    script before the collection, after Cancel at the drive prompt, and
+    when the collection is stopped with Ctrl+C. When the run is stopped
+    with Ctrl+C at a prompt before the collection starts, or during the
+    summary and zip step, or its process is ended from Task Manager,
+    QuickEdit stays off in that window. The window of
+    Run-TriageCollector.bat closes after its last prompt; in a PowerShell
+    window you opened yourself, turn it back on in the window's
+    Properties, or open a new window. Only that window's setting changes,
+    not the saved console defaults. With QuickEdit already off, no
+    console, or input redirected (scripts, CI), nothing is changed and the
+    line below is not logged.
     Log: "Console QuickEdit is off for this run, so a click in the window cannot pause it (copy text with the window menu: Edit > Mark)."
 
   - Locked files (live system): when a normal copy fails because a program
@@ -1655,19 +1661,21 @@ capture before collection begins.
   tests\Test-ConsoleMode.ps1 (no admin needed; also runs in CI)
     Checks that QuickEdit is turned off for the run and the console's mode
     put back, without touching the console the test runs in. The new mode
-    is checked for QuickEdit on (0x01F7 becomes 0x01B7), already off, and
+    is checked for QuickEdit on (0x01F7 becomes 0x01A7: QuickEdit and
+    mouse input off), already off (unchanged, mouse input included), and
     a mode without the extended flags bit. The helpers run in child
     processes of the same PowerShell edition that the test starts with no
     window: with input redirected, with no standard input handle, and with
     a type of the helper's name that lacks its methods, nothing is changed
     and nothing is written (no error, no warning, exit code 0); in a
-    console of the child's own, QuickEdit is turned off and the mode put
-    back exactly, once, and a console with QuickEdit already off is left
-    as it is. In the collector's code: QuickEdit is turned off right after
-    the Administrator check (before the first prompt), every exit after
-    that turns it back on first, a run stopped during the collection turns
-    it back on in the finally block after the cleanup, and a finished run
-    right before the last prompt (after the zip); the log line.
+    console of the child's own, QuickEdit and mouse input are turned off
+    and the mode put back exactly, once, and a console with QuickEdit
+    already off is left as it is. In the collector's code: QuickEdit is
+    turned off right after the Administrator check (before the first
+    prompt), every exit after that turns it back on first, a run stopped
+    during the collection turns it back on in the finally block after the
+    cleanup, and a finished run right before the last prompt (after the
+    zip); the log line.
       powershell -ExecutionPolicy Bypass -File tests\Test-ConsoleMode.ps1
 
   Planted-activity test (both tools, end to end, on a live machine)
@@ -1743,8 +1751,9 @@ are downloaded, bundled, or required.
                        times (services, drivers, Run keys).
 
   GetConsoleMode /     Windows API (kernel32.dll), called through a small
-  SetConsoleMode       Add-Type definition to turn QuickEdit off in the
-  (Add-Type)           console window for the run and back on at the end.
+  SetConsoleMode       Add-Type definition to turn QuickEdit (and mouse
+  (Add-Type)           input) off in the console window for the run and
+                       back on at the end.
 
   Raw NTFS reader      Built into the script (C# compiled via Add-Type). Opens
   (CreateFile,         the volume (\\.\C:) read-only with the kernel32.dll
@@ -1801,8 +1810,9 @@ This script is read-only by design, with these minimal exceptions:
     dump (as large as the RAM) is written to the output drive or to
     -MemoryOutputPath; on the system drive this overwrites free space that
     can hold deleted files
-  - Turns QuickEdit off in its console window for the run and back on at
-    the end (that window only, not the saved console defaults)
+  - Turns QuickEdit and mouse input off in its console window for the run,
+    and puts the console's mode back at the end (that window only, not the
+    saved console defaults)
   - Compiles small Add-Type helpers (registry key times, raw NTFS reader,
     console mode); Windows PowerShell writes and deletes temporary compiler
     files in %TEMP% for this

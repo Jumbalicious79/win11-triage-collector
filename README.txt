@@ -1366,7 +1366,10 @@ capture before collection begins.
     error; a hive that no method collects is a warning and one error, even
     when the direct copy has logged and counted its own failure. Also
     checks that the LNK, jump-list, Prefetch and task XML counts include a
-    file saved under a shortened name or with [ ] in its name.
+    file saved under a shortened name or with [ ] in its name, and that
+    the browser copies made within a size cap (session files, history
+    snapshots, extension manifests) count such a file and its size toward
+    the cap.
       powershell -ExecutionPolicy Bypass -File tests\Test-CollectionLogging.ps1
 
   Planted-activity test (both tools, end to end, on a live machine)

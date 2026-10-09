@@ -2891,6 +2891,7 @@ function Copy-TriageSrumFiles {
         }
     }
 
+    $dbCollected = $useShadow
     if ($useShadow) {
         $count++
         $shadowNames = Get-ShadowFileNames -RelativePath $relDir
@@ -2926,12 +2927,18 @@ function Copy-TriageSrumFiles {
                 Log-Warning "Skipped SRUM file $($vf.FullName) ($([math]::Round($vf.Length / 1MB, 1)) MB): larger than the $capText"
                 continue
             }
+            # Counted from $script:fileCount, not by the original name: a
+            # copy under a deep output folder is saved with a shortened name
+            $filesBefore = $script:fileCount
             Copy-ForensicFile -SourcePath $vf.FullName -DestDir $DestDir
-            if ((Get-FileLength (Join-Path $DestDir $vf.Name)) -gt 0) { $count++ }
+            if ($script:fileCount -gt $filesBefore) {
+                $count++
+                if ($vf.Name -eq "SRUDB.dat") { $dbCollected = $true }
+            }
         }
     }
 
-    if ((Get-FileLength (Join-Path $DestDir "SRUDB.dat")) -gt 0) {
+    if ($dbCollected) {
         $note = ""
         if ($useShadow) {
             $note = " (from the shadow copy)"
@@ -3815,7 +3822,8 @@ function Initialize-TriageRedactor {
 }
 
 # Copy a file unless it is larger than -MaxBytes (logged with its size).
-# Returns $true when the copy is in the collection.
+# Returns $true when the copy is in the collection (recorded in the
+# manifest; it may be saved under a shortened name, see Copy-ForensicFile).
 function Copy-TriageCappedFile {
     [OutputType([bool])]
     param(
@@ -3830,8 +3838,9 @@ function Copy-TriageCappedFile {
         Log "Skipped (larger than the $([math]::Round($MaxBytes / 1MB)) MB cap: $([math]::Round($size / 1MB, 1)) MB): $SourcePath"
         return $false
     }
+    $filesBefore = $script:fileCount
     Copy-ForensicFile -SourcePath $SourcePath -DestDir $DestDir -DestName $DestName
-    return (Test-Path -LiteralPath (Join-Path $DestDir $DestName))
+    return ($script:fileCount -gt $filesBefore)
 }
 
 # Copy files (already in the order of preference, e.g. newest first) to the
@@ -3861,6 +3870,10 @@ function Copy-TriageFilesWithinCap {
         }
         $relDir = Split-Path ($file.FullName.Substring($root.Length + 1)) -Parent
         $destDir = if ($relDir) { Join-Path $DestRoot $relDir } else { $DestRoot }
+        # Counted (with the copy's size) from what the manifest recorded, not
+        # by the original name: a long name is saved shortened
+        $filesBefore = $script:fileCount
+        $bytesBefore = $script:totalBytes
         if ($Format) {
             # A blanked Firefox session copy is stored uncompressed: its own
             # size counts (it must fit in what is left)
@@ -3870,9 +3883,8 @@ function Copy-TriageFilesWithinCap {
         else {
             Copy-ForensicFile -SourcePath $file.FullName -DestDir $destDir -DestName $file.Name
         }
-        $copyLength = Get-FileLength (Join-Path $destDir $file.Name)
-        if ($copyLength -gt 0) {
-            $total += $copyLength
+        if ($script:fileCount -gt $filesBefore) {
+            $total += $script:totalBytes - $bytesBefore
             $copied++
         }
     }
@@ -4045,9 +4057,10 @@ function Copy-TriageChromiumProfileExtras {
                 if (-not (Copy-TriageCappedFile -SourcePath (Join-Path $versionDir.FullName "manifest.json") -DestDir $versionDest -DestName "manifest.json" -MaxBytes 1MB)) { continue }
                 $manifestCount++
                 # A name such as "__MSG_appName__" is looked up in the default
-                # locale's messages.json (read from the copy just made)
+                # locale's messages.json (read from the copy just made, which
+                # may have a shortened name)
                 $manifestText = ""
-                try { $manifestText = [System.IO.File]::ReadAllText((Join-Path $versionDest "manifest.json")) }
+                try { $manifestText = [System.IO.File]::ReadAllText($script:lastRecordedDestPath) }
                 catch { Write-Verbose "Reading the copied manifest of $($extensionDir.Name): $($_.Exception.Message)" }
                 if ($manifestText -match '__MSG_' -and $manifestText -match '"default_locale"\s*:\s*"([A-Za-z0-9_-]+)"') {
                     $locale = $Matches[1]

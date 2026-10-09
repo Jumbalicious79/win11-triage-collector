@@ -457,6 +457,12 @@ function Get-TargetRelativePath {
 $script:fileCount = 0
 $script:errorCount = 0
 $script:totalBytes = 0
+# How the last Copy-ForensicFile call made its copy, for callers that report
+# the outcome themselves (Copy-HiveFile): "direct copy", or for a locked file
+# (with -FallbackOnAccessDenied also an access-denied one) "shadow copy" /
+# "raw NTFS read"; "" when it made none. Whether the copy was kept (recorded
+# in the manifest) shows in $script:fileCount
+$script:lastForensicCopyMethod = ""
 
 function Copy-ForensicFile {
     [OutputType([void])]
@@ -471,6 +477,7 @@ function Copy-ForensicFile {
         [switch]$FallbackOnAccessDenied
     )
 
+    $script:lastForensicCopyMethod = ""
     # -LiteralPath: paths can contain [ ], which -Path treats as wildcards
     if (-not $SourcePath -or -not (Test-Path -LiteralPath $SourcePath)) {
         return
@@ -497,8 +504,11 @@ function Copy-ForensicFile {
         # create longer ones. Long names (e.g. Recent .lnk files named after web
         # searches) are shortened with a hash suffix; the full original path is
         # kept in the manifest's SourcePath column. Names are also capped at
-        # 100 characters so the zip still extracts under a deeper folder
-        # (the timeline builder extracts into %TEMP%).
+        # 100 characters so the zip still extracts under a deeper folder (by
+        # default the timeline builder extracts into a per-run folder under
+        # %LOCALAPPDATA%\TimelineBuilder, and shortens any path that is still
+        # over 240 characters). Callers therefore count collected files from
+        # $script:fileCount (Copy-ForensicFileSet), not by the original name.
         if ($DestName.Length -gt 100 -or $destPath.Length -gt 250) {
             $ext = [System.IO.Path]::GetExtension($DestName)
             $sha1 = New-Object System.Security.Cryptography.SHA1Managed
@@ -523,6 +533,7 @@ function Copy-ForensicFile {
     try {
         # Try direct copy first (also reads hidden/system files)
         [System.IO.File]::Copy($SourcePath, $destPath, $true)
+        $script:lastForensicCopyMethod = "direct copy"
         Record-Manifest -SourcePath $SourcePath -DestPath $destPath -SourceTimes $srcTimes
         return
     } catch {
@@ -535,6 +546,7 @@ function Copy-ForensicFile {
     # Try standard Copy-Item as fallback
     try {
         Copy-Item -LiteralPath $SourcePath -Destination $destPath -Force -ErrorAction Stop
+        $script:lastForensicCopyMethod = "direct copy"
         Record-Manifest -SourcePath $SourcePath -DestPath $destPath -SourceTimes $srcTimes
         return
     } catch { Write-Verbose "Copy-Item fallback for ${SourcePath}: $($_.Exception.Message)" }
@@ -551,12 +563,14 @@ function Copy-ForensicFile {
         $relPath = Get-TargetRelativePath $SourcePath
         if ($relPath) {
             if (Copy-FromShadow -RelativePath $relPath -DestDir $DestDir -DestName $DestName -Quiet) {
+                $script:lastForensicCopyMethod = "shadow copy"
                 Log "Collected from shadow copy ($cause): $SourcePath"
                 return
             }
             # Not in the shadow copy (created after it was taken) or no shadow
             # copy possible: read the file straight from the volume
             if (Copy-TriageRawFile -SourcePath $SourcePath -DestPath $destPath -SourceTimes $srcTimes) {
+                $script:lastForensicCopyMethod = "raw NTFS read"
                 Log "Collected by raw NTFS read ($cause, not available from a shadow copy): $SourcePath"
                 return
             }
@@ -586,6 +600,24 @@ function Copy-ForensicFile {
         Log-Warning "Could not copy: $SourcePath -- $reason"
     }
     $script:errorCount++
+}
+
+# Copy-ForensicFile for every file of a folder listing; returns how many
+# were collected, counted from $script:fileCount: a long name is saved
+# shortened, so looking for the original name in DestDir misses it (as
+# does Test-Path without -LiteralPath for a name with [ ]). Empty and
+# failed files do not count.
+function Copy-ForensicFileSet {
+    [OutputType([int])]
+    param(
+        [object[]]$Files,
+        [string]$DestDir
+    )
+    $filesBefore = $script:fileCount
+    foreach ($file in $Files) {
+        Copy-ForensicFile -SourcePath $file.FullName -DestDir $DestDir
+    }
+    return $script:fileCount - $filesBefore
 }
 
 # Manifest columns:
@@ -820,6 +852,78 @@ function Copy-FromShadow {
         }
         return $false
     }
+}
+
+# Collect a registry hive or hive transaction log (path relative to
+# TargetRoot) from the shadow copy, else by direct copy (Copy-ForensicFile,
+# which falls back to a raw NTFS read for a locked file). Logs one outcome
+# per file, so a shadow copy failure that the direct copy recovers is not
+# an error:
+#   OK      -- "Collected <Label> via shadow copy" / "via direct copy" /
+#              "via raw NTFS read" (with the shadow copy's reason if it
+#              failed for this file); a locked file's fallback read also
+#              gets Copy-ForensicFile's own line, with the path
+#   info    -- empty (0 bytes): nothing to collect
+#   warning -- not found on the target (no error, as for the system hives)
+#   warning -- not collected; one error in all (Copy-ForensicFile may have
+#              logged and counted the direct copy's failure already)
+function Copy-HiveFile {
+    [OutputType([void])]
+    param(
+        [string]$RelativePath,
+        [string]$DestDir,
+        [string]$Label
+    )
+
+    $destName = [System.IO.Path]::GetFileName($RelativePath)
+    $sourcePath = $script:TargetRoot.TrimEnd('\') + '\' + $RelativePath
+
+    if (Copy-FromShadow -RelativePath $RelativePath -DestDir $DestDir -DestName $destName -Quiet) {
+        Log-Success "Collected $Label via shadow copy"
+        return
+    }
+    # Kept before the direct copy, which can try the shadow copy again.
+    # "Failed" without a shadow copy (image mode, or none could be made) is
+    # no failure of this file: there was nothing to try
+    $shadowResult = $script:lastShadowCopyResult
+    $shadowReason = $script:lastShadowCopyReason
+    $shadowFailed = ($shadowResult -eq "Failed") -and [bool]$script:shadowPath
+
+    $filesBefore = $script:fileCount
+    $errorsBefore = $script:errorCount
+    Copy-ForensicFile -SourcePath $sourcePath -DestDir $DestDir -DestName $destName
+    if ($script:fileCount -gt $filesBefore) {
+        # Copy-ForensicFile reads a locked file by raw NTFS read (or from
+        # the shadow copy, if a second try works: no failure to report then)
+        $method = $script:lastForensicCopyMethod
+        if ($shadowFailed -and $method -ne "shadow copy") {
+            Log-Success "Collected $Label via $method (shadow copy: $shadowReason)"
+        } else {
+            Log-Success "Collected $Label via $method"
+        }
+        return
+    }
+
+    # Nothing to collect: empty, or not on the target at all. Not when the
+    # snapshot file could not be read: it may have held data
+    $liveLength = Get-FileLength $sourcePath
+    if ($script:errorCount -eq $errorsBefore -and -not $shadowFailed -and $liveLength -le 0) {
+        if ($shadowResult -eq "Empty") {
+            Log "Skipped empty file (0 bytes in the shadow copy): $RelativePath"
+        } elseif ($liveLength -eq 0) {
+            Log "Skipped empty file (0 bytes): $RelativePath"
+        } else {
+            Log-Warning "$Label not found at $sourcePath"
+        }
+        return
+    }
+
+    if ($shadowFailed) {
+        Log-Warning "Could not collect $Label -- shadow copy: $shadowReason"
+    } else {
+        Log-Warning "Could not collect $Label"
+    }
+    if ($script:errorCount -eq $errorsBefore) { $script:errorCount++ }
 }
 
 # Names of the files (not folders) in a folder of the shadow copy (path
@@ -2277,31 +2381,10 @@ if ($Categories -contains "Registry") {
 
     # Amcache (hive + transaction logs so dirty hives can be recovered)
     Log "Collecting Amcache.hve..."
-    $amcacheSrc = "${script:TargetRoot}Windows\AppCompat\Programs\Amcache.hve"
-    $amcachePath = "Windows\AppCompat\Programs\Amcache.hve"
-    $result = Copy-FromShadow -RelativePath $amcachePath -DestDir $regDir -DestName "Amcache.hve"
-    if (-not $result) {
-        Copy-ForensicFile -SourcePath $amcacheSrc -DestDir $regDir
-    }
-    if ((Get-FileLength (Join-Path $regDir "Amcache.hve")) -gt 0) {
-        Log-Success "Collected Amcache.hve"
-    } else {
-        Log-Warning "Could not collect Amcache.hve"
-    }
+    Copy-HiveFile -RelativePath "Windows\AppCompat\Programs\Amcache.hve" -DestDir $regDir -Label "Amcache.hve"
     # Collect transaction logs for dirty hive recovery (locked + hidden, need shadow copy)
     foreach ($logExt in @(".LOG1", ".LOG2")) {
-        $logRelPath = "Windows\AppCompat\Programs\Amcache.hve${logExt}"
-        $logResult = Copy-FromShadow -RelativePath $logRelPath -DestDir $regDir -DestName "Amcache.hve${logExt}"
-        if (-not $logResult) {
-            # Fallback to direct copy
-            $logSrc = "${amcacheSrc}${logExt}"
-            if (Test-Path -LiteralPath $logSrc) {
-                Copy-ForensicFile -SourcePath $logSrc -DestDir $regDir
-            }
-        }
-        if ((Get-FileLength (Join-Path $regDir "Amcache.hve${logExt}")) -gt 0) {
-            Log-Success "Collected Amcache.hve${logExt}"
-        }
+        Copy-HiveFile -RelativePath "Windows\AppCompat\Programs\Amcache.hve${logExt}" -DestDir $regDir -Label "Amcache.hve${logExt}"
     }
 
     # Per-user hives: NTUSER.DAT and UsrClass.dat
@@ -2368,16 +2451,10 @@ if ($Categories -contains "Registry") {
                 } catch { Write-Verbose "reg save of HKU\$userSid for ${userName}: $($_.Exception.Message)" }
             }
 
-            # Method 2: Shadow copy
+            # Method 2: Shadow copy, then Method 3: Direct copy (works for
+            # non-active users); either way the outcome is logged once
             if (-not $collected) {
-                $relPath = "Users\$userName\NTUSER.DAT"
-                $result = Copy-FromShadow -RelativePath $relPath -DestDir $userRegDir -DestName "NTUSER.DAT"
-                if ($result) { $collected = $true }
-            }
-
-            # Method 3: Direct copy (works for non-active users)
-            if (-not $collected) {
-                Copy-ForensicFile -SourcePath $ntuser -DestDir $userRegDir -DestName "NTUSER.DAT"
+                Copy-HiveFile -RelativePath "Users\$userName\NTUSER.DAT" -DestDir $userRegDir -Label "NTUSER.DAT for $userName"
             }
         }
 
@@ -2400,16 +2477,10 @@ if ($Categories -contains "Registry") {
                 } catch { Write-Verbose "reg save of HKU\${userSid}_Classes for ${userName}: $($_.Exception.Message)" }
             }
 
-            # Method 2: Shadow copy
+            # Method 2: Shadow copy, then Method 3: Direct copy (works for
+            # non-active users); either way the outcome is logged once
             if (-not $collected) {
-                $relPath = "Users\$userName\AppData\Local\Microsoft\Windows\UsrClass.dat"
-                $result = Copy-FromShadow -RelativePath $relPath -DestDir $userRegDir -DestName "UsrClass.dat"
-                if ($result) { $collected = $true }
-            }
-
-            # Method 3: Direct copy (works for non-active users)
-            if (-not $collected) {
-                Copy-ForensicFile -SourcePath $usrclass -DestDir $userRegDir -DestName "UsrClass.dat"
+                Copy-HiveFile -RelativePath "Users\$userName\AppData\Local\Microsoft\Windows\UsrClass.dat" -DestDir $userRegDir -Label "UsrClass.dat for $userName"
             }
         }
     }
@@ -2821,6 +2892,7 @@ function Copy-TriageSrumFiles {
         }
     }
 
+    $dbCollected = $useShadow
     if ($useShadow) {
         $count++
         $shadowNames = Get-ShadowFileNames -RelativePath $relDir
@@ -2856,12 +2928,18 @@ function Copy-TriageSrumFiles {
                 Log-Warning "Skipped SRUM file $($vf.FullName) ($([math]::Round($vf.Length / 1MB, 1)) MB): larger than the $capText"
                 continue
             }
+            # Counted from $script:fileCount, not by the original name: a
+            # copy under a deep output folder is saved with a shortened name
+            $filesBefore = $script:fileCount
             Copy-ForensicFile -SourcePath $vf.FullName -DestDir $DestDir
-            if ((Get-FileLength (Join-Path $DestDir $vf.Name)) -gt 0) { $count++ }
+            if ($script:fileCount -gt $filesBefore) {
+                $count++
+                if ($vf.Name -eq "SRUDB.dat") { $dbCollected = $true }
+            }
         }
     }
 
-    if ((Get-FileLength (Join-Path $DestDir "SRUDB.dat")) -gt 0) {
+    if ($dbCollected) {
         $note = ""
         if ($useShadow) {
             $note = " (from the shadow copy)"
@@ -3202,12 +3280,7 @@ if ($Categories -contains "Execution") {
         # -Force here and at the other artifact listings: without it
         # Get-ChildItem silently skips hidden/system files
         $pfFiles = Get-ChildItem -Path $prefetchSource -Filter "*.pf" -Force -ErrorAction SilentlyContinue
-        $pfCount = 0
-        foreach ($pf in $pfFiles) {
-            Copy-ForensicFile -SourcePath $pf.FullName -DestDir $prefetchDir
-            $destFile = Join-Path $prefetchDir $pf.Name
-            if (Test-Path $destFile) { $pfCount++ }
-        }
+        $pfCount = Copy-ForensicFileSet -Files $pfFiles -DestDir $prefetchDir
         Log-Success "Collected $pfCount Prefetch files."
     } else {
         Log-Warning "Prefetch directory not found (may be disabled)."
@@ -3389,12 +3462,7 @@ if ($Categories -contains "UserActivity") {
             $recentDest = Join-Path $uaDir "$userName\RecentFiles"
             Ensure-Directory $recentDest
             $lnkFiles = Get-ChildItem -Path $recentSource -Filter "*.lnk" -Force -ErrorAction SilentlyContinue
-            $lnkCount = 0
-            foreach ($lnk in $lnkFiles) {
-                Copy-ForensicFile -SourcePath $lnk.FullName -DestDir $recentDest
-                $destFile = Join-Path $recentDest $lnk.Name
-                if (Test-Path $destFile) { $lnkCount++ }
-            }
+            $lnkCount = Copy-ForensicFileSet -Files $lnkFiles -DestDir $recentDest
             Log-Success "Collected $lnkCount recent LNK files for $userName"
         }
 
@@ -3404,12 +3472,7 @@ if ($Categories -contains "UserActivity") {
             $autoJumpDest = Join-Path $uaDir "$userName\JumpLists\AutomaticDestinations"
             Ensure-Directory $autoJumpDest
             $jlFiles = Get-ChildItem -Path $autoJumpSource -File -Force -ErrorAction SilentlyContinue
-            $jlCount = 0
-            foreach ($jl in $jlFiles) {
-                Copy-ForensicFile -SourcePath $jl.FullName -DestDir $autoJumpDest
-                $destFile = Join-Path $autoJumpDest $jl.Name
-                if (Test-Path $destFile) { $jlCount++ }
-            }
+            $jlCount = Copy-ForensicFileSet -Files $jlFiles -DestDir $autoJumpDest
             Log-Success "Collected $jlCount AutomaticDestinations for $userName"
         }
 
@@ -3419,12 +3482,7 @@ if ($Categories -contains "UserActivity") {
             $customJumpDest = Join-Path $uaDir "$userName\JumpLists\CustomDestinations"
             Ensure-Directory $customJumpDest
             $jlFiles = Get-ChildItem -Path $customJumpSource -File -Force -ErrorAction SilentlyContinue
-            $jlCount = 0
-            foreach ($jl in $jlFiles) {
-                Copy-ForensicFile -SourcePath $jl.FullName -DestDir $customJumpDest
-                $destFile = Join-Path $customJumpDest $jl.Name
-                if (Test-Path $destFile) { $jlCount++ }
-            }
+            $jlCount = Copy-ForensicFileSet -Files $jlFiles -DestDir $customJumpDest
             Log-Success "Collected $jlCount CustomDestinations for $userName"
         }
 
@@ -3765,7 +3823,8 @@ function Initialize-TriageRedactor {
 }
 
 # Copy a file unless it is larger than -MaxBytes (logged with its size).
-# Returns $true when the copy is in the collection.
+# Returns $true when the copy is in the collection (recorded in the
+# manifest; it may be saved under a shortened name, see Copy-ForensicFile).
 function Copy-TriageCappedFile {
     [OutputType([bool])]
     param(
@@ -3780,8 +3839,9 @@ function Copy-TriageCappedFile {
         Log "Skipped (larger than the $([math]::Round($MaxBytes / 1MB)) MB cap: $([math]::Round($size / 1MB, 1)) MB): $SourcePath"
         return $false
     }
+    $filesBefore = $script:fileCount
     Copy-ForensicFile -SourcePath $SourcePath -DestDir $DestDir -DestName $DestName
-    return (Test-Path -LiteralPath (Join-Path $DestDir $DestName))
+    return ($script:fileCount -gt $filesBefore)
 }
 
 # Copy files (already in the order of preference, e.g. newest first) to the
@@ -3811,6 +3871,10 @@ function Copy-TriageFilesWithinCap {
         }
         $relDir = Split-Path ($file.FullName.Substring($root.Length + 1)) -Parent
         $destDir = if ($relDir) { Join-Path $DestRoot $relDir } else { $DestRoot }
+        # Counted (with the copy's size) from what the manifest recorded, not
+        # by the original name: a long name is saved shortened
+        $filesBefore = $script:fileCount
+        $bytesBefore = $script:totalBytes
         if ($Format) {
             # A blanked Firefox session copy is stored uncompressed: its own
             # size counts (it must fit in what is left)
@@ -3820,9 +3884,8 @@ function Copy-TriageFilesWithinCap {
         else {
             Copy-ForensicFile -SourcePath $file.FullName -DestDir $destDir -DestName $file.Name
         }
-        $copyLength = Get-FileLength (Join-Path $destDir $file.Name)
-        if ($copyLength -gt 0) {
-            $total += $copyLength
+        if ($script:fileCount -gt $filesBefore) {
+            $total += $script:totalBytes - $bytesBefore
             $copied++
         }
     }
@@ -3995,9 +4058,10 @@ function Copy-TriageChromiumProfileExtras {
                 if (-not (Copy-TriageCappedFile -SourcePath (Join-Path $versionDir.FullName "manifest.json") -DestDir $versionDest -DestName "manifest.json" -MaxBytes 1MB)) { continue }
                 $manifestCount++
                 # A name such as "__MSG_appName__" is looked up in the default
-                # locale's messages.json (read from the copy just made)
+                # locale's messages.json (read from the copy just made, which
+                # may have a shortened name)
                 $manifestText = ""
-                try { $manifestText = [System.IO.File]::ReadAllText((Join-Path $versionDest "manifest.json")) }
+                try { $manifestText = [System.IO.File]::ReadAllText($script:lastRecordedDestPath) }
                 catch { Write-Verbose "Reading the copied manifest of $($extensionDir.Name): $($_.Exception.Message)" }
                 if ($manifestText -match '__MSG_' -and $manifestText -match '"default_locale"\s*:\s*"([A-Za-z0-9_-]+)"') {
                     $locale = $Matches[1]
@@ -4457,11 +4521,7 @@ if ($Categories -contains "Persistence") {
             # -Recurse -Force is safe here: the Tasks folder has no junctions
             $taskFiles = Get-ChildItem -Path $taskSourceDir -File -Recurse -Force -ErrorAction SilentlyContinue |
                 Where-Object { $_.Length -gt 0 } | Select-Object -First 200
-            $taskCount = 0
-            foreach ($tf in $taskFiles) {
-                Copy-ForensicFile -SourcePath $tf.FullName -DestDir $taskDestDir -DestName $tf.Name
-                if (Test-Path (Join-Path $taskDestDir $tf.Name)) { $taskCount++ }
-            }
+            $taskCount = Copy-ForensicFileSet -Files $taskFiles -DestDir $taskDestDir
             Log-Success "Collected $taskCount scheduled task XML file(s)."
         }
 

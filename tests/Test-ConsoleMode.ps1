@@ -15,14 +15,18 @@
 #     handle, and with a type of the helper's name that lacks its methods,
 #     nothing is changed or returned and nothing is written (no error, no
 #     warning); in a console of the child's own, QuickEdit and mouse input
-#     are turned off and the mode put back exactly, once, and a console
-#     with QuickEdit already off is left as it was;
+#     are turned off, stay off through a Read-Host (the child types the
+#     answer into its own console), and the mode is put back exactly, once,
+#     and a console with QuickEdit already off is left as it was (skipped
+#     when the child gets no console of its own, or shares it);
 #   - the collector's code: the helper runs right after the Administrator
 #     check (before the first prompt and the collection); every exit after
-#     it puts the mode back first; the main finally block puts it back,
-#     after the cleanup, when the run is stopped; a finished run puts it
-#     back right before the last prompt (after the zip); the log line.
-# No admin rights needed. Exit code 0 = pass, 1 = fail.
+#     it puts the mode back first, before its pause; the main finally block
+#     puts it back, after the cleanup, when the run is stopped; a finished
+#     run puts it back right before the last prompt (after the zip); the
+#     log line.
+# No admin rights needed. Exit code 0 = pass (a skipped case is not a
+# failure), 1 = fail.
 #
 #   powershell -ExecutionPolicy Bypass -File tests\Test-ConsoleMode.ps1
 # =============================================================
@@ -70,7 +74,11 @@ foreach ($name in @("Get-ConsoleModeWithoutQuickEdit", "Disable-ConsoleQuickEdit
 $failures = 0
 $results = New-Object System.Collections.Generic.List[object]
 function Add-Result {
-    param([string]$Case, [System.Collections.Generic.List[string]]$Problems, [string]$Info = "")
+    param([string]$Case, [System.Collections.Generic.List[string]]$Problems, [string]$Info = "", [string]$Skipped = "")
+    if ($Skipped) {
+        $results.Add([PSCustomObject]@{ Result = "SKIP"; Case = $Case; Note = $Skipped })
+        return
+    }
     $note = $Problems -join "; "
     if ($Problems.Count -gt 0) { $script:failures++ } elseif ($Info) { $note = $Info }
     $results.Add([PSCustomObject]@{
@@ -112,15 +120,41 @@ try {
     }
     # The test's own access to the console (not the collector's type)
     function Initialize-TestNative {
-        Add-Type -Namespace ConsoleModeTest -Name Native -ErrorAction Stop -MemberDefinition @"
-[DllImport("kernel32.dll", SetLastError = true)]
-public static extern IntPtr GetStdHandle(int nStdHandle);
-[DllImport("kernel32.dll", SetLastError = true)]
-public static extern bool SetStdHandle(int nStdHandle, IntPtr hHandle);
-[DllImport("kernel32.dll", SetLastError = true)]
-public static extern bool GetConsoleMode(IntPtr hConsoleHandle, out uint lpMode);
-[DllImport("kernel32.dll", SetLastError = true)]
-public static extern bool SetConsoleMode(IntPtr hConsoleHandle, uint dwMode);
+        Add-Type -ErrorAction Stop -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+namespace ConsoleModeTest {
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct KEY_EVENT_RECORD { public int bKeyDown; public ushort wRepeatCount; public ushort wVirtualKeyCode; public ushort wVirtualScanCode; public char UnicodeChar; public uint dwControlKeyState; }
+    [StructLayout(LayoutKind.Explicit, CharSet = CharSet.Unicode)]
+    public struct INPUT_RECORD { [FieldOffset(0)] public ushort EventType; [FieldOffset(4)] public KEY_EVENT_RECORD KeyEvent; }
+    public static class Native {
+        [DllImport("kernel32.dll", SetLastError = true)] public static extern IntPtr GetStdHandle(int nStdHandle);
+        [DllImport("kernel32.dll", SetLastError = true)] public static extern bool SetStdHandle(int nStdHandle, IntPtr hHandle);
+        [DllImport("kernel32.dll", SetLastError = true)] public static extern bool GetConsoleMode(IntPtr hConsoleHandle, out uint lpMode);
+        [DllImport("kernel32.dll", SetLastError = true)] public static extern bool SetConsoleMode(IntPtr hConsoleHandle, uint dwMode);
+        [DllImport("kernel32.dll", SetLastError = true)] public static extern uint GetConsoleProcessList(uint[] lpdwProcessList, uint dwProcessCount);
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)] public static extern bool WriteConsoleInputW(IntPtr hConsoleInput, INPUT_RECORD[] lpBuffer, uint nLength, out uint lpNumberOfEventsWritten);
+        public static uint ProcessCount() { uint[] list = new uint[16]; return GetConsoleProcessList(list, (uint)list.Length); }
+        // Key down and key up for each character, as typed
+        public static bool Type(string text) {
+            INPUT_RECORD[] records = new INPUT_RECORD[text.Length * 2];
+            for (int i = 0; i < text.Length; i++) {
+                char c = text[i];
+                ushort key = c == '\r' ? (ushort)0x0D : (ushort)char.ToUpperInvariant(c);
+                for (int up = 0; up < 2; up++) {
+                    records[i * 2 + up].EventType = 1;
+                    records[i * 2 + up].KeyEvent.bKeyDown = up == 0 ? 1 : 0;
+                    records[i * 2 + up].KeyEvent.wRepeatCount = 1;
+                    records[i * 2 + up].KeyEvent.wVirtualKeyCode = key;
+                    records[i * 2 + up].KeyEvent.UnicodeChar = c;
+                }
+            }
+            uint written;
+            return WriteConsoleInputW(GetStdHandle(-10), records, (uint)records.Length, out written) && written == records.Length;
+        }
+    }
+}
 "@
     }
     function Get-TestMode {
@@ -154,13 +188,27 @@ public static extern bool SetConsoleMode(IntPtr hConsoleHandle, uint dwMode);
         }
         "Console" {
             Initialize-TestNative
-            $lines.Add("initial=" + (Get-TestMode))
+            $initial = Get-TestMode
+            $processes = [ConsoleModeTest.Native]::ProcessCount()
+            $lines.Add("initial=" + $initial)
+            $lines.Add("processes=" + $processes)
+            # No console input of its own, or a console another process
+            # uses too (never changed): the parent skips this case
+            if ($initial -eq "fail" -or $processes -ne 1) { break }
             # QuickEdit on (the usual default): off, then back exactly
             Set-TestMode 0x01F7
             $lines.Add("on.returned=" + (Invoke-Disable))
             $lines.Add("on.during=" + (Get-TestMode))
             $lines.Add("on.again=" + (Invoke-Disable))
             $lines.Add("on.duringAgain=" + (Get-TestMode))
+            # The collector's prompts come after the helper: Read-Host still
+            # reads the console (the answer is typed into it here) and leaves
+            # QuickEdit and mouse input off
+            if ([ConsoleModeTest.Native]::Type("1`r")) {
+                $lines.Add("on.readHost=" + (Read-Host "Answer"))
+                $lines.Add("on.afterReadHost=" + (Get-TestMode))
+            }
+            else { $lines.Add("on.readHost=(could not type into the console)") }
             Invoke-Restore
             $lines.Add("on.after=" + (Get-TestMode))
             # A second restore does nothing
@@ -194,7 +242,8 @@ public static extern bool SetConsoleMode(IntPtr hConsoleHandle, uint dwMode);
 # Runs the child script in a new process of this PowerShell edition, with
 # no window. Redirected: standard input, output and error are pipes (the
 # child's input is at its end at once). Otherwise nothing is redirected,
-# so the child's standard input is the console it gets for itself.
+# so the child's standard input is the console it gets for itself, and
+# the child is not started with -NonInteractive, so Read-Host works.
 # Returns the exit code, what it wrote, and its result lines as a hashtable
 $testId = [guid]::NewGuid().ToString("N").Substring(0, 8)
 $workDir = Join-Path ([System.IO.Path]::GetTempPath()) "TriageConsoleModeTest_$testId"
@@ -205,7 +254,8 @@ function Invoke-Child {
     $resultPath = Join-Path $workDir "$Case.txt"
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $exe
-    $psi.Arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$childPath`" -CollectorPath `"$collector`" -Case $Case -ResultPath `"$resultPath`""
+    $nonInteractive = if ($Redirected) { "-NonInteractive " } else { "" }
+    $psi.Arguments = "-NoProfile $($nonInteractive)-ExecutionPolicy Bypass -File `"$childPath`" -CollectorPath `"$collector`" -Case $Case -ResultPath `"$resultPath`""
     $psi.UseShellExecute = $false
     $psi.CreateNoWindow = $true
     if ($Redirected) {
@@ -312,15 +362,28 @@ try {
     $run = Invoke-Child -Case "Console"
     $problems = New-Problems
     Test-Child -Run $run -Problems $problems
-    if ($run.Values["initial"] -eq "fail") { $problems.Add("the child has no console of its own (GetConsoleMode failed)") }
-    foreach ($expected in @(
-            @("on.returned", "0x01F7"), @("on.during", "0x01A7"), @("on.again", "none"), @("on.duringAgain", "0x01A7"),
-            @("on.after", "0x01F7"), @("on.secondRestore", "0x01A7"),
-            @("off.returned", "none"), @("off.during", "0x01B7"), @("off.after", "0x01B7"),
-            @("noext.returned", "0x0007"), @("noext.during", "0x0087"), @("noext.after", "0x0007"))) {
-        Test-Value -Run $run -Key $expected[0] -Expected $expected[1] -Problems $problems
+    $skip = ""
+    if ($problems.Count -eq 0 -and $run.Values["initial"] -eq "fail") { $skip = "the child got no console input of its own (GetConsoleMode failed)" }
+    elseif ($problems.Count -eq 0 -and $run.Values["processes"] -ne "1") { $skip = "the child's console is shared with $($run.Values['processes']) processes (not changed)" }
+    else {
+        foreach ($expected in @(
+                @("on.returned", "0x01F7"), @("on.during", "0x01A7"), @("on.again", "none"), @("on.duringAgain", "0x01A7"),
+                @("on.readHost", "1"),
+                @("on.after", "0x01F7"), @("on.secondRestore", "0x01A7"),
+                @("off.returned", "none"), @("off.during", "0x01B7"), @("off.after", "0x01B7"),
+                @("noext.returned", "0x0007"), @("noext.during", "0x0087"), @("noext.after", "0x0007"))) {
+            Test-Value -Run $run -Key $expected[0] -Expected $expected[1] -Problems $problems
+        }
+        # After Read-Host: QuickEdit (0x40) and mouse input (0x10) still off,
+        # the extended flags bit (0x80) still on
+        $afterReadHost = "$($run.Values['on.afterReadHost'])"
+        if ($afterReadHost -notmatch '^0x[0-9A-F]{4}$') { $problems.Add("on.afterReadHost is '$afterReadHost'") }
+        else {
+            $bits = [Convert]::ToUInt32($afterReadHost.Substring(2), 16) -band 0xD0
+            if ($bits -ne 0x80) { $problems.Add("after Read-Host the mode is ${afterReadHost}: QuickEdit or mouse input back on, or the extended flags bit off") }
+        }
     }
-    Add-Result "own console: off, then put back once" $problems -Info "0x01F7 -> 0x01A7 -> 0x01F7 (child's console was $($run.Values['initial']))"
+    Add-Result "own console: off, then put back once" $problems -Info "0x01F7 -> 0x01A7 -> Read-Host $($run.Values['on.afterReadHost']) -> 0x01F7 (child's console was $($run.Values['initial']))" -Skipped $skip
 
     # --- 3. The collector's code ---
     $commands = @($ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.CommandAst] }, $true) |
@@ -371,7 +434,8 @@ try {
     Add-Result "collector: off right after the admin check" $problems -Info "line $(if ($disableCalls.Count -eq 1) { $disableCalls[0].Extent.StartLineNumber })"
 
     # Every exit after it (outside the main try block, whose finally block
-    # covers its own) puts the mode back first, in the same block
+    # covers its own) puts the mode back first, in the same block, and
+    # before a pause there (so the error can be selected with the mouse)
     $problems = New-Problems
     $exits = @($ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.ExitStatementAst] }, $true) |
         Where-Object { -not (Test-InsideFunction $_) -and $disableCalls.Count -eq 1 -and $_.Extent.StartOffset -gt $disableCalls[0].Extent.StartOffset })
@@ -382,8 +446,15 @@ try {
         if ($block -is [System.Management.Automation.Language.StatementBlockAst] -or $block -is [System.Management.Automation.Language.NamedBlockAst]) {
             $before = @($block.Statements | Where-Object { $_.Extent.EndOffset -le $exitStatement.Extent.StartOffset })
         }
-        $restored = @($before | Where-Object { $_ -is [System.Management.Automation.Language.PipelineAst] -and $_.PipelineElements.Count -eq 1 -and $_.PipelineElements[0] -is [System.Management.Automation.Language.CommandAst] -and $_.PipelineElements[0].GetCommandName() -eq "Restore-ConsoleMode" })
-        if ($restored.Count -eq 0) { $problems.Add("exit at line $($exitStatement.Extent.StartLineNumber) does not run Restore-ConsoleMode first") }
+        $restoreAt = -1
+        $pauseAt = -1
+        for ($k = 0; $k -lt $before.Count; $k++) {
+            $statement = $before[$k]
+            if ($restoreAt -lt 0 -and $statement -is [System.Management.Automation.Language.PipelineAst] -and $statement.PipelineElements.Count -eq 1 -and $statement.PipelineElements[0] -is [System.Management.Automation.Language.CommandAst] -and $statement.PipelineElements[0].GetCommandName() -eq "Restore-ConsoleMode") { $restoreAt = $k }
+            if ($pauseAt -lt 0 -and @($statement.FindAll({ param($node) $node -is [System.Management.Automation.Language.CommandAst] -and $node.GetCommandName() -eq "pause" }, $true)).Count -gt 0) { $pauseAt = $k }
+        }
+        if ($restoreAt -lt 0) { $problems.Add("exit at line $($exitStatement.Extent.StartLineNumber) does not run Restore-ConsoleMode first") }
+        elseif ($pauseAt -ge 0 -and $pauseAt -lt $restoreAt) { $problems.Add("exit at line $($exitStatement.Extent.StartLineNumber): the pause at line $($before[$pauseAt].Extent.StartLineNumber) comes before Restore-ConsoleMode") }
     }
     if ($disableCalls.Count -eq 1 -and $exits.Count -eq 0) { $problems.Add("no exit found after the call (the early exits were expected)") }
     Add-Result "collector: every exit restores first" $problems -Info "$($exits.Count) exits"
@@ -451,17 +522,19 @@ finally {
 
 Write-Host "PowerShell $($PSVersionTable.PSVersion) ($($PSVersionTable.PSEdition))"
 foreach ($r in $results) {
-    $color = if ($r.Result -eq "PASS") { "Green" } else { "Red" }
+    $color = switch ($r.Result) { "PASS" { "Green" } "SKIP" { "Yellow" } default { "Red" } }
     $line = "  {0}  {1}" -f $r.Result, $r.Case
     if ($r.Note) { $line = "  {0}  {1,-44} -- {2}" -f $r.Result, $r.Case, $r.Note }
     Write-Host $line -ForegroundColor $color
-    if ($r.Result -ne "PASS" -and $env:GITHUB_ACTIONS) {
+    if ($r.Result -eq "FAIL" -and $env:GITHUB_ACTIONS) {
         Write-Host "::error file=tests/Test-ConsoleMode.ps1::$($r.Case): $($r.Note)"
     }
 }
-if ($failures -gt 0 -or $results.Count -eq 0) {
+$passed = @($results | Where-Object { $_.Result -eq "PASS" }).Count
+$skipped = @($results | Where-Object { $_.Result -eq "SKIP" }).Count
+if ($failures -gt 0 -or $passed -eq 0) {
     Write-Host "FAIL: $failures check(s) failed" -ForegroundColor Red
     exit 1
 }
-Write-Host "PASS: $($results.Count) check(s)" -ForegroundColor Green
+Write-Host "PASS: $passed check(s)$(if ($skipped) { ", $skipped skipped" })" -ForegroundColor Green
 exit 0

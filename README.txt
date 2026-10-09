@@ -1668,14 +1668,17 @@ capture before collection begins.
     window: with input redirected, with no standard input handle, and with
     a type of the helper's name that lacks its methods, nothing is changed
     and nothing is written (no error, no warning, exit code 0); in a
-    console of the child's own, QuickEdit and mouse input are turned off
-    and the mode put back exactly, once, and a console with QuickEdit
-    already off is left as it is. In the collector's code: QuickEdit is
-    turned off right after the Administrator check (before the first
-    prompt), every exit after that turns it back on first, a run stopped
-    during the collection turns it back on in the finally block after the
-    cleanup, and a finished run right before the last prompt (after the
-    zip); the log line.
+    console of the child's own, QuickEdit and mouse input are turned off,
+    stay off through a Read-Host (the child types the answer into its own
+    console), and the mode is put back exactly, once, and a console with
+    QuickEdit already off is left as it is (skipped when the child gets no
+    console of its own, or shares it with another process). In the
+    collector's code: QuickEdit is turned off right after the
+    Administrator check (before the first prompt), every exit after that
+    turns it back on first (before its pause), a run stopped during the
+    collection turns it back on in the finally block after the cleanup,
+    and a finished run right before the last prompt (after the zip); the
+    log line.
       powershell -ExecutionPolicy Bypass -File tests\Test-ConsoleMode.ps1
 
   Planted-activity test (both tools, end to end, on a live machine)

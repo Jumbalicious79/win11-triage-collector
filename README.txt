@@ -236,8 +236,17 @@ With -MemoryOutputPath <folder> (or another drive chosen at the memory
 prompt) the dump is written to that folder from the start, under the same
 <collection>_memory_dump.dmp name; Memory\memory_acquisition_log.txt stays
 in the collection. The summary names the dump's location (also with
--NoCompress). Unless that folder is the one the zip is in, give the dump to
-the timeline builder with -MemoryDumpPath.
+-NoCompress). The timeline builder finds the dump through the collection
+manifest: collection_manifest.csv records its full path and size wherever
+it ends up (next to the zip, or in that folder), so Run-TimelineBuilder.bat
+finds it with no parameter. If the dump is moved, or the collection is
+analyzed on another machine (where the drive may have another letter), put
+the dump next to the zip under its <collection>_memory_dump.dmp name (next
+to the collection folder with -NoCompress): the timeline builder looks
+there too, and the summary says so. The timeline builder never opens a
+network path (\\server\share\...) named in a manifest, so a dump written
+to one must be put next to the zip the same way. (Run directly,
+timeline-builder.ps1 also takes the dump's path as -MemoryDumpPath.)
 
 Use -NoCompress to keep the uncompressed folder instead.
 
@@ -247,10 +256,11 @@ versions run by the .bat launcher (Windows PowerShell 5.1) use "\"; Windows
 tools and the timeline builder read both. A file already at the zip path
 (an earlier run with the same -OutputPath) is replaced, and the log says so.
 If compression fails, the incomplete zip is deleted, the uncompressed folder
-is kept and the log says why. If the memory dump cannot be moved out of the
-collection folder (another program has it open), the folder is not zipped,
-so the dump does not end up in the zip; the log and the summary say where it
-is.
+is kept and the log says why; a memory dump moved out for the zip is moved
+back into Memory\, and its manifest row with it. If the memory dump cannot
+be moved out of the collection folder (another program has it open), the
+folder is not zipped, so the dump does not end up in the zip; the log and
+the summary say where it is.
 
 Inside the zip:
 
@@ -825,12 +835,18 @@ when the analysis machine uses a different time zone or locale.
                        raw NTFS copies, "(memory dump via <tool>)" and
                        "(memory capture tool output: <tool>)" for the memory
                        dump and Memory\memory_acquisition_log.txt
-  DestPath             Full path of the copy at collection time
+  DestPath             Full path of the copy at collection time; for the
+                       memory dump, where it is at the end of the run (next
+                       to the zip, in the -MemoryOutputPath folder, or in
+                       Memory\ when the folder is not zipped). The timeline
+                       builder finds the dump through this row (not on a
+                       network path, which it never opens).
   SizeBytes            Size of the copy
   CollectedAt          Collector's local time when the file was recorded
   RelativePath         Path inside the collection, e.g.
                        Execution\Prefetch\CMD.EXE-0BD30981.pf; blank for a
-                       memory dump written to -MemoryOutputPath
+                       memory dump outside the collection (next to the zip,
+                       or written to -MemoryOutputPath)
   SourceCreatedUtc     Created / modified / accessed times of the ORIGINAL
   SourceModifiedUtc    file (the copies in the collection get new times).
   SourceAccessedUtc    Blank for command output, reg save exports, or unknown.
@@ -978,8 +994,10 @@ The fastest path from collection to analysis:
   1. Double-click Run-TimelineBuilder.bat (no arguments needed)
   2. It auto-finds triage zips in the sibling reports\ directory
   3. Pick a collection number
-  4. If a memory dump is detected alongside the zip and Volatility 3 is
-     installed, the script prompts to include memory analysis
+  4. If the collection's memory dump is found (next to the zip, or where
+     collection_manifest.csv says it was written, e.g. D:\TriageMemory)
+     and Volatility 3 is installed, the script prompts to include memory
+     analysis
   5. Timeline builds (~2 minutes for ~56,000 events, longer with memory)
   6. Color-coded Excel (.xlsx) is generated with rows colored by EventType
   7. Choose a viewer: Excel (colored), Timeline Explorer, Both, or None
@@ -1061,6 +1079,14 @@ The fastest path from collection to analysis:
     dump's name must be deleted by hand before the collection is analyzed.
     Error: "Memory capture failed: DumpIt reported NtStatus 0xC000007F; ..."
     Warning: "Could not delete the incomplete memory dump, delete it by hand (it is not complete, do not analyze it): ..."
+
+  - The memory dump's row in collection_manifest.csv is changed when the
+    dump is moved next to the zip (and back if the zip fails). If the
+    manifest cannot be changed (another program has it open), it is kept
+    as it was, the row still names the path in Memory\, and the log warns.
+    The dump is still next to the zip, where the timeline builder also
+    looks.
+    Warning: "Could not update the memory dump's row in collection_manifest.csv, it still names ...: ..."
 
   - Per-user live registry data (Run/RunOnce keys, RecentApps) covers every
     user whose hive is loaded, i.e. users logged in at collection time, not
@@ -1305,8 +1331,11 @@ the mounted image for a non-invasive collection.
                    collection folder). The dump is written there as
                    <collection>_memory_dump.dmp (.raw for WinPmem and Magnet
                    RAM Capture); the acquisition log stays in the
-                   collection. Default: Memory\ in the collection, moved
-                   next to the zip at the end.
+                   collection, and collection_manifest.csv records the
+                   dump's full path, where the timeline builder finds it
+                   (not on a network path: put such a dump next to the
+                   zip under its name). Default: Memory\ in the
+                   collection, moved next to the zip at the end.
   -MinFreeSpaceGB  Free space in GB to keep on the system drive after the
                    memory dump and the collection. Default: -1 (automatic:
                    10% of the volume, at least 4 and at most 20 GB). 0
@@ -1375,7 +1404,8 @@ capture before collection begins.
           the zip as <collection>_memory_dump.dmp / .raw. With
           -MemoryOutputPath <folder> (or another drive chosen at the
           prompt), written to that folder under that name from the start.
-          The acquisition log always stays in the collection.
+          The acquisition log always stays in the collection, and
+          collection_manifest.csv records where the dump ends up.
   Storage: Dump size equals installed RAM (16 GB RAM = ~16 GB file).
            Before the capture the script checks the free space where the
            dump goes, for the dump (RAM + 1 MB for DumpIt, RAM x 1.05 for
@@ -1583,13 +1613,20 @@ capture before collection begins.
     (nonzero NtStatus, short file, an "Error:" line). The memory section
     with a stand-in tool: no room (an error, no capture), low reserve (a
     warning), a complete, failed, empty or missing dump, an earlier dump at
-    the path, -MemoryOutputPath, a failed dump that cannot be renamed or is
-    held open. The summary and compression step: the dump moved next to the
-    zip, or the folder kept unzipped (and the summary corrected) when it
-    cannot be moved; the -MemoryDumpPath hint only for a dump that is not
-    next to the zip; a failed dump still in the folder set aside then, or
-    the folder not zipped. The prompt asks again after a bad answer (also a
-    number too large for an [int]) and is not shown with -Unattended.
+    the path, -MemoryOutputPath, WinPmem and Magnet RAM Capture, a failed
+    dump that cannot be renamed or is held open; the dump's manifest row
+    has its full path, size and hash. The summary and compression step:
+    the dump moved next to the zip (the manifest in the zip then names that
+    path), or the folder kept unzipped (and the summary corrected) when it
+    cannot be moved; moved back with its manifest row when the zip fails;
+    the rest of the manifest unchanged, and kept as it was (a warning) when
+    it cannot be changed; for a dump that is not next to the zip, the lines
+    that the timeline builder finds it through the manifest (or, on a
+    network path, does not) and that a moved dump goes next to the zip
+    (next to the folder with -NoCompress), never "pass -MemoryDumpPath"; a
+    failed dump still in the folder set aside then, or the folder not
+    zipped. The prompt asks again after a bad answer (also a number too
+    large for an [int]) and is not shown with -Unattended.
       powershell -ExecutionPolicy Bypass -File tests\Test-MemorySpaceCheck.ps1
 
   Planted-activity test (both tools, end to end, on a live machine)

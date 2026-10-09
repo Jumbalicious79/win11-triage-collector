@@ -1179,6 +1179,72 @@ function Move-IncompleteMemoryDump {
     return $null
 }
 
+# The timeline builder finds the memory dump through its row in
+# collection_manifest.csv (DestPath, SizeBytes). The compression step moves
+# a dump in Memory\ next to the zip, and back if the zip fails, after that
+# row was written: this changes the DestPath of the row whose DestPath is
+# OldPath to NewPath, and its RelativePath to match (blank outside the
+# collection). Its hash, size and times stay, and so does every other line
+# (also one that has OldPath in another field). The new manifest is written
+# as collection_manifest.csv.new and renamed into place, so a failure
+# leaves the old one (a warning). Returns $true when the row was changed;
+# $false when that failed or there is no such row (a dump that could not
+# be hashed has none: Record-Manifest warned then).
+function Set-ManifestDumpPath {
+    [OutputType([bool])]
+    param(
+        [string]$OldPath,
+        [string]$NewPath
+    )
+    $newFile = "$manifestFile.new"
+    $oldFile = "$manifestFile.old"
+    try {
+        # UTF-8 with BOM, as the manifest is written; lines end in CRLF. Only
+        # the lines that hold OldPath (quoted, as a field) are looked at. The
+        # whole text is passed to one .NET call only, the write: PowerShell 7
+        # scans the arguments of each call (about 2 s for a 45 MB manifest)
+        $utf8 = New-Object System.Text.UTF8Encoding($true)
+        $text = [System.IO.File]::ReadAllText($manifestFile, $utf8)
+        $oldField = ConvertTo-CsvField $OldPath
+        $changed = $false
+        $at = $text.IndexOf($oldField, [System.StringComparison]::OrdinalIgnoreCase)
+        while ($at -ge 0) {
+            $start = $text.LastIndexOf([char]10, $at) + 1
+            $end = $text.IndexOf("`r`n", $at, [System.StringComparison]::Ordinal)
+            if ($end -lt 0) { $end = $text.Length }
+            # Every field is quoted, quotes in it doubled (ConvertTo-CsvField)
+            $fields = @([regex]::Matches($text.Substring($start, $end - $start), '"((?:[^"]|"")*)"(?:,|$)') | ForEach-Object { $_.Groups[1].Value.Replace('""', '"') })
+            if ($start -gt 0 -and $fields.Count -eq 9 -and $fields[2].Equals($OldPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+                $fields[2] = $NewPath
+                $fields[5] = Get-CollectionRelativePath $NewPath
+                $row = ($fields | ForEach-Object { ConvertTo-CsvField $_ }) -join ','
+                $text = $text.Substring(0, $start) + $row + $text.Substring($end)
+                $end = $start + $row.Length
+                $changed = $true
+            }
+            $at = $text.IndexOf($oldField, $end, [System.StringComparison]::OrdinalIgnoreCase)
+        }
+        if (-not $changed) { return $false }
+        [System.IO.File]::WriteAllText($newFile, $text, $utf8)
+        [System.IO.File]::Move($manifestFile, $oldFile)
+        try { [System.IO.File]::Move($newFile, $manifestFile) }
+        catch { [System.IO.File]::Move($oldFile, $manifestFile); throw }
+    } catch {
+        $left = ""
+        if ([System.IO.File]::Exists($manifestFile)) {
+            try { [System.IO.File]::Delete($newFile) } catch { Write-Verbose "Could not delete ${newFile}: $($_.Exception.Message)" }
+        } else {
+            $left = " The manifest is left as $oldFile."
+        }
+        Log-Warning "Could not update the memory dump's row in collection_manifest.csv, it still names ${OldPath}: $($_.Exception.Message)$left"
+        return $false
+    }
+    Log "collection_manifest.csv: the memory dump's row now names $NewPath"
+    try { [System.IO.File]::Delete($oldFile) }
+    catch { Log-Warning "Could not delete the manifest from before that change: $oldFile -- $($_.Exception.Message)" }
+    return $true
+}
+
 # ----------------------------------------------------------
 # Helper: Volume Shadow Copy for locked files
 # ----------------------------------------------------------
@@ -1786,6 +1852,8 @@ if ($Categories -contains "Memory") {
                     foreach ($memErrorLine in $memResult.ErrorLines) { Log-Warning "${memToolName}: $memErrorLine" }
                     if ($memResult.Complete) {
                         $dumpSizeGB = [math]::Round((Get-FileLength $dumpFile) / 1GB, 2)
+                        # The compression step changes the row's path when
+                        # it moves the dump (Set-ManifestDumpPath)
                         Record-Manifest -SourcePath "(memory dump via $memToolName)" -DestPath $dumpFile
                         $script:memDumpPath = $dumpFile
                         Log "Memory dump check: $($memResult.Summary)"
@@ -6600,6 +6668,7 @@ $zipCompleted = $false   # set once New-CollectionZip has written the whole zip
 # complete dump (in Memory\, or with -MemoryOutputPath outside the folder)
 $memDumpInCollection = [bool]($script:memDumpPath -and (Get-CollectionRelativePath $script:memDumpPath))
 $memDumpMovedTo = $null
+$memDumpRowMoved = $false     # its manifest row names the path next to the zip
 $memDumpMoveFailed = $false   # a dump could not be moved out of the folder: no zip
 # A failed dump the memory section could neither set aside nor delete (a
 # lock) is still under the dump's name: try once more. One still in the
@@ -6635,9 +6704,24 @@ if ($memDumpInCollection -and -not $NoCompress) {
     $summaryLines += "  Memory dump:    $($script:memDumpPath)"
     # Not in the collection and not next to it (in the folder that holds
     # the collection and its zip, under <collection>_memory_dump.<ext>, as
-    # -MemoryOutputPath names it), where the builder looks
+    # -MemoryOutputPath names it): the timeline builder finds it through
+    # its row in the manifest, which has its full path and size, but only
+    # on a drive letter (it never opens a network path a manifest names).
+    # Next to the zip (or the folder) under this name it finds it on any
+    # machine, also when started from Run-TimelineBuilder.bat, which takes
+    # no path for the dump
     if (-not $memDumpInCollection -and [System.IO.Path]::GetDirectoryName($script:memDumpPath) -ne [System.IO.Path]::GetDirectoryName($OutputPath)) {
-        $summaryLines += "                  (timeline builder: pass it as -MemoryDumpPath)"
+        $memDumpNextTo = "the zip"
+        if ($NoCompress) { $memDumpNextTo = "the collection folder" }
+        if ($script:memDumpPath -match '^[A-Za-z]:\\') {
+            $summaryLines += "                  (the timeline builder finds it here through collection_manifest.csv;"
+            $summaryLines += "                  if the dump is moved or analyzed on another machine, put it next"
+            $summaryLines += "                  to $memDumpNextTo under this name)"
+        } else {
+            $summaryLines += "                  (the timeline builder does not open a network path named in"
+            $summaryLines += "                  collection_manifest.csv: to analyze the dump, put it next to"
+            $summaryLines += "                  $memDumpNextTo under this name)"
+        }
     }
 }
 if ($script:memDumpIncompletePath) {
@@ -6712,9 +6796,10 @@ if (-not $NoCompress) {
     Log "============================================================="
 
     # Memory dump: kept next to the zip, not inside it (as large as RAM, slow
-    # to compress, and analysis tools need the file itself). One written
-    # with -MemoryOutputPath is already outside the folder. If it cannot be
-    # moved out, the folder is not zipped (the dump would be in the zip)
+    # to compress, and analysis tools need the file itself), and its row in
+    # the manifest names it there. One written with -MemoryOutputPath is
+    # already outside the folder. If it cannot be moved out, the folder is
+    # not zipped (the dump would be in the zip)
     if ($memDumpInCollection) {
         $dumpSizeGB = [math]::Round((Get-FileLength $script:memDumpPath) / 1GB, 2)
         Log "Memory dump detected ($dumpSizeGB GB) -- keeping it next to the zip."
@@ -6734,6 +6819,10 @@ if (-not $NoCompress) {
             # path next to the zip: correct it
             $summaryLines[$memDumpSummaryIndex] = "  Memory dump:    $($script:memDumpPath) (not moved out, the folder is not zipped)"
             Log $summaryLines[$memDumpSummaryIndex]
+        }
+        # The manifest, zipped next, names where the dump is now
+        if ($memDumpMovedTo) {
+            $memDumpRowMoved = Set-ManifestDumpPath -OldPath $script:memDumpPath -NewPath $memDumpMovedTo
         }
         # Remove empty Memory folder if only the dump was in it
         $memDir = Join-Path $OutputPath "Memory"
@@ -6808,6 +6897,12 @@ if (-not $NoCompress -and -not $memDumpMoveFailed) {
             $memDir = Join-Path $OutputPath "Memory"
             Ensure-Directory $memDir
             Move-Item -LiteralPath $memDumpMovedTo -Destination $script:memDumpPath -Force
+            # Back in Memory\: so are its manifest row and summary line
+            if ((Get-FileLength $script:memDumpPath) -ge 0) {
+                if ($memDumpRowMoved) { [void](Set-ManifestDumpPath -OldPath $memDumpMovedTo -NewPath $script:memDumpPath) }
+                $summaryLines[$memDumpSummaryIndex] = "  Memory dump:    $($script:memDumpPath) (moved back, no zip was created)"
+                Log $summaryLines[$memDumpSummaryIndex]
+            }
         }
     }
 }

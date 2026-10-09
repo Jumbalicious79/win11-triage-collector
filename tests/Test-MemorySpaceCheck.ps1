@@ -24,10 +24,13 @@
 #     (its manifest row then names that path), kept with the folder (no
 #     zip, the summary corrected) when it cannot be moved, moved back with
 #     its row when the zip fails, left where -MemoryOutputPath put it (the
-#     summary says the timeline builder finds it through the manifest,
-#     only when that is not next to the zip); the rest of the manifest
-#     unchanged, and kept as it was when it cannot be changed; a failed
-#     dump still in the folder: set aside then, or no zip.
+#     summary says the timeline builder finds it through the manifest, or,
+#     for a network path, that it does not, and to put it next to the zip
+#     or the folder if it is moved; only when that is not next to the zip;
+#     never "pass -MemoryDumpPath", which Run-TimelineBuilder.bat cannot);
+#     the rest of the manifest unchanged, and kept as it was when it cannot
+#     be changed; a failed dump still in the folder: set aside then, or no
+#     zip.
 # No admin rights needed. Exit code 0 = pass, 1 = fail.
 #
 #   powershell -ExecutionPolicy Bypass -File tests\Test-MemorySpaceCheck.ps1
@@ -82,17 +85,21 @@ $sectionStatement = @($ast.FindAll({ param($node) $node -is [System.Management.A
     Where-Object { -not (Test-InsideFunction $_) })
 $firstFinal = -1
 $lastFinal = -1
+$zipFunction = -1   # the compression step starts with New-CollectionZip
 for ($i = 0; $i -lt $topStatements.Count; $i++) {
     if ($firstFinal -lt 0 -and $topStatements[$i].Extent.Text -like '$endTime = Get-Date*') { $firstFinal = $i }
+    if ($firstFinal -ge 0 -and $zipFunction -lt 0 -and $topStatements[$i] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $topStatements[$i].Name -eq "New-CollectionZip") { $zipFunction = $i }
     if ($topStatements[$i].Extent.Text -like '*RawUI.ReadKey*') { $lastFinal = $i }
 }
-if ($promptStatement.Count -ne 1 -or $sectionStatement.Count -ne 1 -or $firstFinal -lt 0 -or $lastFinal -le $firstFinal) {
-    Write-Host "FAIL: collector code not found (prompt: $($promptStatement.Count), memory section: $($sectionStatement.Count), summary: $firstFinal..$lastFinal)" -ForegroundColor Red
+if ($promptStatement.Count -ne 1 -or $sectionStatement.Count -ne 1 -or $firstFinal -lt 0 -or $zipFunction -le $firstFinal -or $lastFinal -le $zipFunction) {
+    Write-Host "FAIL: collector code not found (prompt: $($promptStatement.Count), memory section: $($sectionStatement.Count), summary: $firstFinal..$zipFunction..$lastFinal)" -ForegroundColor Red
     exit 1
 }
 $promptBlock = [scriptblock]::Create($promptStatement[0].Extent.Text)
 $sectionBlock = [scriptblock]::Create($sectionStatement[0].Extent.Text)
 $finalBlock = [scriptblock]::Create((@($topStatements[$firstFinal..($lastFinal - 1)] | ForEach-Object { $_.Extent.Text }) -join "`r`n"))
+# The summary alone (logged before compression): nothing is moved or zipped
+$summaryBlock = [scriptblock]::Create((@($topStatements[$firstFinal..($zipFunction - 1)] | ForEach-Object { $_.Extent.Text }) -join "`r`n"))
 
 $failures = 0
 $results = New-Object System.Collections.Generic.List[object]
@@ -1112,26 +1119,79 @@ try {
     Test-ManifestAfter -Before $final.ManifestBefore -After $final.ZipManifest -Tool "DumpIt" -DestPath "" -RelativePath "" -Problems $problems -Where "in the zip"
     Add-Result "compression: failed dump set aside at the end -> zip" $problems
 
+    # The lines under "Memory dump:" in the summary (regexes): as logged
+    # ("[time] " first), or as shown on screen at the end
+    function Get-HintPatterns {
+        param([string[]]$Hint, [switch]$Logged)
+        $start = '^ {18}'
+        if ($Logged) { $start = '\] {19}' }
+        return @($Hint | ForEach-Object { $start + [regex]::Escape($_) + '$' })
+    }
+    # A dump on a drive letter outside the collection: the timeline builder
+    # finds it through the manifest; if it is moved, next to the zip (or the
+    # folder) under its name, also from Run-TimelineBuilder.bat. Never
+    # "-MemoryDumpPath", which the .bat cannot pass
+    $driveHint = @('(the timeline builder finds it here through collection_manifest.csv;', 'if the dump is moved or analyzed on another machine, put it next')
+
     # -MemoryOutputPath (or a drive chosen at the prompt): the dump stays
-    # there, its row names it, and the summary says the timeline builder
-    # finds it through the manifest
+    # there, its row names it, and the summary says so
     $final = Invoke-Final -Name "dumpdir" -DumpDir (Join-Path $workDir "dumpdir-final")
     $problems = New-Problems
-    $hintLines = @('(the timeline builder finds it through collection_manifest.csv;', '-MemoryDumpPath only if the dump is moved or analyzed on another machine)')
-    Test-LinesInOrder -Lines $final.Screen -Expected @(
-        ('Memory dump:    ' + [regex]::Escape($final.Dump) + '$'),
-        ('\] {19}' + [regex]::Escape($hintLines[0]) + '$'),
-        ('\] {19}' + [regex]::Escape($hintLines[1]) + '$'),
-        'OK: Compressed to ',
-        ('^ {18}' + [regex]::Escape($hintLines[0]) + '$'),
-        ('^ {18}' + [regex]::Escape($hintLines[1]) + '$'),
-        ('^  Memory dump:    ' + [regex]::Escape($final.Dump) + ' \(')
-    ) -Problems $problems -Where "screen"
-    if (@($final.Screen | Where-Object { $_ -match 'pass it as' }).Count -gt 0) { $problems.Add("the old -MemoryDumpPath hint") }
+    $hintLines = $driveHint + 'to the zip under this name)'
+    Test-LinesInOrder -Lines $final.Screen -Expected (@('Memory dump:    ' + [regex]::Escape($final.Dump) + '$') + (Get-HintPatterns $hintLines -Logged) + @('OK: Compressed to ') + (Get-HintPatterns $hintLines) + @('^  Memory dump:    ' + [regex]::Escape($final.Dump) + ' \(')) -Problems $problems -Where "screen"
+    if (@($final.Screen | Where-Object { $_ -match 'MemoryDumpPath' }).Count -gt 0) { $problems.Add("the summary asks for -MemoryDumpPath") }
     if (-not $final.Zip -or (Get-FileLength $final.Dump) -ne 4) { $problems.Add("zip $($final.Zip), dump left $((Get-FileLength $final.Dump) -eq 4)") }
     if (@($final.Screen | Where-Object { $_ -match 'Memory dump detected|row now names' }).Count -gt 0) { $problems.Add("dump moved, or its row changed") }
     Test-ManifestAfter -Before $final.ManifestBefore -After $final.ZipManifest -Tool "DumpIt" -DestPath $final.Dump -RelativePath "" -Problems $problems -Where "in the zip"
     Add-Result "compression: -MemoryOutputPath dump left in place" $problems
+
+    # ... with -NoCompress (Run-TriageCollector.bat nozip): no zip, so next
+    # to the collection folder, where the timeline builder looks then
+    $final = Invoke-Final -Name "dumpdirnozip" -DumpDir (Join-Path $workDir "dumpdirnozip-final") -NoZip
+    $problems = New-Problems
+    $hintLines = $driveHint + 'to the collection folder under this name)'
+    Test-LinesInOrder -Lines $final.Screen -Expected (@('\]   Memory dump:    ' + [regex]::Escape($final.Dump) + '$') + (Get-HintPatterns $hintLines -Logged) + @('^  COLLECTION SUMMARY$') + (Get-HintPatterns $hintLines) + @('^  Memory dump:    ' + [regex]::Escape($final.Dump) + ' \(')) -Problems $problems -Where "screen"
+    Test-LinesInOrder -Lines $final.Log -Expected (Get-HintPatterns $hintLines -Logged) -Problems $problems -Where "collection_log.txt"
+    if (@($final.Screen | Where-Object { $_ -match 'MemoryDumpPath|to the zip under' }).Count -gt 0) { $problems.Add("the summary asks for -MemoryDumpPath, or names the zip") }
+    if ($final.Zip -or -not $final.Folder -or (Get-FileLength $final.Dump) -ne 4) { $problems.Add("zip $($final.Zip), folder kept $($final.Folder), dump left $((Get-FileLength $final.Dump) -eq 4)") }
+    Test-ManifestAfter -Before $final.ManifestBefore -After $final.FolderManifest -Tool "DumpIt" -DestPath $final.Dump -RelativePath "" -Problems $problems -Where "in the folder"
+    Add-Result "summary: -MemoryOutputPath with -NoCompress" $problems
+
+    # A dump on a network path (-MemoryOutputPath \\server\share\...): the
+    # timeline builder does not open a network path a manifest names, so
+    # the summary does not say it finds it there, and says to put it next
+    # to the zip (or the folder). The summary alone (Invoke-Summary):
+    # nothing at that path is touched
+    function Invoke-Summary {
+        param([string]$Name, [string]$DumpPath, [switch]$NoZip)
+        $script:OutputPath = Join-Path $workDir "$Name\TriageCollection_2026-01-02_03-04"
+        New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null
+        $script:logFile = Join-Path $OutputPath "collection_log.txt"
+        [System.IO.File]::WriteAllText($logFile, "start`r`n")
+        $script:logToFile = $true
+        $script:NoCompress = [bool]$NoZip
+        $script:memDumpPath = $DumpPath
+        $script:memDumpIncompletePath = $null
+        $script:fileCount = 3
+        $script:errorCount = 0
+        $script:totalBytes = 1000
+        $screen = @(& {
+            $ErrorActionPreference = "Continue"
+            . $summaryBlock
+        } 6>&1 | ForEach-Object { "$_" })
+        return [PSCustomObject]@{ Screen = $screen; Log = @(Get-Content -LiteralPath $logFile) }
+    }
+    $netDump = "\\fileserver\evidence\TriageMemory\TriageCollection_2026-01-02_03-04_memory_dump.dmp"
+    $netHint = @('(the timeline builder does not open a network path named in', 'collection_manifest.csv: to analyze the dump, put it next to')
+    $problems = New-Problems
+    foreach ($netCase in @(@{ Name = "netdump"; NoZip = $false; NextTo = "the zip under this name)" }, @{ Name = "netdumpnozip"; NoZip = $true; NextTo = "the collection folder under this name)" })) {
+        $summary = Invoke-Summary -Name $netCase.Name -DumpPath $netDump -NoZip:$netCase.NoZip
+        $hintLines = Get-HintPatterns ($netHint + $netCase.NextTo) -Logged
+        Test-LinesInOrder -Lines $summary.Screen -Expected (@('\]   Memory dump:    ' + [regex]::Escape($netDump) + '$') + $hintLines) -Problems $problems -Where "screen, $($netCase.Name)"
+        Test-LinesInOrder -Lines $summary.Log -Expected $hintLines -Problems $problems -Where "collection_log.txt, $($netCase.Name)"
+        if (@($summary.Screen | Where-Object { $_ -match 'finds it here|MemoryDumpPath' }).Count -gt 0) { $problems.Add("$($netCase.Name): the summary says the manifest finds it, or asks for -MemoryDumpPath") }
+    }
+    Add-Result "summary: dump on a network path -> next to the zip" $problems
 
     $final = Invoke-Final -Name "nozip" -NoZip
     $problems = New-Problems
@@ -1150,12 +1210,12 @@ try {
     Add-Result "summary: incomplete dump named" $problems
 
     # -MemoryOutputPath = the folder that holds the collection and its zip:
-    # the dump is where the timeline builder looks, so no -MemoryDumpPath hint
+    # the dump is where the timeline builder looks, so no hint
     $final = Invoke-Final -Name "dumpdirparent" -DumpDir (Join-Path $workDir "dumpdirparent")
     $problems = New-Problems
     if ($final.Dump -ne $final.Next) { $problems.Add("dump path '$($final.Dump)', expected '$($final.Next)'") }
     Test-LinesInOrder -Lines $final.Screen -Expected @(('\]   Memory dump:    ' + [regex]::Escape($final.Dump) + '$'), 'OK: Compressed to ', ('^  Memory dump:    ' + [regex]::Escape($final.Dump) + '$')) -Problems $problems -Where "screen"
-    if (@($final.Screen | Where-Object { $_ -match 'timeline builder|Memory dump detected' }).Count -gt 0) { $problems.Add("-MemoryDumpPath hint, or the dump moved") }
+    if (@($final.Screen | Where-Object { $_ -match 'timeline builder|under this name|Memory dump detected' }).Count -gt 0) { $problems.Add("a hint, or the dump moved") }
     if (-not $final.Zip -or (Get-FileLength $final.Dump) -ne 4 -or @($final.Entries | Where-Object { $_ -like "*memory_dump*" }).Count -gt 0) { $problems.Add("zip $($final.Zip), dump left $((Get-FileLength $final.Dump) -eq 4)") }
     Test-ManifestAfter -Before $final.ManifestBefore -After $final.ZipManifest -Tool "DumpIt" -DestPath $final.Dump -RelativePath "" -Problems $problems -Where "in the zip"
     Add-Result "summary: -MemoryOutputPath next to the zip, no hint" $problems

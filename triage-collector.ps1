@@ -6705,10 +6705,23 @@ if ($memDumpInCollection -and -not $NoCompress) {
     # Not in the collection and not next to it (in the folder that holds
     # the collection and its zip, under <collection>_memory_dump.<ext>, as
     # -MemoryOutputPath names it): the timeline builder finds it through
-    # its row in the manifest, which has its full path and size
+    # its row in the manifest, which has its full path and size, but only
+    # on a drive letter (it never opens a network path a manifest names).
+    # Next to the zip (or the folder) under this name it finds it on any
+    # machine, also when started from Run-TimelineBuilder.bat, which takes
+    # no path for the dump
     if (-not $memDumpInCollection -and [System.IO.Path]::GetDirectoryName($script:memDumpPath) -ne [System.IO.Path]::GetDirectoryName($OutputPath)) {
-        $summaryLines += "                  (the timeline builder finds it through collection_manifest.csv;"
-        $summaryLines += "                  -MemoryDumpPath only if the dump is moved or analyzed on another machine)"
+        $memDumpNextTo = "the zip"
+        if ($NoCompress) { $memDumpNextTo = "the collection folder" }
+        if ($script:memDumpPath -match '^[A-Za-z]:\\') {
+            $summaryLines += "                  (the timeline builder finds it here through collection_manifest.csv;"
+            $summaryLines += "                  if the dump is moved or analyzed on another machine, put it next"
+            $summaryLines += "                  to $memDumpNextTo under this name)"
+        } else {
+            $summaryLines += "                  (the timeline builder does not open a network path named in"
+            $summaryLines += "                  collection_manifest.csv: to analyze the dump, put it next to"
+            $summaryLines += "                  $memDumpNextTo under this name)"
+        }
     }
 }
 if ($script:memDumpIncompletePath) {

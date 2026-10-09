@@ -238,10 +238,15 @@ prompt) the dump is written to that folder from the start, under the same
 in the collection. The summary names the dump's location (also with
 -NoCompress). The timeline builder finds the dump through the collection
 manifest: collection_manifest.csv records its full path and size wherever
-it ends up (next to the zip, or in that folder). -MemoryDumpPath is needed
-only when the dump is moved or the collection is analyzed on another
-machine; copying the dump next to the zip under its
-<collection>_memory_dump.dmp name works too.
+it ends up (next to the zip, or in that folder), so Run-TimelineBuilder.bat
+finds it with no parameter. If the dump is moved, or the collection is
+analyzed on another machine (where the drive may have another letter), put
+the dump next to the zip under its <collection>_memory_dump.dmp name (next
+to the collection folder with -NoCompress): the timeline builder looks
+there too, and the summary says so. The timeline builder never opens a
+network path (\\server\share\...) named in a manifest, so a dump written
+to one must be put next to the zip the same way. (Run directly,
+timeline-builder.ps1 also takes the dump's path as -MemoryDumpPath.)
 
 Use -NoCompress to keep the uncompressed folder instead.
 
@@ -834,7 +839,8 @@ when the analysis machine uses a different time zone or locale.
                        memory dump, where it is at the end of the run (next
                        to the zip, in the -MemoryOutputPath folder, or in
                        Memory\ when the folder is not zipped). The timeline
-                       builder finds the dump through this row.
+                       builder finds the dump through this row (not on a
+                       network path, which it never opens).
   SizeBytes            Size of the copy
   CollectedAt          Collector's local time when the file was recorded
   RelativePath         Path inside the collection, e.g.
@@ -1326,9 +1332,10 @@ the mounted image for a non-invasive collection.
                    <collection>_memory_dump.dmp (.raw for WinPmem and Magnet
                    RAM Capture); the acquisition log stays in the
                    collection, and collection_manifest.csv records the
-                   dump's full path, where the timeline builder finds it.
-                   Default: Memory\ in the collection, moved next to the
-                   zip at the end.
+                   dump's full path, where the timeline builder finds it
+                   (not on a network path: put such a dump next to the
+                   zip under its name). Default: Memory\ in the
+                   collection, moved next to the zip at the end.
   -MinFreeSpaceGB  Free space in GB to keep on the system drive after the
                    memory dump and the collection. Default: -1 (automatic:
                    10% of the volume, at least 4 and at most 20 GB). 0
@@ -1613,8 +1620,10 @@ capture before collection begins.
     path), or the folder kept unzipped (and the summary corrected) when it
     cannot be moved; moved back with its manifest row when the zip fails;
     the rest of the manifest unchanged, and kept as it was (a warning) when
-    it cannot be changed; the line that the timeline builder finds the dump
-    through the manifest only for a dump that is not next to the zip; a
+    it cannot be changed; for a dump that is not next to the zip, the lines
+    that the timeline builder finds it through the manifest (or, on a
+    network path, does not) and that a moved dump goes next to the zip
+    (next to the folder with -NoCompress), never "pass -MemoryDumpPath"; a
     failed dump still in the folder set aside then, or the folder not
     zipped. The prompt asks again after a bad answer (also a number too
     large for an [int]) and is not shown with -Unattended.

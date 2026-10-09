@@ -13,6 +13,10 @@
 #    and task XML counts from $script:fileCount: a file saved under a
 #    shortened name, or with [ ] in its name, still counts; an empty one
 #    does not.
+#  - Copy-TriageFilesWithinCap and Copy-TriageCappedFile (browser session
+#    files, history snapshots, extension manifests), which count the same
+#    way: a copy saved under a shortened name counts, and its size counts
+#    toward the total cap.
 # Folders stand in for the shadow copy and the target volume, and a
 # stand-in replaces the raw NTFS read, so no snapshot is made and no admin
 # rights are needed (Test-RawCopy.ps1 covers the raw NTFS read itself).
@@ -343,6 +347,63 @@ try {
         Result = $(if ($problems.Count -gt 0) { "FAIL" } else { "PASS" })
         Case   = "Recent LNK count"
         Expect = "3 counted"
+        Note   = ($problems -join "; ")
+    })
+
+    # --- Browser file copies within a total cap (Copy-TriageFilesWithinCap,
+    # Copy-TriageCappedFile) ---
+    # The copy saved under a shortened name counts, with its size, toward
+    # the cap: of 600 + 600 + 300 bytes under a 1000-byte cap the second file
+    # is skipped. Counted by the original name, the first copy was missed,
+    # so the second was copied too and the cap overrun
+    Write-Host "Case: browser copies within a cap"
+    $browserRel = "Users\Case16\Browser"
+    $browserSource = Join-Path $targetDir $browserRel
+    $longBrowserName = "Snapshot of " + ("b" * 88) + ".dat"
+    $null = New-TestFile -Root $targetDir -RelativePath "$browserRel\$longBrowserName" -Size 600
+    $null = New-TestFile -Root $targetDir -RelativePath "$browserRel\Plain.dat" -Size 600
+    $null = New-TestFile -Root $targetDir -RelativePath "$browserRel\Report [x].dat" -Size 300
+    $longManifestName = "Manifest " + ("m" * 88) + ".json"
+    $null = New-TestFile -Root $targetDir -RelativePath "$browserRel\$longManifestName" -Size 200
+    $browserDest = Join-Path $OutputPath "Browser\Case16"
+    $cappedDest = Join-Path $OutputPath "Browser\Case16Capped"
+
+    $logBefore = Get-LogLines
+    $errorsBefore = $script:errorCount
+    $filesBefore = $script:fileCount
+    $problems = New-Object System.Collections.Generic.List[string]
+    $ErrorActionPreference = "Continue"
+    try {
+        $browserFiles = @(foreach ($name in @($longBrowserName, "Plain.dat", "Report [x].dat")) {
+            Get-Item -LiteralPath (Join-Path $browserSource $name) -Force
+        })
+        $returned = @(Copy-TriageFilesWithinCap -Files $browserFiles -SourceRoot $browserSource -DestRoot $browserDest -MaxTotalBytes 1000 -Label "test file")
+        $cappedReturned = @(Copy-TriageCappedFile -SourcePath (Join-Path $browserSource $longManifestName) -DestDir $cappedDest -DestName $longManifestName -MaxBytes 1MB)
+    } finally {
+        $ErrorActionPreference = "Stop"
+    }
+    $saved = @(Get-ChildItem -LiteralPath $browserDest -Force -File -ErrorAction SilentlyContinue)
+    if ($returned.Count -ne 1 -or $returned[0] -isnot [int] -or $returned[0] -ne 2) { $problems.Add("returned '$($returned -join ', ')' instead of 2") }
+    if ($saved.Count -ne 2) { $problems.Add("$($saved.Count) file(s) saved, expected 2: $($saved.Name -join ', ')") }
+    if (@($saved | Where-Object { $_.Name -match '^Snapshot.*~[0-9A-F]{8}\.dat$' -and $_.Name.Length -le 100 }).Count -ne 1) {
+        $problems.Add("no shortened copy of the long name: $($saved.Name -join ', ')")
+    }
+    if (Test-Path -LiteralPath (Join-Path $browserDest "Plain.dat")) { $problems.Add("file over the cap copied") }
+    if (-not (Test-Path -LiteralPath (Join-Path $browserDest "Report [x].dat"))) { $problems.Add("[ ] name not saved under its own name") }
+    if ($cappedReturned.Count -ne 1 -or $cappedReturned[0] -isnot [bool] -or -not $cappedReturned[0]) {
+        $problems.Add("Copy-TriageCappedFile returned '$($cappedReturned -join ', ')' instead of True for a copy saved under a shortened name")
+    }
+    if (($script:fileCount - $filesBefore) -ne 3) { $problems.Add("file count went up by $($script:fileCount - $filesBefore), expected 3") }
+    if ($script:errorCount -ne $errorsBefore) { $problems.Add("error count changed") }
+    $logNew = @(Get-LogLines | Select-Object -Skip $logBefore.Count)
+    if ($logNew.Count -ne 1 -or $logNew[0] -notmatch '\] Skipped 1 test file\(s\) in .* total cap\): Plain\.dat \(0 MB\)$') {
+        $problems.Add("log: expected one 'Skipped 1 test file(s) ... Plain.dat' line, got: $($logNew -join ' | ')")
+    }
+    if ($problems.Count -gt 0) { $failures++ }
+    $results.Add([PSCustomObject]@{
+        Result = $(if ($problems.Count -gt 0) { "FAIL" } else { "PASS" })
+        Case   = "Browser copies within a cap"
+        Expect = "2 counted, 1 skipped"
         Note   = ($problems -join "; ")
     })
 }

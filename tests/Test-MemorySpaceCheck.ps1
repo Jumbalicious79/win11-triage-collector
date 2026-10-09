@@ -1101,6 +1101,8 @@ try {
     ) -Problems $problems -Where "screen"
     if (@($final.Screen | Where-Object { $_ -match 'Compressing to:|Memory dump detected' }).Count -gt 0) { $problems.Add("compression started, or the dump taken for a good one") }
     if ($final.Zip -or -not $final.Folder -or (Get-FileLength $final.Dump) -ne 4) { $problems.Add("zip $($final.Zip), folder kept $($final.Folder), dump in it $((Get-FileLength $final.Dump) -eq 4)") }
+    # No dump row (the dump failed): the manifest is as it was
+    Test-ManifestAfter -Before $final.ManifestBefore -After $final.FolderManifest -Tool "DumpIt" -DestPath "" -RelativePath "" -Problems $problems -Where "in the folder"
     Add-Result "compression: failed dump still in the folder -> no zip" $problems
 
     # ... and when it can be moved by then: set aside, the folder zipped
@@ -1207,6 +1209,7 @@ try {
     Test-LinesInOrder -Lines $final.Screen -Expected @(('^  Memory dump:    INCOMPLETE, not for analysis: ' + [regex]::Escape($final.SetAside) + '$')) -Problems $problems -Where "screen"
     if (@($final.Screen | Where-Object { $_ -match 'WARNING' }).Count -gt 0) { $problems.Add("a warning for a dump already set aside") }
     if ((Get-FileLength $final.SetAside) -ne 4) { $problems.Add("set-aside dump moved") }
+    Test-ManifestAfter -Before $final.ManifestBefore -After $final.FolderManifest -Tool "DumpIt" -DestPath "" -RelativePath "" -Problems $problems -Where "in the folder"
     Add-Result "summary: incomplete dump named" $problems
 
     # -MemoryOutputPath = the folder that holds the collection and its zip:

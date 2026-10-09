@@ -61,6 +61,48 @@ jobs:
       - name: Run raw copy test
         run: ./tests/Test-RawCopy.ps1
 
+  collection-tests:
+    # Builds fake mounted images (subst) holding synthetic artifacts and
+    # checks what the collector copies from them; some tests add live checks
+    # on the runner (the collector needs Administrator: runners are elevated)
+    name: Collection tests (${{ matrix.shell }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shell: [powershell, pwsh]
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # Each step runs even if an earlier one failed, so one run reports
+      # every failing collection area
+      - name: Run event log collection test
+        if: ${{ !cancelled() }}
+        run: ./tests/Test-CollectEventLogs.ps1
+
+      - name: Run browser collection test
+        if: ${{ !cancelled() }}
+        run: ./tests/Test-CollectBrowser.ps1
+
+      - name: Run email collection test
+        if: ${{ !cancelled() }}
+        run: ./tests/Test-CollectEmail.ps1
+
+      - name: Run SRUM collection test
+        if: ${{ !cancelled() }}
+        run: ./tests/Test-CollectSrum.ps1
+
+      - name: Run Defender collection test
+        if: ${{ !cancelled() }}
+        run: ./tests/Test-CollectDefender.ps1
+
+      - name: Run secrets collection test
+        if: ${{ !cancelled() }}
+        run: ./tests/Test-CollectSecrets.ps1
+
   unit-tests:
     # Tests of single collector functions, loaded from the script's syntax
     # tree: no collection runs and no admin rights are needed. Steps after

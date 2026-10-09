@@ -459,8 +459,9 @@ $script:errorCount = 0
 $script:totalBytes = 0
 # How the last Copy-ForensicFile call made its copy, for callers that report
 # the outcome themselves (Copy-HiveFile): "direct copy", or for a locked file
-# "shadow copy" / "raw NTFS read"; "" when it made none. Whether the copy was
-# kept (recorded in the manifest) shows in $script:fileCount
+# (with -FallbackOnAccessDenied also an access-denied one) "shadow copy" /
+# "raw NTFS read"; "" when it made none. Whether the copy was kept (recorded
+# in the manifest) shows in $script:fileCount
 $script:lastForensicCopyMethod = ""
 
 function Copy-ForensicFile {

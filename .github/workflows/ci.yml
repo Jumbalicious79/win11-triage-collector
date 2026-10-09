@@ -131,6 +131,10 @@ jobs:
         if: ${{ !cancelled() }}
         run: ./tests/Test-CollectionZip.ps1
 
+      - name: Run mounted devices test
+        if: ${{ !cancelled() }}
+        run: ./tests/Test-MountedDevices.ps1
+
   analyze:
     name: PSScriptAnalyzer
     runs-on: windows-latest

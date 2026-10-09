@@ -1116,6 +1116,17 @@ function Write-CollectionInfo {
     }
 }
 
+# Format-List and Format-Table show only the first $FormatEnumerationLimit
+# items of a list (4 by default) and then "...", which cut, for example,
+# the HardwareID lists in usb_storage_devices.txt and the exclusion lists
+# in defender_preferences.txt. No limit for this run; the finally block of
+# the try below restores the old value. The formatter reads only the
+# global variable: a plain assignment here works when the script is
+# started with -File (its top level is then the global scope), but not
+# when it is run from an open PowerShell window.
+$savedFormatEnumerationLimit = $global:FormatEnumerationLimit
+$global:FormatEnumerationLimit = -1
+
 # =============================================================
 # Collection body. Everything from here down to the "Cleanup"
 # banner runs inside this try block. Its finally block (at the
@@ -3001,6 +3012,115 @@ function Get-TriageUsbStorageRows {
     return $rows
 }
 
+# One MountedDevices value, decoded. Kind:
+#   GPT         "DMIO:ID:" + partition GUID (24 bytes; also dynamic volumes)
+#   MBR         disk signature (4 bytes) + partition offset in bytes (8)
+#   DevicePath  UTF-16 device path starting "_??_" or "\??\", such as
+#               _??_USBSTOR#Disk&Ven_...&Prod_...#<serial>&0#{...}
+#   Other       anything else, including a value that is not binary
+# HexData is the raw data (as text for a value that is not binary)
+function ConvertFrom-TriageMountedDeviceValue {
+    param([string]$Name, $Data)
+    $row = [ordered]@{
+        Name            = $Name
+        Kind            = "Other"
+        DiskSignature   = ""
+        PartitionOffset = ""
+        PartitionGuid   = ""
+        DevicePath      = ""
+        DataLength      = 0
+        HexData         = ""
+    }
+    if ($Data -isnot [byte[]]) {
+        $row.HexData = Format-TriageRegValue $Data
+        return [PSCustomObject]$row
+    }
+    $row.DataLength = $Data.Length
+    $row.HexData = [BitConverter]::ToString($Data).Replace("-", "")
+    if ($Data.Length -eq 24 -and [Text.Encoding]::ASCII.GetString($Data, 0, 8) -eq "DMIO:ID:") {
+        $row.Kind = "GPT"
+        $row.PartitionGuid = (New-Object Guid (, [byte[]]$Data[8..23])).ToString("B")
+    } elseif ($Data.Length -eq 12) {
+        $row.Kind = "MBR"
+        $row.DiskSignature = "{0:X8}" -f [BitConverter]::ToUInt32($Data, 0)
+        $row.PartitionOffset = [string][BitConverter]::ToUInt64($Data, 4)
+    } elseif ($Data.Length -ge 8 -and $Data.Length % 2 -eq 0 -and $Data[1] -eq 0) {
+        $text = [Text.Encoding]::Unicode.GetString($Data).TrimEnd([char]0)
+        if ($text -match '^(_\?\?_|\\\?\?\\)') {
+            $row.Kind = "DevicePath"
+            $row.DevicePath = $text
+        }
+    }
+    return [PSCustomObject]$row
+}
+
+# Every value of HKLM\SYSTEM\MountedDevices, decoded, with the key's
+# last-write time (Hive and KeyPath as for Open-TriageRegKey)
+function Get-TriageMountedDeviceRows {
+    param(
+        [string]$Hive = "HKLM",
+        [string]$KeyPath = "SYSTEM\MountedDevices"
+    )
+    $rows = @()
+    $key = Open-TriageRegKey -Hive $Hive -SubKey $KeyPath
+    if ($null -eq $key) { return $rows }
+    try {
+        $lastWrite = Get-TriageRegLastWriteUtc -Key $key
+        foreach ($valueName in $key.GetValueNames()) {
+            $data = $key.GetValue($valueName, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+            $row = ConvertFrom-TriageMountedDeviceValue -Name $valueName -Data $data
+            $row | Add-Member -NotePropertyName KeyLastWriteUtc -NotePropertyValue $lastWrite
+            $rows += $row
+        }
+    } catch {
+        Log-Warning "Could not read $Hive\$KeyPath for mounted_devices.csv -- $($_.Exception.Message)"
+    } finally {
+        $key.Close()
+    }
+    return $rows
+}
+
+# Write mounted_devices.csv and mounted_devices.txt (the same rows for
+# humans) and log the number of values of each kind
+function Save-TriageMountedDevices {
+    [OutputType([void])]
+    param(
+        [string]$UsbDir,
+        [string]$Hive = "HKLM",
+        [string]$KeyPath = "SYSTEM\MountedDevices"
+    )
+    # The timeline builder reads these columns
+    $columns = @("Name", "Kind", "DiskSignature", "PartitionOffset", "PartitionGuid", "DevicePath",
+        "DataLength", "HexData", "KeyLastWriteUtc")
+    $mountedRows = @(Get-TriageMountedDeviceRows -Hive $Hive -KeyPath $KeyPath)
+    Export-TriageCsv -Description "Mounted devices (decoded)" `
+        -DestPath (Join-Path $UsbDir "mounted_devices.csv") `
+        -Columns $columns `
+        -Rows $mountedRows
+
+    # Out-String with a wide width keeps each value on one line (Out-File
+    # in Windows PowerShell wraps list values at the console width)
+    Save-CommandOutput -Description "Mounted devices" `
+        -DestPath (Join-Path $UsbDir "mounted_devices.txt") `
+        -Command {
+            if ($mountedRows.Count -gt 0) {
+                $mountedRows | Select-Object -Property $columns | Format-List | Out-String -Width 4096
+            } else {
+                Write-Output "(no values: $Hive\$KeyPath missing, empty or not readable)"
+            }
+        }
+
+    if ($mountedRows.Count -gt 0) {
+        $kindCounts = foreach ($kind in @("GPT", "MBR", "DevicePath", "Other")) {
+            $kindCount = @($mountedRows | Where-Object { $_.Kind -eq $kind }).Count
+            if ($kindCount -gt 0) { "$kindCount $kind" }
+        }
+        Log-Success "Collected $($mountedRows.Count) mounted device value(s): $($kindCounts -join ', ')."
+    } else {
+        Log-Warning "No mounted devices found ($Hive\$KeyPath missing, empty or not readable)."
+    }
+}
+
 # Task Scheduler time -> UTC "o"; "never" (1999-11-30 or MinValue) or missing -> ""
 function Format-TriageTaskTime {
     param($Value)
@@ -4368,12 +4488,11 @@ if ($Categories -contains "USB") {
                     Format-List
             }
 
-        # MountedDevices
-        Save-CommandOutput -Description "Mounted devices" `
-            -DestPath (Join-Path $usbDir "mounted_devices.txt") `
-            -Command {
-                Get-ItemProperty "HKLM:\SYSTEM\MountedDevices" -ErrorAction SilentlyContinue | Format-List
-            }
+        # MountedDevices: each drive letter and volume GUID with the GPT
+        # partition, MBR disk and offset, or device path behind it, decoded
+        # (the raw bytes stay in HexData)
+        Log "Collecting mounted devices..."
+        Save-TriageMountedDevices -UsbDir $usbDir
     } else {
         Log "Skipping USB registry queries (mounted image -- use collected SYSTEM hive for USB analysis)"
     }
@@ -5919,6 +6038,7 @@ $script:collectionCompleted = $true
 # Defender exclusion are never left behind. (Closing the console window
 # kills the process outright; that cannot be caught.)
 } finally {
+    $global:FormatEnumerationLimit = $savedFormatEnumerationLimit
     Invoke-CollectionCleanup
 }
 

@@ -956,7 +956,8 @@ The fastest path from collection to analysis:
     letter to get them.
     Warning: "Raw $MFT, $LogFile and $UsnJrnl:$J not collected: cannot open \\.\C: (...)"
 
-  - Very large volumes (millions of files) can have a $MFT of several GB.
+  - Very large volumes (millions of files) can have a $MFT of several GB,
+    and the SRUM database (copied up to 16 GB) can also pass 4 GB.
     The zip handles files that large (Zip64), but a FAT32 output drive
     (common on USB sticks) cannot hold any file over 4 GB, so on FAT32 such
     a copy, or a zip that would grow past 4 GB, fails: use an NTFS or exFAT

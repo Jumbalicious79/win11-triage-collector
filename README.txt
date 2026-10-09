@@ -110,6 +110,10 @@ is not the live system drive and switches to MOUNTED IMAGE mode:
     - AV log files (Defender support logs, third-party AV logs)
     - USB setupapi.dev.log and rotated setupapi.dev.<date>.log files
     - Amcache.hve (+ .LOG1/.LOG2 transaction logs)
+    - SRUM database and its logs (Windows\System32\sru)
+    - Defender DetectionHistory files and quarantine metadata
+      (Quarantine\Entries; never the quarantined files)
+    - Email: attachment copies and listings (see Email below)
 
   Skipped (requires live system):
     - Network state (DNS, ARP, TCP connections, firewall, Wi-Fi)
@@ -119,6 +123,8 @@ is not the live system drive and switches to MOUNTED IMAGE mode:
     - Scheduled task run times (scheduled_tasks.csv)
     - WMI queries (services, startup commands, drivers, WMI subscriptions)
     - Defender cmdlets (detections, status, preferences)
+    - OutlookSecureTempFolder lookup (the Content.Outlook folders are
+      listed instead; the value is in the collected NTUSER.DAT)
     - Shadow copies (not needed -- files are not locked)
     - systeminfo (would report collector host, not target)
 
@@ -251,7 +257,13 @@ Inside the zip:
       Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational.evtx
       Microsoft-Windows-Windows Defender%4Operational.evtx
       Microsoft-Windows-Bits-Client%4Operational.evtx
-      (Sysmon, Task Scheduler -- if present on the system)
+      Windows PowerShell.evtx         -- classic PowerShell log
+      Microsoft-Windows-WMI-Activity%4Operational.evtx
+      Microsoft-Windows-TerminalServices-RDPClient%4Operational.evtx
+      Microsoft-Windows-NTLM%4Operational.evtx
+      Microsoft-Windows-Windows Firewall With Advanced Security%4Firewall.evtx
+      Microsoft-Windows-Shell-Core%4Operational.evtx
+      (Sysmon, Task Scheduler, OAlerts -- if present on the system)
     Execution\
       Prefetch\                       -- all .pf files (program execution evidence)
       RecentApps\<user>\RecentApps.reg  -- per logged-in user, only if the key
@@ -259,6 +271,8 @@ Inside the zip:
       bam_entries.csv                 -- BAM: per-user program paths with
                                          decoded last-execution times (UTC)
       appcompat_cache.reg             -- ShimCache execution artifacts
+      SRUM\                           -- SRUDB.dat (SRUM database) with its
+                                         checkpoint, logs and flush map
     Network\
       dns_cache.txt                   -- recently resolved domains
       arp_cache.txt                   -- local network neighbors
@@ -277,8 +291,15 @@ Inside the zip:
       buzz_\
         Chrome\                       -- History, Bookmarks, Login Data, etc.
           <profile>\Network\Cookies   -- cookies (current Chromium location)
+          <profile>\Preferences, Secure Preferences, Favicons, Sessions\,
+            Extensions\<id>\<version>\manifest.json
+                                      -- settings, extensions, open and
+                                         closed tabs (secrets blanked)
+          Local State, Snapshots\     -- browser settings; pre-update copies
+                                         of History and Favicons
         Edge\                         -- same artifacts as Chrome
-      (Firefox -- if installed)
+      (Firefox -- if installed; also extensions.json, addons.json, prefs.js
+       and session files)
     USB\
       setupapi.dev.log                -- device installation log (first-connect times)
       setupapi.dev.<yyyymmdd_hhmmss>.log  -- older logs rotated by Windows
@@ -313,6 +334,8 @@ Inside the zip:
       defender_status.txt             -- Defender real-time status
       defender_preferences.txt        -- Defender configuration/exclusions
       Defender\                       -- Defender support logs (last 10)
+        DetectionHistory\<nn>\        -- one file per Defender detection
+        Quarantine\Entries\           -- quarantine metadata (encrypted)
       Symantec_SEP\                   -- if installed
       CrowdStrike\                    -- if installed
       SentinelOne\                    -- if installed
@@ -327,6 +350,26 @@ Inside the zip:
       Webroot\                        -- if installed
       Norton\                         -- if installed
       Cylance\                        -- if installed
+    Email\                            -- per user, only where email data exists
+      <user>\
+        Outlook\
+          outlook_temp_files.csv      -- classic Outlook attachment temp
+                                         folder listing (Content.Outlook)
+          SecureTemp\<folder>\        -- copied attachments (capped)
+          outlook_data_files.csv      -- OST/PST files (listed, not copied)
+        NewOutlook\
+          olk_files.csv               -- listing of the new Outlook's Olk
+          UserSettings.json           -- signed-in accounts
+          Attachments\                -- copied attachments (capped)
+        Thunderbird\
+          profiles.ini
+          <profile>\prefs.js          -- account settings
+          <profile>\global-messages-db.sqlite
+                                      -- search index, only with
+                                         -IncludeThunderbirdIndex
+          thunderbird_mail_files.csv  -- Mail\ and ImapMail\ listing
+        WindowsMail\
+          windows_mail_files.csv      -- Windows Mail store listing
 
 
 ## What Gets Collected
@@ -398,6 +441,29 @@ Inside the zip:
   TerminalServices           RDP logins (lateral movement).
   Windows Defender           Detections, scans, exclusion changes.
   BITS Client                Background transfers (stealthy downloads).
+  Windows PowerShell         Classic PowerShell log: engine starts with the
+                             command line that started them (400), pipeline
+                             details (800), PowerShell 2.0 downgrades.
+  WMI-Activity               WMI event subscriptions (permanent ones are a
+                             persistence method).
+  RDP client                 Outbound RDP connections made from this machine.
+  NTLM                       NTLM authentication, in and out (written only
+                             when NTLM auditing is enabled).
+  Windows Firewall           Firewall rule and setting changes.
+  Shell-Core                 Run / RunOnce and Active Setup commands started
+                             at logon.
+  OAlerts (if Office)        Alerts shown by Office applications (macro and
+                             Protected View prompts, ...) and add-in events.
+
+  The seven logs above, from Windows PowerShell on, are collected like the
+  others (wevtutil on a live system, a file copy from a mounted image), but
+  with a 256 MB limit: their default maximum size is 1 MB (15 MB for Windows
+  PowerShell), so a larger one was enlarged on purpose. Of such a log only
+  the newest events, about 256 MB of them, are exported with wevtutil (also
+  from a mounted image's .evtx file), with a warning that names the record
+  range; one whose events cannot be read is skipped with a warning. A log
+  that does not exist on the target is an info line. The other logs have no
+  size limit.
 
 ### Execution Artifacts
 
@@ -410,6 +476,23 @@ Inside the zip:
                              logged-in user. The key does not exist on Windows
                              11 and recent Windows 10 builds; nothing is written
                              then.
+  SRUM                       System Resource Usage Monitor: bytes sent and
+                             received and CPU/disk use per application and
+                             user, recorded about once an hour and usually
+                             kept for 30-60 days. Every file of
+                             Windows\System32\sru goes to Execution\SRUM\:
+                             the ESE database SRUDB.dat with its checkpoint
+                             (SRU.chk), logs (SRU*.log, SRUtmp.log,
+                             SRUres*.jrs) and flush map (SRUDB.jfm), so the
+                             timeline builder can replay the logs into a
+                             copy of the open database. Live system: when
+                             SRUDB.dat can be read from the shadow copy,
+                             every file comes from there (one moment);
+                             otherwise from the volume (raw NTFS read if
+                             locked), and the log says they may be from
+                             slightly different moments. Files over 16 GB
+                             (2 GB with -SkipLargeFiles) are skipped and
+                             logged. Live system and mounted images.
 
 ### Network
 
@@ -431,11 +514,56 @@ Inside the zip:
 
   History, Bookmarks, Login Data, Cookies, Downloads, Preferences.
   Supports Chrome, Edge, Brave, Opera, Opera GX, Vivaldi (all Chromium-based)
-  and Firefox. Per-user, per-profile.
+  and Firefox. Per-user, per-profile (Default, Profile <n> and the Guest
+  profile).
   Cookies of the Chromium-based browsers: current versions keep them in
   <profile>\Network\Cookies (collected to <profile>\Network\Cookies, with
   Network\Cookies-journal if present); the profile-root Cookies file of
   older versions is collected too when it exists.
+
+  Extensions, sessions, settings and history snapshots, for the timeline
+  builder. Every file has a size cap; skipped files are logged.
+    Chromium, per profile    Preferences and Secure Preferences (settings,
+                             installed extensions; 32 MB each), Favicons
+                             (256 MB), Sessions\Session_* and Tabs_* (also
+                             the older Current/Last Session and Tabs files;
+                             newest first, 64 MB in all), and
+                             Extensions\<id>\<version>\manifest.json with
+                             the default locale's messages.json (1 MB each;
+                             no other locales, no extension code).
+    Chromium, per browser    Local State (32 MB) and the pre-update copies
+                             Snapshots\<version>\<profile>\History and
+                             Favicons, which can hold history deleted since
+                             (newest version first, 1 GB in all).
+    Firefox, per profile     extensions.json and addons.json (32 MB each),
+                             prefs.js (16 MB), sessionstore.jsonlz4 and
+                             sessionstore-backups\ (newest first, 64 MB in
+                             all).
+
+  Browser secrets are blanked in the copies of these files, so the copies
+  are not byte-identical to the originals (the manifest has the original
+  path and times and the hash of the copy; the log names each file):
+    - Local State, Preferences, Secure Preferences: the encrypted keys that
+      protect saved passwords and cookies (os_crypt), password hashes, the
+      sync encryption keys, and every member named like a token, salt or
+      encrypted key
+    - Firefox prefs.js: the value of every pref whose name contains
+      "token", "secret", "password" or "userAgentID"
+    - Chromium session files: the page state (form contents, POST data) of
+      every entry is zeroed; URLs, titles and times are kept
+    - Firefox session files: session cookies, form data, session storage,
+      POST data, page state and typed address-bar text are emptied (the
+      copy is a valid mozLz4 file stored uncompressed, so it is larger)
+  A file that cannot be read well enough to blank it (damaged, or an
+  encrypted Chromium session file) is not collected. These files are read
+  in place with sharing, without the shadow copy or raw NTFS fallback.
+  Login Data, Cookies and Web Data are still copied unchanged.
+
+  With -IncludeSecrets the blanking above is skipped: every one of these
+  files is copied unaltered through the normal copy path (with the shadow
+  copy / raw NTFS fallbacks), so each copy is byte-for-byte the original and
+  its manifest hash equals the original's. The size caps still apply. See
+  "Secrets" below and the -IncludeSecrets parameter.
 
 ### USB
 
@@ -475,6 +603,19 @@ Inside the zip:
   Installed AV products      All registered AV products via WMI SecurityCenter2.
   Windows Defender           Detection history, threat catalog, real-time status,
                              configured preferences/exclusions, and support logs.
+                             From the live system and mounted images also
+                             the DetectionHistory files (one per detection:
+                             threat, resources, user, process, SHA-256,
+                             times; Defender deletes them after 15 days by
+                             default) and the quarantine metadata in
+                             Quarantine\Entries (original path, threat
+                             name, quarantine time; encrypted, decoded by
+                             the timeline builder). Files over 1 MB and
+                             empty files are skipped, and at most the newest
+                             2,000 per folder are collected (logged). The
+                             quarantined files themselves
+                             (Quarantine\ResourceData) and
+                             Quarantine\Resources are never collected.
   Third-party AV logs        Auto-detected and collected if installed:
                              Symantec SEP, CrowdStrike Falcon, SentinelOne,
                              Carbon Black, Malwarebytes, Sophos, ESET,
@@ -482,6 +623,116 @@ Inside the zip:
                              Webroot, Norton, Cylance.
   AV event logs              Windows event logs from AV products (Symantec,
                              CrowdStrike) collected via wevtutil if present.
+
+### Email
+
+  Per user profile, on the live system and on mounted images, into
+  Email\<user>\ (only for users with email data; others get an info line).
+  Mail contents are never copied: OST/PST files, Thunderbird mailboxes and
+  the new Outlook's and Windows Mail's mail stores are only listed. Parsing
+  OST/PST content is deferred.
+
+  Outlook attachments        Classic Outlook saves an attachment to its
+  (classic)                  temp folder (INetCache\Content.Outlook\
+                             <random>\) when it is opened. Every file there
+                             is listed in Outlook\outlook_temp_files.csv and
+                             copied to Outlook\SecureTemp\. Live system: the
+                             folder each logged-on user's Outlook is set to
+                             (OutlookSecureTempFolder under HKU\<SID>\
+                             Software\Microsoft\Office\<version>\Outlook\
+                             Security) is read too, with that user's own
+                             environment variables; a value that is not a
+                             folder below a drive or share root (such as
+                             "C:\") is refused and logged.
+  New Outlook (olk)          AppData\Local\Microsoft\Olk: UserSettings.json
+                             (signed-in accounts) and Attachments\ (opened,
+                             sent and received attachments) are copied; the
+                             whole folder is listed in
+                             NewOutlook\olk_files.csv (its mail data in
+                             EBWebView\ is listed, not copied).
+  Outlook data files         *.ost / *.pst in AppData\Local\Microsoft\Outlook
+                             and *.pst in Documents\Outlook Files (also
+                             under OneDrive*\): listed in
+                             Outlook\outlook_data_files.csv, never copied.
+  Thunderbird                profiles.ini and each profile's prefs.js
+                             (account settings) are copied; Mail\ and
+                             ImapMail\ are listed in
+                             Thunderbird\thunderbird_mail_files.csv. The
+                             search index global-messages-db.sqlite (with
+                             its -wal/-journal, up to 1 GB) is copied only
+                             with -IncludeThunderbirdIndex, because it holds
+                             the text of the indexed messages; without the
+                             switch only its size is logged.
+  Windows Mail               The app's LocalState and AppData\Local\Comms\
+                             UnistoreDB are listed in
+                             WindowsMail\windows_mail_files.csv.
+
+  Caps: attachments are copied newest first, up to 50 MB per file, 500 MB
+  per user (both Outlooks together) and 2 GB for all users together (10 MB,
+  100 MB and 500 MB with -SkipLargeFiles). A listing stops at 20,000 files
+  per folder (attachment folders keep the newest). Skipped files are logged
+  with the reason (the first 25 per user); all of them are in the listing
+  CSVs. Junctions and symbolic links are never followed, and OneDrive
+  placeholders are listed but not read (reading one would download it).
+
+  The copied attachments are files someone opened, sent or received by mail
+  and can be malware; handle the collection accordingly.
+
+### Secrets (opt-in: -IncludeSecrets, authorized examinations only)
+
+  Collected only with -IncludeSecrets, into a top-level Secrets\ folder, on
+  both live systems and mounted images. This is the DPAPI credential material
+  an examiner needs to decrypt the unredacted browser copies (and the user's
+  other DPAPI-protected data) offline.
+
+    Per user (Secrets\<user>\...)
+      AppData\Roaming\Microsoft\Protect    DPAPI master keys: the <SID>\
+                                           subfolder (the master key GUID
+                                           files, including hidden/system
+                                           ones), Preferred and CREDHIST
+      AppData\Roaming\Microsoft\Credentials   roaming credential blobs
+      AppData\Local\Microsoft\Credentials     local credential blobs
+      AppData\Local\Microsoft\Vault            Windows Vault (vcrd/vpol)
+    System (Secrets\System\...)
+      System32\Microsoft\Protect\S-1-5-18  the machine DPAPI master keys and
+                                           their User\ subfolder. These are
+                                           hidden/system files that current
+                                           Windows lets administrators read, so
+                                           they copy directly; on a hardened
+                                           system where access is denied, the
+                                           shadow-copy / raw-NTFS fallback is a
+                                           safety net and anything that still
+                                           cannot be read is logged.
+
+  All of these files are small. A shared total cap guards against anything
+  unexpected and skips are logged; junctions and symbolic links out of a
+  profile are never followed (a credential folder that is itself a link is
+  skipped and logged). Collected copies keep the original path and times in
+  the manifest, and (unlike the blanked browser copies) their hashes match the
+  originals.
+
+  Not collected: SYSTEM-account Credential Manager and machine Vault stores
+  (systemprofile and ServiceProfiles AppData, ProgramData\Microsoft\Vault).
+  The machine (S-1-5-18) master keys above decrypt them, but the vaults
+  themselves are out of scope here; collect them separately if a case needs
+  them.
+
+  Why this is enough for offline decryption of the user's data: the per-user
+  Protect master keys are encrypted with a key derived from the user's
+  password (or escrowed to the domain's DPAPI backup key), so with the user's
+  password or the domain backup key the saved passwords and session cookies in
+  the unredacted browser copies can be decrypted on the analysis machine --
+  the Registry hives are not needed for that. The machine (S-1-5-18) master
+  keys instead need DPAPI_SYSTEM from the SECURITY hive, unlocked with the boot
+  key from the SYSTEM hive; SAM holds local password hashes. SYSTEM, SECURITY
+  and SAM are collected by the Registry category (selected by default), so for
+  the machine keys include that category. The one thing none of this gives you
+  is Chrome/Edge App-Bound Encryption, which can only be undone on the live
+  machine (see Known Limitations).
+
+  A prominent warning is logged at the start of a run with -IncludeSecrets:
+  the collection then holds secrets equivalent to a password store and must
+  be handled, stored and transferred accordingly.
 
 
 ## Output File Formats
@@ -508,10 +759,18 @@ Written at the start of the run, at the root of the collection:
   TargetTimeZoneId     Time zone of the examined Windows install. Live: same
                        as CollectorTimeZoneId. Mounted image: TimeZoneKeyName
                        from the image's SYSTEM hive, or null if unreadable.
+  SecretsIncluded      true when the run used -IncludeSecrets: the browser
+                       copies are unredacted and the collection holds the
+                       Secrets\ folder (DPAPI credential material). The
+                       timeline builder logs one line when this is true and
+                       reads nothing under Secrets\.
+  ThunderbirdIndexIncluded  true when the run used -IncludeThunderbirdIndex
+                       (Thunderbird's search index was copied).
 
-The timeline builder uses these to convert local-time text (USN journal,
-setupapi logs) correctly even when the analysis machine uses a different
-time zone or locale.
+SecretsIncluded and ThunderbirdIndexIncluded are additive fields;
+SchemaVersion stays 1. The timeline builder uses the time-zone and culture
+fields to convert local-time text (USN journal, setupapi logs) correctly even
+when the analysis machine uses a different time zone or locale.
 
 ### collection_manifest.csv
 
@@ -606,6 +865,29 @@ run_keys.txt lists the same keys plus Shell Folders / User Shell Folders.
   LastRemovalUtc       Last time the device was removed
 
 Devices that are no longer connected are included.
+
+### Email\<user>\...\*_files.csv  (live system and mounted images)
+
+outlook_temp_files.csv, outlook_data_files.csv, olk_files.csv,
+thunderbird_mail_files.csv and windows_mail_files.csv, one row per file:
+
+  User                 Profile folder name
+  Program              "Classic Outlook", "New Outlook", "Thunderbird" or
+                       "Windows Mail"
+  Store                SecureTemp (attachment temp folder), DataFile
+                       (OST/PST), Olk, ThunderbirdMail or WindowsMail
+  Profile              Thunderbird profile folder (blank otherwise)
+  Path                 Full original path
+  RelativePath         Path below the listed folder
+  SizeBytes            File size
+  CreatedUtc           Created / modified / accessed times of the file,
+  ModifiedUtc          read before it was copied
+  AccessedUtc
+  Status               Copied; Listed (listing only, by design); "Skipped:
+                       <reason>" (over a cap, empty file, link or cloud
+                       placeholder); "Not copied: copy failed (see
+                       collection_log.txt)"
+  CollectedAs          Path of the copy inside the collection (Copied rows)
 
 
 ## Analyzing the Output
@@ -743,12 +1025,71 @@ The fastest path from collection to analysis:
     shadow copy and the raw NTFS read all fail.
     Warning: "Could not copy (locked; shadow copy and raw NTFS read also failed)"
 
-  - Sysmon and Task Scheduler logs only collected if present on the system.
-    These are not installed by default on Windows 11 Home.
-    Message: "Skipping Microsoft-Windows-Sysmon%4Operational.evtx (not present)"
+  - Sysmon, Task Scheduler and OAlerts logs only collected if present on the
+    system. Sysmon and Task Scheduler are not installed by default on
+    Windows 11 Home; OAlerts.evtx exists only where Office is installed.
+    Message: "Skipping Microsoft-Windows-Sysmon%4Operational.evtx (not present on target)"
+
+  - The Phase 2 event logs (Windows PowerShell, WMI-Activity, RDP client,
+    NTLM, Firewall, Shell-Core, OAlerts) have a 256 MB limit; of a larger
+    one only the newest events are collected.
+    Warning: "Collected only the newest events of <log>.evtx (<n> MB, over
+    the 256 MB limit for this log): records <first>-<newest> of
+    <oldest>-<newest>"
+
+  - SRUM: on a live system SRUDB.dat is open, so its copy is normally in
+    "dirty shutdown" state; its logs are collected with it from the same
+    shadow copy and the timeline builder replays them into a temp copy.
+    When SRUDB.dat cannot be read from the shadow copy (the line gives the
+    reason when the copy failed), the files come from the volume and may be
+    from slightly different moments; the builder may then have to repair
+    its copy, which can lose the newest records. A file that is 0 bytes in
+    the shadow copy is skipped with an info line and is not counted as an
+    error (it is not taken from the volume instead, so all files stay from
+    one moment); a failed copy from the shadow copy gives a warning with
+    the reason. A system without the sru folder gets an info line, not a
+    warning.
+    Message: "SRUDB.dat could not be read from the shadow copy -- the SRUM files are copied from the volume ..."
+    Warning: "Skipped SRUM file ... larger than the 16384 MB size cap"
+
+  - Copied email attachments can be malware. Antivirus on the analysis
+    machine may quarantine them when the zip is extracted; the listing CSVs
+    and the manifest still record them.
 
   - The collection manifest hashes are computed on destination copies, not source
     files. For "reg save" exports, the hash represents the saved snapshot.
+    Browser settings and session files are copied with their secret values
+    blanked (see Browser), so their hashes do not match the originals.
+    Log: "Collected with N secret value(s) blanked (keys, tokens, password
+    hashes): <path>"
+    With -IncludeSecrets these files are copied unaltered instead, so their
+    manifest hashes DO match the originals (see Secrets).
+
+  - -IncludeSecrets (authorized examinations only): the collection holds
+    DPAPI credential material (Secrets\) and unredacted browser files, i.e.
+    secrets equivalent to saved passwords and session cookies. Handle, store
+    and transfer the whole collection like a password store. A prominent
+    warning is logged at the start of such a run.
+    Warning: "-IncludeSecrets is set: browser settings and session files are
+    collected UNREDACTED ..."
+
+  - App-Bound Encryption (Chrome/Edge): newer Chromium versions wrap the
+    profile encryption key with an App-Bound Encryption key that is itself
+    tied to the machine and can only be unwrapped by code running as the
+    logged-in user on that live machine. -IncludeSecrets does NOT try to work
+    around this: it collects the DPAPI material (which still protects older
+    keys and everything else), but App-Bound-protected Chrome/Edge passwords
+    and cookies cannot be decrypted from an offline copy. Decrypt those on the
+    live machine before collecting if the case needs them.
+
+  - The system DPAPI master keys (System32\Microsoft\Protect\S-1-5-18) are
+    hidden/system files that current Windows lets administrators read, so they
+    are normally copied directly. On a hardened system where access is denied,
+    the collector falls back to the shadow copy / raw NTFS read (the raw read
+    bypasses the ACL); if a folder there cannot even be listed (a shadow copy
+    preserves the volume's ACLs, so the listing fallback does not get past
+    them), what could not be read is logged and the run goes on.
+    Warning: "Could not list (collected credential material may be incomplete): <path>"
 
 
 ## Legal and Authorization
@@ -757,7 +1098,16 @@ IMPORTANT: Only run this script on systems you are authorized to examine.
 
   - Obtain written authorization before collecting forensic artifacts.
   - This script accesses sensitive data including password databases (SAM),
-    security policies, browser credentials, and user activity history.
+    security policies, browser credentials, email attachments, and user
+    activity history.
+  - -IncludeSecrets additionally collects DPAPI master keys, Windows
+    Credentials and Vault, and copies the browser settings/session files
+    unredacted. With SAM/SECURITY and the user's password or the domain DPAPI
+    backup key, this is enough to decrypt saved passwords and session cookies
+    offline. Use it only where that is authorized (e.g. infostealer and
+    session/token-theft cases, authorized cloud-evidence access, and evidence
+    integrity where copies must hash-match the originals), and treat the
+    output as a password store.
   - Collected artifacts may contain PII subject to privacy regulations.
   - Maintain chain of custody documentation if used in legal proceedings.
   - The collection manifest provides SHA256 hashes for integrity verification.
@@ -781,15 +1131,64 @@ the mounted image for a non-invasive collection.
                    and the fsutil USN journal export for faster, smaller
                    runs ("fast" in the .bat). These are the timeline
                    builder's largest sources. Registry hives are still
-                   collected.
+                   collected. Also lowers the SRUM cap from 16 GB to 2 GB
+                   per file and the email attachment caps to 10 MB per
+                   file, 100 MB per user and 500 MB in all.
   -NoCompress      Keep uncompressed folder (don't zip and delete).
   -Categories      Specific categories to collect. Default: all (except Memory).
                    Valid: Memory, FileSystem, Registry, EventLogs, Execution,
                    Network, UserActivity, Browser, USB, Persistence,
-                   AntiVirus
+                   AntiVirus, Email
                    Note: Memory is opt-in. On live systems, the script prompts
                    if a capture tool is found in tools\. For automation, pass
                    -Categories "Memory","FileSystem","Registry",...
+  -Unattended      No prompts, for scripts and tests: the target is the live
+                   system drive unless -TargetDrive is given, memory is
+                   captured only when -Categories includes Memory, and the
+                   script never waits for a key press (at the end, or when
+                   it stops early, e.g. without Administrator rights).
+  -IncludeThunderbirdIndex
+                   Email category: also copy Thunderbird's search index
+                   (global-messages-db.sqlite, up to 1 GB). Off by default
+                   because it holds the text of the indexed messages, not
+                   only their headers; the timeline builder reads only the
+                   headers from it (date, addresses, subject, attachment
+                   names).
+  -IncludeSecrets  AUTHORIZED EXAMINATIONS ONLY. Two changes, both off by
+                   default (see "What Gets Collected" > "Secrets" and "Known
+                   Limitations"):
+                     1. The browser settings and session files (Chromium Local
+                        State, Preferences and Secure Preferences; Firefox
+                        prefs.js; Firefox and Chromium session files) are
+                        copied UNREDACTED -- no private or secret value is
+                        blanked -- so each copy is byte-for-byte the original
+                        and its manifest hash equals the original's. The size
+                        caps still apply. (Without the switch these copies have
+                        their encrypted keys, tokens, password hashes, cookies,
+                        form data and page state blanked, as always.)
+                     2. DPAPI credential material is collected into a top-level
+                        Secrets\ folder: per user the master keys
+                        (AppData\Roaming\Microsoft\Protect\<SID>\, including
+                        Preferred and CREDHIST), Credentials (roaming and
+                        local) and Vault, and the system master keys
+                        (%SystemRoot%\System32\Microsoft\Protect\S-1-5-18).
+                   With the user's password or the domain DPAPI backup key,
+                   this is everything needed to decrypt the unredacted browser
+                   secrets -- saved passwords and session cookies -- offline;
+                   the Registry hives are not needed for the per-user data. The
+                   machine (S-1-5-18) master keys instead need SYSTEM and
+                   SECURITY (boot key and the DPAPI_SYSTEM LSA secret; SAM for
+                   local hashes), collected by the Registry category (selected
+                   by default), so include that category if the machine keys
+                   are needed. The whole collection then holds secrets
+                   equivalent to a password store: handle, store and transfer
+                   it accordingly. A prominent warning is logged at the start
+                   of the run, and collection_info.json records
+                   "SecretsIncluded": true.
+                   Use it for infostealer cases (which saved passwords and
+                   cookies were exposed), session/token-theft cases (cookie
+                   decryption), authorized access to cloud evidence, and
+                   evidence integrity (copies that hash-match the originals).
 
 
 ## Optional Tools (tools\ directory)
@@ -872,13 +1271,89 @@ capture before collection begins.
     file, a file extended past its written data, and an NTFS-compressed
     file, which the raw read must decline cleanly.
 
+  tests\Test-Collect*.ps1 (run as Administrator; all six also run in CI)
+    Each builds a fake mounted image in a temporary folder (a
+    Windows\System32 tree with test artifacts), maps it to a free drive
+    letter with subst, runs the collector on it with -Unattended
+    -NoCompress and one category, and checks what was and was not
+    collected (byte for byte, with manifest rows: original path, hash of
+    the copy, original times). The drive letter and the files are removed
+    afterwards. Without Administrator rights, pass -CollectorPath with a
+    copy of the collector that has no admin check (e.g. under the
+    git-ignored reports\ folder). Only Test-CollectEmail.ps1 changes the
+    machine it runs on, and only in CI or with -AllowSystemChanges.
+
+  tests\Test-CollectEventLogs.ps1 (-Categories EventLogs)
+    Every exported channel is copied with a manifest row; a missing
+    OAlerts.evtx is only an info line. Of a 300 MB Shell-Core log only the
+    newest events are collected (warning with the record range), a 300 MB
+    log of zeros is skipped with a warning, and a 300 MB System log is
+    copied whole. Also checks, on this machine, that each channel is
+    stored under the file name the collector expects ("/" as "%4").
+
+  tests\Test-CollectBrowser.ps1 (-Categories Browser)
+    Chrome, Edge, Opera and Firefox profiles: the extension, session,
+    settings and snapshot files are collected within their caps; other
+    locales, extension code, oversized files and folders that are not
+    browser profiles are not. A canary string in every secret or private
+    value must appear nowhere in the collection, while the other settings,
+    URLs and titles are kept; a damaged Firefox session file is not
+    collected.
+
+  tests\Test-CollectEmail.ps1 (-Categories Email)
+    Classic and new Outlook, Thunderbird and Windows Mail data: the
+    attachment copies and caps (newest first), the listing CSVs, and that
+    mailboxes, OST/PST files, mail contents and link targets are never
+    copied. A second run with -IncludeThunderbirdIndex -SkipLargeFiles
+    copies the search index and applies the lower caps. The collector's
+    listing and path helpers are also checked directly. Live part (CI, or
+    -AllowSystemChanges): sets OutlookSecureTempFolder for three made-up
+    Office versions under HKCU (a custom folder, one with %LOCALAPPDATA%,
+    the drive root), runs a live collection, checks that the first two
+    are listed and copied and the drive root is refused, and removes the
+    keys. Needs about 1.1 GB free in %TEMP% for a moment.
+
+  tests\Test-CollectSrum.ps1 (-Categories Execution)
+    Every file of the sru folder is copied; a file over the 16 GB cap
+    (sparse, no disk space used; 2 GB with -SkipLargeFiles) and a subfolder
+    are not; an image without an sru folder gives only an info line. The
+    live shadow-copy logic is checked with the collector's own functions
+    and a folder standing in for the shadow copy.
+
+  tests\Test-CollectDefender.ps1 (-Categories AntiVirus)
+    DetectionHistory and Quarantine\Entries files are collected; a file
+    over 1 MB, an empty file and anything from Quarantine\ResourceData or
+    Quarantine\Resources are not; of 2,001 DetectionHistory files only the
+    newest 2,000 are; a folder the account may not open gives an "access
+    denied" warning.
+
+  tests\Test-CollectSecrets.ps1 (-Categories Browser, run with and without
+    -IncludeSecrets)
+    Browser settings/session files holding canary secret values, DPAPI
+    master key files (Protect\<SID>\<GUID>, hidden+system), Preferred,
+    CREDHIST, Credentials, Vault, and the system keys
+    System32\Microsoft\Protect\S-1-5-18. Without the switch: the canary is
+    in no browser copy, there is no Secrets folder, and SecretsIncluded is
+    false. With the switch: the browser copies are byte-for-byte the
+    originals (manifest hash equals the original's), every credential file is
+    collected with a manifest row and original times, SecretsIncluded is
+    true, the warning is logged, and a junction out of the profile is not
+    followed.
+
+    powershell -ExecutionPolicy Bypass -File tests\Test-CollectBrowser.ps1
+    powershell -ExecutionPolicy Bypass -File tests\Test-CollectEmail.ps1 -AllowSystemChanges
+
   tests\Test-ShadowCopy.ps1 (no admin needed; also runs in CI)
     Checks how a copy from the shadow copy is reported, with a folder
     standing in for the snapshot: a hidden file is copied and listed in the
     manifest with its hash and original time; an empty one is logged as
     skipped and is not an error; a missing one is "Not present"; a locked
     one gives a warning with the reason and counts one error; with -Quiet
-    nothing is logged or counted.
+    nothing is logged or counted. Also checks the SRUM collection, which
+    reports these outcomes itself: an empty SRUM file in the snapshot is an
+    info line, not an error; a locked one is a warning with the reason;
+    with SRUDB.dat locked in the snapshot, the files come from the volume
+    and the info line gives the reason.
       powershell -ExecutionPolicy Bypass -File tests\Test-ShadowCopy.ps1
 
   tests\Test-CollectionLogging.ps1 (no admin needed; also runs in CI)
@@ -910,6 +1385,13 @@ capture before collection begins.
        fail the test; best-effort ones (BAM, Amcache, ShimCache, UserAssist,
        jump list, deleted MFT record) depend on when Windows writes them and
        are only reported. Restart before collecting to get ShimCache.
+       -PlantedFile <planted.json>  which planting to check (default: the
+                                    newest TriageE2E_* folder in Downloads)
+       -TimelinePath <timeline.csv> which timeline to check (default: the
+                                    newest one in a win11-timeline-builder
+                                    folder next to this repository)
+       -ToleranceSeconds <n>        allowed difference between a planted
+                                    time and its timeline time (default 120)
     4. powershell -ExecutionPolicy Bypass -File tests\Invoke-PlantedActivity.ps1 -Cleanup
        Removes the Run value, the task, the Recent shortcut and the files.
 

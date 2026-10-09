@@ -715,6 +715,16 @@ function Initialize-ShadowCopy {
 
 # Copy a file (path relative to TargetRoot) out of the shadow copy.
 # -Quiet: the caller reports failures (no warning / error count here).
+# Returns $true only for a non-empty copy. The outcome is also left in
+# $script:lastShadowCopyResult for callers that report it themselves:
+#   Copied   -- collected and recorded in the manifest
+#   Empty    -- 0 bytes in the snapshot: nothing to collect, not an error
+#   NotFound -- not in the snapshot (e.g. created after it was taken)
+#   Failed   -- no shadow copy, or the copy failed; the reason is in
+#               $script:lastShadowCopyReason
+$script:lastShadowCopyResult = ""
+$script:lastShadowCopyReason = ""
+
 function Copy-FromShadow {
     param(
         [string]$RelativePath,
@@ -723,8 +733,11 @@ function Copy-FromShadow {
         [switch]$Quiet
     )
 
+    $script:lastShadowCopyResult = "Failed"
+    $script:lastShadowCopyReason = ""
     if (-not $script:shadowPath) {
         if (-not (Initialize-ShadowCopy)) {
+            $script:lastShadowCopyReason = "no shadow copy available"
             return $false
         }
     }
@@ -748,37 +761,59 @@ function Copy-FromShadow {
         # hidden/system files (NTUSER.DAT, UsrClass.dat, hive .LOG1/.LOG2),
         # which "cmd /c copy" reports as not found. cmd copy stays as fallback.
         $notFound = $false
+        $copied = $false          # .NET copy finished without an exception
+        $failReason = ""
         try {
             [System.IO.File]::Copy($shadowFile, $destPath, $true)
+            $copied = $true
         } catch {
             $copyError = $_.Exception
             if ($copyError.InnerException) { $copyError = $copyError.InnerException }
             if ($copyError -is [System.IO.FileNotFoundException] -or $copyError -is [System.IO.DirectoryNotFoundException]) {
                 $notFound = $true
             } else {
+                $failReason = $copyError.Message
                 $null = cmd /c "copy /Y `"$shadowFile`" `"$destPath`"" 2>&1
             }
         }
 
-        if ((Get-FileLength $destPath) -gt 0) {
+        $destLength = Get-FileLength $destPath
+        if ($destLength -gt 0) {
             Record-Manifest -SourcePath "(shadow)$RelativePath" -DestPath $destPath -SourceTimes $srcTimes
+            $script:lastShadowCopyResult = "Copied"
             return $true
         }
-
         # Remove empty/corrupt shadow copy output
-        if ((Get-FileLength $destPath) -ge 0) {
-            Remove-Item -LiteralPath $destPath -Force -ErrorAction SilentlyContinue
+        if ($destLength -ge 0) { Remove-Item -LiteralPath $destPath -Force -ErrorAction SilentlyContinue }
+
+        # A complete copy of a file that is 0 bytes in the snapshot: nothing to
+        # collect, not an error (same rule as Copy-ForensicFile). Common for
+        # hive transaction logs: one of .LOG1/.LOG2 is often empty. Checked
+        # after the copy, not before: a symlink itself has 0 bytes.
+        $shadowLength = Get-FileLength $shadowFile
+        if ($copied -and $destLength -eq 0 -and $shadowLength -eq 0) {
+            $script:lastShadowCopyResult = "Empty"
+            $msg = "Skipped empty file (0 bytes in the shadow copy): $RelativePath"
+            if ($Quiet) { Write-Verbose $msg } else { Log $msg }
+            return $false     # callers keep their live fallback
         }
+        if ($notFound) {
+            $script:lastShadowCopyResult = "NotFound"
+            if (-not $Quiet) { Log "Not present in shadow copy: $RelativePath" }
+            return $false
+        }
+        if (-not $failReason) {
+            if ($destLength -lt 0) { $failReason = "the copy left no file" }
+            else { $failReason = "the copy is empty but the snapshot file is $shadowLength bytes" }
+        }
+        $script:lastShadowCopyReason = $failReason
         if (-not $Quiet) {
-            if ($notFound) {
-                Log "Not present in shadow copy: $RelativePath"
-            } else {
-                Log-Warning "Shadow copy of $RelativePath did not produce output file"
-                $script:errorCount++
-            }
+            Log-Warning "Shadow copy of $RelativePath did not produce output file -- $failReason"
+            $script:errorCount++
         }
         return $false
     } catch {
+        $script:lastShadowCopyReason = $_.Exception.Message
         if (-not $Quiet) {
             Log-Warning "Could not copy from shadow: $RelativePath -- $($_.Exception.Message)"
             $script:errorCount++
@@ -2779,7 +2814,9 @@ function Copy-TriageSrumFiles {
         if ($dbSize -le $MaxBytes) {
             $useShadow = Copy-FromShadow -RelativePath "$relDir\SRUDB.dat" -DestDir $DestDir -DestName "SRUDB.dat" -Quiet
             if (-not $useShadow) {
-                Log "SRUDB.dat could not be read from the shadow copy -- the SRUM files are copied from the volume (the database and its logs may be from slightly different moments)."
+                $why = ""
+                if ($script:lastShadowCopyReason) { $why = " ($($script:lastShadowCopyReason))" }
+                Log "SRUDB.dat could not be read from the shadow copy$why -- the SRUM files are copied from the volume (the database and its logs may be from slightly different moments)."
             }
         }
     }
@@ -2799,12 +2836,18 @@ function Copy-TriageSrumFiles {
             }
             if (Copy-FromShadow -RelativePath "$relDir\$name" -DestDir $DestDir -DestName $name -Quiet) {
                 $count++
-            } elseif ($null -ne $shadowNames) {
-                Log-Warning "Could not copy SRUM file $name from the shadow copy"
-                $script:errorCount++
-            } else {
+            } elseif ($script:lastShadowCopyResult -eq "Empty") {
+                # 0 bytes in the snapshot: nothing to collect, not an error.
+                # Not taken from the volume instead: all files are from one moment
+                Log "Skipped empty file (0 bytes in the shadow copy): $relDir\$name"
+            } elseif ($script:lastShadowCopyResult -eq "NotFound" -and $null -eq $shadowNames) {
                 # Listed on the volume only: newer than the shadow copy
                 Log "SRUM file not in the shadow copy (newer than the database copy) -- skipped: $name"
+            } else {
+                $reason = $script:lastShadowCopyReason
+                if (-not $reason) { $reason = "not found in the shadow copy" }
+                Log-Warning "Could not copy SRUM file $name from the shadow copy -- $reason"
+                $script:errorCount++
             }
         }
     } else {

@@ -973,7 +973,10 @@ The fastest path from collection to analysis:
     A raw read is not a point-in-time snapshot: a file being written during
     the read can come out inconsistent. NTFS-compressed and EFS-encrypted
     files cannot be read this way. Empty files are skipped (there is nothing
-    to collect; Chromium browsers keep 0-byte SQLite journals open).
+    to collect; Chromium browsers keep 0-byte SQLite journals open). A file
+    that is 0 bytes in the shadow copy is skipped the same way and is not
+    counted as an error; the live file is still tried next, in case it has
+    grown since the snapshot.
     Log: "Collected by raw NTFS read (file in use, not available from a
     shadow copy)"
 
@@ -981,10 +984,12 @@ The fastest path from collection to analysis:
     tries reg save via HKU\SID (works for logged-in users), then VSS shadow
     copy, then direct copy. On most systems reg save succeeds.
 
-  - System service accounts (e.g., WsiAccount) may have locked or inaccessible
-    hive files. Shadow copy attempts will fail for these. This is normal --
-    these are not real user accounts and contain minimal forensic data.
-    Warning: "Shadow copy of Users\WsiAccount\NTUSER.DAT did not produce output"
+  - Hives of system service accounts (e.g., WsiAccount) are usually not
+    loaded, so reg save does not apply; they are taken from the shadow copy.
+    These are not real user accounts and contain minimal forensic data. If
+    the shadow copy cannot provide a hive, the warning gives the reason and
+    the direct copy is tried next.
+    Warning: "Shadow copy of Users\WsiAccount\NTUSER.DAT did not produce output file -- <reason>"
 
   - Hidden files are collected, including the Amcache.hve transaction logs
     (.LOG1/.LOG2) and the hidden NTUSER.DAT / UsrClass.dat of users who are
@@ -994,7 +999,12 @@ The fastest path from collection to analysis:
     skipped those in listings, and copied hidden files and then deleted
     them as "empty".) Locked Amcache logs are taken from the shadow copy or
     by raw NTFS read; if the hive is still dirty without its logs, the
-    timeline builder skips Amcache parsing for that collection.
+    timeline builder skips Amcache parsing for that collection. It is
+    normal for one of .LOG1/.LOG2 to be 0 bytes (Windows can write only one
+    of them for long periods): an empty log holds nothing to collect and is
+    skipped, not counted as an error (logged as info when it comes from the
+    shadow copy).
+    Log: "Skipped empty file (0 bytes in the shadow copy): Windows\AppCompat\Programs\Amcache.hve.LOG2"
 
   - A file is reported as not collected only when the normal copy, the
     shadow copy and the raw NTFS read all fail.
@@ -1015,10 +1025,15 @@ The fastest path from collection to analysis:
   - SRUM: on a live system SRUDB.dat is open, so its copy is normally in
     "dirty shutdown" state; its logs are collected with it from the same
     shadow copy and the timeline builder replays them into a temp copy.
-    When SRUDB.dat cannot be read from the shadow copy, the files come from
-    the volume and may be from slightly different moments; the builder may
-    then have to repair its copy, which can lose the newest records. A
-    system without the sru folder gets an info line, not a warning.
+    When SRUDB.dat cannot be read from the shadow copy (the line gives the
+    reason when the copy failed), the files come from the volume and may be
+    from slightly different moments; the builder may then have to repair
+    its copy, which can lose the newest records. A file that is 0 bytes in
+    the shadow copy is skipped with an info line and is not counted as an
+    error (it is not taken from the volume instead, so all files stay from
+    one moment); a failed copy from the shadow copy gives a warning with
+    the reason. A system without the sru folder gets an info line, not a
+    warning.
     Message: "SRUDB.dat could not be read from the shadow copy -- the SRUM files are copied from the volume ..."
     Warning: "Skipped SRUM file ... larger than the 16384 MB size cap"
 
@@ -1312,6 +1327,19 @@ capture before collection begins.
 
     powershell -ExecutionPolicy Bypass -File tests\Test-CollectBrowser.ps1
     powershell -ExecutionPolicy Bypass -File tests\Test-CollectEmail.ps1 -AllowSystemChanges
+
+  tests\Test-ShadowCopy.ps1 (no admin needed; also runs in CI)
+    Checks how a copy from the shadow copy is reported, with a folder
+    standing in for the snapshot: a hidden file is copied and listed in the
+    manifest with its hash and original time; an empty one is logged as
+    skipped and is not an error; a missing one is "Not present"; a locked
+    one gives a warning with the reason and counts one error; with -Quiet
+    nothing is logged or counted. Also checks the SRUM collection, which
+    reports these outcomes itself: an empty SRUM file in the snapshot is an
+    info line, not an error; a locked one is a warning with the reason;
+    with SRUDB.dat locked in the snapshot, the files come from the volume
+    and the info line gives the reason.
+      powershell -ExecutionPolicy Bypass -File tests\Test-ShadowCopy.ps1
 
   Planted-activity test (both tools, end to end, on a live machine)
     1. In a normal (not elevated) PowerShell window, as the user to test:

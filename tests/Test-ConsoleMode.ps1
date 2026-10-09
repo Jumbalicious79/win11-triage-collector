@@ -286,33 +286,33 @@ try {
 
     $run = Invoke-Child -Case "Redirected" -Redirected
     $problems = New-Problems
-    Test-Child $run $problems
-    Test-Value $run "returned" "none" $problems
+    Test-Child -Run $run -Problems $problems
+    Test-Value -Run $run -Key "returned" -Expected "none" -Problems $problems
     Add-Result "input redirected: nothing changed" $problems -Info "exit 0, nothing written"
 
     $run = Invoke-Child -Case "NoStdin" -Redirected
     $problems = New-Problems
-    Test-Child $run $problems
-    Test-Value $run "handle" "0" $problems
-    Test-Value $run "returned" "none" $problems
+    Test-Child -Run $run -Problems $problems
+    Test-Value -Run $run -Key "handle" -Expected "0" -Problems $problems
+    Test-Value -Run $run -Key "returned" -Expected "none" -Problems $problems
     Add-Result "no standard input handle: nothing" $problems -Info "exit 0, nothing written"
 
     $run = Invoke-Child -Case "TypeClash" -Redirected
     $problems = New-Problems
-    Test-Child $run $problems
-    Test-Value $run "returned" "none" $problems
+    Test-Child -Run $run -Problems $problems
+    Test-Value -Run $run -Key "returned" -Expected "none" -Problems $problems
     Add-Result "type without the methods: caught" $problems -Info "exit 0, nothing written"
 
     $run = Invoke-Child -Case "Console"
     $problems = New-Problems
-    Test-Child $run $problems
+    Test-Child -Run $run -Problems $problems
     if ($run.Values["initial"] -eq "fail") { $problems.Add("the child has no console of its own (GetConsoleMode failed)") }
     foreach ($expected in @(
             @("on.returned", "0x01F7"), @("on.during", "0x01B7"), @("on.again", "none"), @("on.duringAgain", "0x01B7"),
             @("on.after", "0x01F7"), @("on.secondRestore", "0x01B7"),
             @("off.returned", "none"), @("off.during", "0x01B7"), @("off.after", "0x01B7"),
             @("noext.returned", "0x0007"), @("noext.during", "0x0087"), @("noext.after", "0x0007"))) {
-        Test-Value $run $expected[0] $expected[1] $problems
+        Test-Value -Run $run -Key $expected[0] -Expected $expected[1] -Problems $problems
     }
     Add-Result "own console: off, then put back once" $problems -Info "0x01F7 -> 0x01B7 -> 0x01F7 (child's console was $($run.Values['initial']))"
 

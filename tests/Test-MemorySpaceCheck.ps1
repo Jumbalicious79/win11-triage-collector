@@ -18,12 +18,16 @@
 #     error, no capture), low reserve (a warning, capture), a complete dump
 #     (recorded), a failed, empty or missing one (an error; set aside out of
 #     the collection or deleted; left and named when it is locked),
-#     -MemoryOutputPath;
-#   - the summary and compression step with a dump: moved next to the zip,
-#     kept with the folder (no zip, the summary corrected) when it cannot be
-#     moved, left where -MemoryOutputPath put it (the -MemoryDumpPath hint
-#     only when that is not next to the zip); a failed dump still in the
-#     folder: set aside then, or no zip.
+#     -MemoryOutputPath, WinPmem and Magnet RAM Capture; the dump's
+#     manifest row has its full path, size and hash;
+#   - the summary and compression step with a dump: moved next to the zip
+#     (its manifest row then names that path), kept with the folder (no
+#     zip, the summary corrected) when it cannot be moved, moved back with
+#     its row when the zip fails, left where -MemoryOutputPath put it (the
+#     summary says the timeline builder finds it through the manifest,
+#     only when that is not next to the zip); the rest of the manifest
+#     unchanged, and kept as it was when it cannot be changed; a failed
+#     dump still in the folder: set aside then, or no zip.
 # No admin rights needed. Exit code 0 = pass, 1 = fail.
 #
 #   powershell -ExecutionPolicy Bypass -File tests\Test-MemorySpaceCheck.ps1
@@ -62,7 +66,7 @@ foreach ($node in $nodes) {
     if (-not (Test-InsideFunction $node)) { $definitions.Add($node.Extent.Text) }
 }
 . ([scriptblock]::Create($definitions -join "`r`n"))
-foreach ($name in @("Get-VolumeSpace", "Get-MemoryCaptureSpaceCheck", "Format-SpaceCheck", "Get-TriageSpaceCheck", "Get-MemoryDumpPath", "Get-MemoryCaptureChoices", "Get-MemoryCaptureResult", "Move-IncompleteMemoryDump")) {
+foreach ($name in @("Get-VolumeSpace", "Get-MemoryCaptureSpaceCheck", "Format-SpaceCheck", "Get-TriageSpaceCheck", "Get-MemoryDumpPath", "Get-MemoryCaptureChoices", "Get-MemoryCaptureResult", "Move-IncompleteMemoryDump", "Set-ManifestDumpPath", "Record-Manifest", "ConvertTo-CsvField")) {
     if (-not (Get-Command $name -CommandType Function -ErrorAction SilentlyContinue)) {
         Write-Host "FAIL: $name not found in $collector" -ForegroundColor Red
         exit 1
@@ -334,17 +338,20 @@ try {
     $script:testRamBytes = [long]0
     function Get-PhysicalMemoryBytes { return $script:testRamBytes }
     # The capture tool: a function run as "& $memTool /TYPE DMP ... /OUTPUT
-    # <file>" that writes a dump of DumpBytes (-1: none) and prints Lines.
-    # With $script:lockDump it leaves the dump open for reading only (no
-    # rename, no delete) in $script:testLock, as a scanner could
+    # <file>" (DumpIt), "acquire <file>" (WinPmem) or "... /output <file>"
+    # (Magnet RAM Capture) that writes a dump of DumpBytes (-1: none) and
+    # prints Lines. With $script:lockDump it leaves the dump open for
+    # reading only (no rename, no delete) in $script:testLock, as a scanner
+    # could. $script:testToolName: the tool found in tools\
     $script:standIn = $null
     $script:toolCalls = 0
     $script:lockDump = $false
     $script:testLock = $null
+    $script:testToolName = "DumpIt"
     function Invoke-TestCaptureTool {
         $script:toolCalls++
         $outFile = $null
-        for ($a = 0; $a -lt $args.Count - 1; $a++) { if ($args[$a] -eq "/OUTPUT") { $outFile = [string]$args[$a + 1] } }
+        for ($a = 0; $a -lt $args.Count - 1; $a++) { if ($args[$a] -eq "/OUTPUT" -or $args[$a] -eq "acquire") { $outFile = [string]$args[$a + 1] } }
         if ($script:standIn.DumpBytes -ge 0) {
             $stream = [System.IO.File]::Create($outFile)
             try { $stream.SetLength($script:standIn.DumpBytes) } finally { $stream.Dispose() }
@@ -355,7 +362,7 @@ try {
     }
     function Find-MemoryCaptureTool {
         $script:skippedMemTools = @()
-        return [PSCustomObject]@{ Name = "DumpIt"; Path = "Invoke-TestCaptureTool"; RelPath = "tools\dumpit\x64\DumpIt.exe" }
+        return [PSCustomObject]@{ Name = $script:testToolName; Path = "Invoke-TestCaptureTool"; RelPath = "tools\$($script:testToolName.ToLowerInvariant())\stand-in.exe" }
     }
     # Read-Host answers from a queue (a function comes before the cmdlet);
     # a question more than the test expects ends the prompt with an error
@@ -581,9 +588,9 @@ try {
     # logged and left behind. LockDump: the dump stays open (see
     # Invoke-TestCaptureTool) until the section is done; BlockIncomplete: a
     # file at <dump>.incomplete, open the same way, so the dump cannot be
-    # renamed to it
+    # renamed to it. Tool: the capture tool found (DumpIt, WinPmem, MagnetRAM)
     function Invoke-MemorySection {
-        param([string]$Name, [object]$StandIn, [string]$DumpDir = "", [object]$Volume = "default", [switch]$Accepted, [switch]$EarlierDump, [switch]$LockDump, [switch]$BlockIncomplete)
+        param([string]$Name, [object]$StandIn, [string]$DumpDir = "", [object]$Volume = "default", [string]$Tool = "DumpIt", [switch]$Accepted, [switch]$EarlierDump, [switch]$LockDump, [switch]$BlockIncomplete)
         $script:OutputPath = Join-Path $workDir "$Name\TriageCollection_2026-01-02_03-04"
         New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null
         $script:logFile = Join-Path $OutputPath "collection_log.txt"
@@ -599,10 +606,11 @@ try {
         $script:MemoryOutputPath = $DumpDir
         $script:standIn = $StandIn
         $script:toolCalls = 0
+        $script:testToolName = $Tool
         if ($Volume -is [string]) { $Volume = New-TestVolume -Root $tempRoot -FreeGB 500 -TotalGB 1000 }
         $script:testVolumes = @{}
         if ($Volume) { $script:testVolumes[$tempRoot] = $Volume }
-        $dumpPath = Get-MemoryDumpPath -ToolName "DumpIt" -DumpDir $DumpDir
+        $dumpPath = Get-MemoryDumpPath -ToolName $Tool -DumpDir $DumpDir
         if ($EarlierDump) {
             New-Item -ItemType Directory -Path (Split-Path $dumpPath -Parent) -Force | Out-Null
             [System.IO.File]::WriteAllText($dumpPath, "earlier dump")
@@ -654,6 +662,19 @@ try {
         if ($Run.ToolCalls -ne $ToolCalls) { $Problems.Add("tool ran $($Run.ToolCalls) time(s), expected $ToolCalls") }
         if ($Problems.Count -gt 0) { foreach ($line in $Run.Log) { Write-Verbose "  | $line" } }
     }
+    # The manifest has one dump row, and it names the dump's full path, its
+    # size and the hash of the file there (what the timeline builder reads)
+    function Test-DumpRow {
+        param([object[]]$Rows, [string]$Tool, [string]$DestPath, [string]$RelativePath, [System.Collections.Generic.List[string]]$Problems)
+        $dumpRows = @($Rows | Where-Object { $_.SourcePath -like "(memory dump via *)" })
+        if ($dumpRows.Count -ne 1) { $Problems.Add("$($dumpRows.Count) dump row(s) in the manifest"); return }
+        $row = $dumpRows[0]
+        $bytes = Get-FileLength $DestPath
+        if ($row.SourcePath -cne "(memory dump via $Tool)" -or $row.DestPath -cne $DestPath -or $row.RelativePath -cne $RelativePath -or $row.SizeBytes -cne "$bytes") {
+            $Problems.Add("dump row '$($row.SourcePath)', '$($row.DestPath)', '$($row.RelativePath)', $($row.SizeBytes) bytes; expected '$DestPath', '$RelativePath', $bytes bytes")
+        }
+        if ($bytes -gt 0 -and $row.SHA256 -cne (Get-FileHash -LiteralPath $DestPath -Algorithm SHA256).Hash) { $Problems.Add("dump row hash is not the dump's") }
+    }
     $rootText = [regex]::Escape((ConvertTo-LogText $tempRoot))
 
     # Complete dump in Memory\: recorded, kept
@@ -670,10 +691,26 @@ try {
     ) -Errors 0 -ToolCalls 1 -Problems $problems -Absent @('WARNING', 'ERROR')
     if ($run.MemDumpPath -ne $run.DumpPath) { $problems.Add("memDumpPath '$($run.MemDumpPath)'") }
     if ((Get-FileLength $run.DumpPath) -ne $completeBytes) { $problems.Add("dump is $(Get-FileLength $run.DumpPath) bytes") }
-    $dumpRows = @($run.Rows | Where-Object { $_.SourcePath -eq "(memory dump via DumpIt)" })
-    if ($dumpRows.Count -ne 1 -or $dumpRows[0].RelativePath -ne "Memory\memory_dump.dmp") { $problems.Add("$($dumpRows.Count) dump row(s) in the manifest") }
+    Test-DumpRow -Rows $run.Rows -Tool "DumpIt" -DestPath $run.DumpPath -RelativePath "Memory\memory_dump.dmp" -Problems $problems
     if (@($run.Rows | Where-Object { $_.SourcePath -eq "(memory capture tool output: DumpIt)" }).Count -ne 1) { $problems.Add("acquisition log not in the manifest") }
     Add-Result "section: complete dump" $problems -Info "$completeBytes bytes"
+
+    # WinPmem and Magnet RAM Capture: a raw image, recorded the same way
+    # (in Memory\, and in a -MemoryOutputPath folder as the prompt sets it)
+    $run = Invoke-MemorySection -Name "winpmem" -Tool "WinPmem" -StandIn (New-StandIn $completeBytes -ReportedBytes -1 -NtStatus "")
+    $problems = New-Problems
+    Test-SectionRun -Run $run -Lines @('Memory capture tool: WinPmem ', 'OK: Memory dump captured: ') -Errors 0 -ToolCalls 1 -Problems $problems
+    if ($run.DumpPath -cne (Join-Path $OutputPath "Memory\memory_dump.raw") -or $run.MemDumpPath -cne $run.DumpPath) { $problems.Add("dump path '$($run.DumpPath)', memDumpPath '$($run.MemDumpPath)'") }
+    Test-DumpRow -Rows $run.Rows -Tool "WinPmem" -DestPath $run.DumpPath -RelativePath "Memory\memory_dump.raw" -Problems $problems
+    Add-Result "section: WinPmem raw image recorded" $problems
+
+    $magnetDir = Join-Path $workDir "TriageMemory"
+    $run = Invoke-MemorySection -Name "magnetram" -Tool "MagnetRAM" -StandIn (New-StandIn $completeBytes -ReportedBytes -1 -NtStatus "") -DumpDir $magnetDir
+    $problems = New-Problems
+    Test-SectionRun -Run $run -Lines @('Memory capture tool: MagnetRAM ', 'OK: Memory dump captured: ') -Errors 0 -ToolCalls 1 -Problems $problems
+    if ($run.DumpPath -cne (Join-Path $magnetDir "TriageCollection_2026-01-02_03-04_memory_dump.raw")) { $problems.Add("dump path '$($run.DumpPath)'") }
+    Test-DumpRow -Rows $run.Rows -Tool "MagnetRAM" -DestPath $run.DumpPath -RelativePath "" -Problems $problems
+    Add-Result "section: Magnet RAM Capture to another folder" $problems
 
     # No room: an error, no capture, nothing written
     $run = Invoke-MemorySection -Name "noroom" -StandIn (New-StandIn $completeBytes) -Volume (New-TestVolume -Root $tempRoot -FreeGB 2 -TotalGB 100)
@@ -763,8 +800,7 @@ try {
     Test-SectionRun -Run $run -Lines @(("Memory dump file: " + [regex]::Escape((ConvertTo-LogText $expectedDump)) + '$'), 'OK: Memory dump captured') -Errors 0 -ToolCalls 1 -Problems $problems
     if ($run.MemDumpPath -ne $expectedDump -or (Get-FileLength $expectedDump) -ne $completeBytes) { $problems.Add("memDumpPath '$($run.MemDumpPath)', $(Get-FileLength $expectedDump) bytes") }
     if (-not (Test-Path -LiteralPath $run.AcqLog)) { $problems.Add("no acquisition log in Memory\") }
-    $dumpRows = @($run.Rows | Where-Object { $_.SourcePath -eq "(memory dump via DumpIt)" })
-    if ($dumpRows.Count -ne 1 -or $dumpRows[0].DestPath -ne $expectedDump -or $dumpRows[0].RelativePath) { $problems.Add("dump row: $(@($dumpRows | ForEach-Object { $_.DestPath + ' | ' + $_.RelativePath }) -join '; ')") }
+    Test-DumpRow -Rows $run.Rows -Tool "DumpIt" -DestPath $expectedDump -RelativePath "" -Problems $problems
     Add-Result "section: -MemoryOutputPath" $problems
 
     # A failed capture to -MemoryOutputPath: renamed in place
@@ -808,26 +844,29 @@ try {
     $script:startTime = Get-Date
     $script:TargetDrive = "C"
     # Runs the summary and compression steps on a small collection with a
-    # dump; returns the screen, the log, the files left and the zip's
-    # entries. Incomplete: a failed dump the memory section set aside (at
+    # dump; returns the screen, the log, the files left, the zip's entries
+    # and the manifest before and after (as the zip has it, or in the
+    # folder). Tool: the capture tool (DumpIt: .dmp; WinPmem, MagnetRAM:
+    # .raw). Incomplete: a failed dump the memory section set aside (at
     # SetAside); IncompleteLeft: one it could neither set aside nor delete,
     # still at the dump's path. LockDump: the file at the dump's path is
-    # open for reading only (no move, no delete) during the run
+    # open for reading only (no move, no delete) during the run. LockZip: a
+    # file at the zip path that cannot be replaced, so the zip fails.
+    # LockManifest: the manifest is open (no rename, no delete) during the run
     function Invoke-Final {
-        param([string]$Name, [string]$DumpDir = "", [switch]$NoZip, [switch]$LockDump, [switch]$Incomplete, [switch]$IncompleteLeft)
+        param([string]$Name, [string]$DumpDir = "", [string]$Tool = "DumpIt", [switch]$NoZip, [switch]$LockDump, [switch]$Incomplete, [switch]$IncompleteLeft, [switch]$LockZip, [switch]$LockManifest)
         $script:OutputPath = Join-Path $workDir "$Name\TriageCollection_2026-01-02_03-04"
         New-Item -ItemType Directory -Path (Join-Path $OutputPath "Memory") -Force | Out-Null
         $script:logFile = Join-Path $OutputPath "collection_log.txt"
         [System.IO.File]::WriteAllText($logFile, "start`r`n")
-        [System.IO.File]::WriteAllText((Join-Path $OutputPath "Memory\memory_acquisition_log.txt"), "synthetic`r`n")
+        $acqLog = Join-Path $OutputPath "Memory\memory_acquisition_log.txt"
+        [System.IO.File]::WriteAllText($acqLog, "synthetic`r`n")
         $script:logToFile = $true
         $script:NoCompress = [bool]$NoZip
-        $script:fileCount = 3
-        $script:errorCount = 0
-        $script:totalBytes = 1000
-        $dump = Get-MemoryDumpPath -ToolName "DumpIt" -DumpDir $DumpDir
+        $dump = Get-MemoryDumpPath -ToolName $Tool -DumpDir $DumpDir
+        $next = "${OutputPath}_memory_dump" + [System.IO.Path]::GetExtension($dump)
         $setAside = "$dump.incomplete"
-        if (-not $DumpDir) { $setAside = "${OutputPath}_memory_dump.dmp.incomplete" }
+        if (-not $DumpDir) { $setAside = "$next.incomplete" }
         New-Item -ItemType Directory -Path (Split-Path $dump -Parent) -Force | Out-Null
         $script:memDumpPath = $dump
         $script:memDumpIncompletePath = $null
@@ -839,33 +878,117 @@ try {
             [System.IO.File]::WriteAllText($dump, "DUMP")
         }
         if ($IncompleteLeft) { $script:memDumpPath = $null; $script:memDumpIncompletePath = $dump }
-        $lock = $null
-        if ($LockDump) { $lock = [System.IO.File]::Open($dump, "Open", "Read", "Read") }
+        # The manifest as the collection writes it: command output with "
+        # and , in its source, the acquisition log, the dump (only one that
+        # passed the checks), and a file whose source is the dump's path
+        # (that row must stay as it is)
+        $script:manifestFile = Join-Path $OutputPath "collection_manifest.csv"
+        [System.IO.File]::WriteAllText($manifestFile, "SHA256,SourcePath,DestPath,SizeBytes,CollectedAt,RelativePath,SourceCreatedUtc,SourceModifiedUtc,SourceAccessedUtc`r`n", (New-Object System.Text.UTF8Encoding($true)))
+        $sysinfo = Join-Path $OutputPath "systeminfo.txt"
+        [System.IO.File]::WriteAllText($sysinfo, "synthetic`r`n")
+        Record-Manifest -SourcePath '(command: systeminfo "a,b")' -DestPath $sysinfo
+        Record-Manifest -SourcePath "(memory capture tool output: $Tool)" -DestPath $acqLog
+        if ($script:memDumpPath) { Record-Manifest -SourcePath "(memory dump via $Tool)" -DestPath $dump }
+        $decoy = Join-Path $OutputPath "decoy.txt"
+        [System.IO.File]::WriteAllText($decoy, "synthetic`r`n")
+        Record-Manifest -SourcePath $dump -DestPath $decoy
+        $manifestBefore = [System.IO.File]::ReadAllBytes($manifestFile)
+        $script:fileCount = 3
+        $script:errorCount = 0
+        $script:totalBytes = 1000
+        $locks = @()
+        if ($LockDump) { $locks += [System.IO.File]::Open($dump, "Open", "Read", "Read") }
+        if ($LockZip) {
+            [System.IO.File]::WriteAllText("$OutputPath.zip", "not a zip")
+            $locks += [System.IO.File]::Open("$OutputPath.zip", "Open", "Read", "None")
+        }
+        if ($LockManifest) { $locks += [System.IO.File]::Open($manifestFile, "Open", "Read", "ReadWrite") }
         try {
             $screen = @(& {
                 $ErrorActionPreference = "Continue"
                 . $finalBlock
             } 6>&1 | ForEach-Object { "$_" })
         } finally {
-            if ($lock) { $lock.Dispose() }
+            foreach ($lock in $locks) { $lock.Dispose() }
+        }
+        $zipKept = $false
+        if ($LockZip) {
+            # The file that was there is kept (and is not the zip)
+            $zipKept = (Get-FileLength "$OutputPath.zip") -eq 9
+            Remove-Item -LiteralPath "$OutputPath.zip" -Force -ErrorAction SilentlyContinue
         }
         $entries = @()
+        $zipManifest = $null
         if (Test-Path -LiteralPath "$OutputPath.zip") {
             $zip = [System.IO.Compression.ZipFile]::OpenRead("$OutputPath.zip")
-            try { $entries = @($zip.Entries | ForEach-Object { $_.FullName }) } finally { $zip.Dispose() }
+            try {
+                $entries = @($zip.Entries | ForEach-Object { $_.FullName })
+                $entry = $zip.GetEntry("TriageCollection_2026-01-02_03-04/collection_manifest.csv")
+                if ($entry) {
+                    $buffer = New-Object System.IO.MemoryStream
+                    $stream = $entry.Open()
+                    try { $stream.CopyTo($buffer) } finally { $stream.Dispose() }
+                    $zipManifest = $buffer.ToArray()
+                }
+            } finally { $zip.Dispose() }
         }
+        $folderManifest = $null
+        if (Test-Path -LiteralPath $manifestFile) { $folderManifest = [System.IO.File]::ReadAllBytes($manifestFile) }
         $logged = @()
         if (Test-Path -LiteralPath $logFile) { $logged = @(Get-Content -LiteralPath $logFile) }
         return [PSCustomObject]@{
-            Screen   = $screen
-            Log      = $logged
-            Dump     = $dump
-            SetAside = $setAside
-            Next     = "${OutputPath}_memory_dump.dmp"
-            Folder   = Test-Path -LiteralPath $OutputPath
-            Zip      = Test-Path -LiteralPath "$OutputPath.zip"
-            Entries  = $entries
+            Screen         = $screen
+            Log            = $logged
+            Dump           = $dump
+            SetAside       = $setAside
+            Next           = $next
+            Folder         = Test-Path -LiteralPath $OutputPath
+            Zip            = Test-Path -LiteralPath "$OutputPath.zip"
+            ZipKept        = $zipKept
+            Entries        = $entries
+            ManifestBefore = $manifestBefore
+            ZipManifest    = $zipManifest
+            FolderManifest = $folderManifest
+            Leftovers      = @(@("$manifestFile.new", "$manifestFile.old") | Where-Object { Test-Path -LiteralPath $_ }) + @($entries | Where-Object { $_ -like "*collection_manifest.csv?*" })
         }
+    }
+
+    # The manifest after the run (bytes) against the one before: the same
+    # bytes (UTF-8 BOM, CRLF) except the dump row, which names DestPath and
+    # RelativePath and keeps its hash, size and times. DestPath "": no dump
+    # row. SizeOf: the file whose size the row has (default: DestPath)
+    function Test-ManifestAfter {
+        param([byte[]]$Before, [byte[]]$After, [string]$Tool, [string]$DestPath, [string]$RelativePath, [System.Collections.Generic.List[string]]$Problems, [string]$Where, [string]$SizeOf = "")
+        if ($null -eq $After) { $Problems.Add("no manifest $Where"); return }
+        if ($After.Count -lt 3 -or $After[0] -ne 0xEF -or $After[1] -ne 0xBB -or $After[2] -ne 0xBF) { $Problems.Add("manifest $Where has no UTF-8 BOM") }
+        $utf8 = New-Object System.Text.UTF8Encoding($false)
+        $beforeLines = $utf8.GetString($Before, 3, $Before.Count - 3).Split([string[]]@("`r`n"), [System.StringSplitOptions]::None)
+        $afterLines = $utf8.GetString($After, 3, [math]::Max(0, $After.Count - 3)).Split([string[]]@("`r`n"), [System.StringSplitOptions]::None)
+        if ($afterLines.Count -ne $beforeLines.Count) { $Problems.Add("manifest $Where has $($afterLines.Count) lines, $($beforeLines.Count) before"); return }
+        $header = $beforeLines[0]
+        $dumpRows = 0
+        for ($i = 0; $i -lt $beforeLines.Count; $i++) {
+            $old = $null
+            if ($i -gt 0 -and $beforeLines[$i]) { $old = @($header, $beforeLines[$i]) | ConvertFrom-Csv }
+            if (-not $old -or $old.SourcePath -notlike "(memory dump via *)") {
+                if ($afterLines[$i] -cne $beforeLines[$i]) { $Problems.Add("manifest $Where line $i changed: $($afterLines[$i])") }
+                continue
+            }
+            $dumpRows++
+            $new = @($header, $afterLines[$i]) | ConvertFrom-Csv
+            foreach ($column in @("SHA256", "SourcePath", "SizeBytes", "CollectedAt", "SourceCreatedUtc", "SourceModifiedUtc", "SourceAccessedUtc")) {
+                if ($new.$column -cne $old.$column) { $Problems.Add("manifest $Where dump row $column '$($new.$column)', was '$($old.$column)'") }
+            }
+            if ($new.SourcePath -cne "(memory dump via $Tool)" -or $new.DestPath -cne $DestPath -or $new.RelativePath -cne $RelativePath) {
+                $Problems.Add("manifest $Where dump row '$($new.SourcePath)', '$($new.DestPath)', '$($new.RelativePath)'; expected '$DestPath', '$RelativePath'")
+            }
+            if (-not $SizeOf) { $SizeOf = $DestPath }
+            $bytes = Get-FileLength $SizeOf
+            if ($new.SizeBytes -cne "$bytes") { $Problems.Add("manifest $Where dump row: $($new.SizeBytes) bytes, the file at '$SizeOf' has $bytes") }
+            # The line is written as Record-Manifest writes one
+            if ($afterLines[$i] -cne (($new.PSObject.Properties | ForEach-Object { ConvertTo-CsvField $_.Value }) -join ',')) { $Problems.Add("manifest $Where dump row not written as Record-Manifest writes it: $($afterLines[$i])") }
+        }
+        if ($dumpRows -ne [int][bool]$DestPath) { $Problems.Add("manifest $Where has $dumpRows dump row(s)") }
     }
 
     $final = Invoke-Final -Name "zip"
@@ -873,6 +996,7 @@ try {
     Test-LinesInOrder -Lines $final.Screen -Expected @(
         ('Memory dump:    ' + [regex]::Escape($final.Next) + ' \(kept outside the zip\)$'),
         'Memory dump detected .* keeping it next to the zip\.$',
+        ('\] collection_manifest\.csv: the memory dump''s row now names ' + [regex]::Escape($final.Next) + '$'),
         'OK: Compressed to ',
         ('^  Memory dump:    ' + [regex]::Escape($final.Next) + ' \(')
     ) -Problems $problems -Where "screen"
@@ -880,7 +1004,59 @@ try {
     if ((Get-FileLength $final.Next) -ne 4 -or (Get-FileLength $final.Dump) -ge 0) { $problems.Add("dump not next to the zip") }
     if (@($final.Entries | Where-Object { $_ -like "*memory_dump*" }).Count -gt 0) { $problems.Add("dump in the zip") }
     if (@($final.Entries | Where-Object { $_ -like "*/Memory/memory_acquisition_log.txt" }).Count -ne 1) { $problems.Add("acquisition log not in the zip") }
+    # The zip's manifest names the dump next to the zip, outside the collection
+    Test-ManifestAfter -Before $final.ManifestBefore -After $final.ZipManifest -Tool "DumpIt" -DestPath $final.Next -RelativePath "" -Problems $problems -Where "in the zip"
+    if ($final.Leftovers.Count -gt 0) { $problems.Add("left: $($final.Leftovers -join ', ')") }
     Add-Result "compression: dump moved next to the zip" $problems
+
+    # The same for a raw image (WinPmem; Magnet RAM Capture is the same)
+    $final = Invoke-Final -Name "zipraw" -Tool "WinPmem"
+    $problems = New-Problems
+    if ($final.Next -notlike "*_memory_dump.raw") { $problems.Add("next to the zip: '$($final.Next)'") }
+    Test-LinesInOrder -Lines $final.Screen -Expected @(('\] collection_manifest\.csv: the memory dump''s row now names ' + [regex]::Escape($final.Next) + '$'), 'OK: Compressed to ') -Problems $problems -Where "screen"
+    if (-not $final.Zip -or (Get-FileLength $final.Next) -ne 4) { $problems.Add("zip $($final.Zip), dump next to it $((Get-FileLength $final.Next) -eq 4)") }
+    Test-ManifestAfter -Before $final.ManifestBefore -After $final.ZipManifest -Tool "WinPmem" -DestPath $final.Next -RelativePath "" -Problems $problems -Where "in the zip"
+    Add-Result "compression: raw image moved next to the zip" $problems
+
+    # The zip fails (a file at the zip path that cannot be replaced): the
+    # dump is moved back into Memory\, and so are its manifest row (the
+    # manifest is as it was) and the summary line
+    $final = Invoke-Final -Name "zipfail" -LockZip
+    $problems = New-Problems
+    $movedBackLine = '  Memory dump:    ' + [regex]::Escape($final.Dump) + ' \(moved back, no zip was created\)$'
+    Test-LinesInOrder -Lines $final.Screen -Expected @(
+        ('\] collection_manifest\.csv: the memory dump''s row now names ' + [regex]::Escape($final.Next) + '$'),
+        'WARNING: Compression failed, no zip created: ',
+        ('\] collection_manifest\.csv: the memory dump''s row now names ' + [regex]::Escape($final.Dump) + '$'),
+        ('\] ' + $movedBackLine),
+        '^  COLLECTION SUMMARY$',
+        ('^' + $movedBackLine),
+        'Zip NOT created -- collection left at: ',
+        ('^  Memory dump:    ' + [regex]::Escape($final.Dump) + ' \(')
+    ) -Problems $problems -Where "screen"
+    if (@($final.Screen | Where-Object { $_ -match '^  Memory dump:.*kept outside the zip' }).Count -gt 0) { $problems.Add("the summary on screen names the path next to the zip") }
+    Test-LinesInOrder -Lines $final.Log -Expected @(('\] ' + [regex]::Escape('  Memory dump:    ' + (ConvertTo-LogText $final.Dump) + ' (moved back, no zip was created)') + '$')) -Problems $problems -Where "collection_log.txt"
+    if (-not $final.ZipKept -or -not $final.Folder -or (Get-FileLength $final.Dump) -ne 4 -or (Get-FileLength $final.Next) -ge 0) { $problems.Add("file at the zip path kept $($final.ZipKept), folder kept $($final.Folder), dump back in it $((Get-FileLength $final.Dump) -eq 4)") }
+    Test-ManifestAfter -Before $final.ManifestBefore -After $final.FolderManifest -Tool "DumpIt" -DestPath $final.Dump -RelativePath "Memory\memory_dump.dmp" -Problems $problems -Where "in the folder"
+    if ($null -ne $final.FolderManifest -and [System.Convert]::ToBase64String($final.FolderManifest) -cne [System.Convert]::ToBase64String($final.ManifestBefore)) { $problems.Add("manifest not as it was") }
+    if ($final.Leftovers.Count -gt 0) { $problems.Add("left: $($final.Leftovers -join ', ')") }
+    Add-Result "compression: zip fails -> dump and its row moved back" $problems
+
+    # The manifest cannot be changed (open in another program): a warning,
+    # the manifest as it was, nothing left beside it; the zip is made and
+    # the dump is next to it, where the timeline builder also looks
+    $final = Invoke-Final -Name "manifestlocked" -LockManifest
+    $problems = New-Problems
+    Test-LinesInOrder -Lines $final.Screen -Expected @(
+        ('WARNING: Could not update the memory dump''s row in collection_manifest\.csv, it still names ' + [regex]::Escape($final.Dump) + ': '),
+        'OK: Compressed to '
+    ) -Problems $problems -Where "screen"
+    if (@($final.Screen | Where-Object { $_ -match 'row now names|The manifest is left as' }).Count -gt 0) { $problems.Add("row reported as changed, or the manifest moved") }
+    if (-not $final.Zip -or (Get-FileLength $final.Next) -ne 4) { $problems.Add("zip $($final.Zip), dump next to it $((Get-FileLength $final.Next) -eq 4)") }
+    Test-ManifestAfter -Before $final.ManifestBefore -After $final.ZipManifest -Tool "DumpIt" -DestPath $final.Dump -RelativePath "Memory\memory_dump.dmp" -Problems $problems -Where "in the zip" -SizeOf $final.Next
+    if ($null -ne $final.ZipManifest -and [System.Convert]::ToBase64String($final.ZipManifest) -cne [System.Convert]::ToBase64String($final.ManifestBefore)) { $problems.Add("manifest not as it was") }
+    if ($final.Leftovers.Count -gt 0) { $problems.Add("left: $($final.Leftovers -join ', ')") }
+    Add-Result "compression: manifest locked -> warning, kept as it was" $problems
 
     # The summary, logged before compression, named the path next to the
     # zip: corrected in the log, and on screen at the end
@@ -899,8 +1075,9 @@ try {
     if (@($final.Screen | Where-Object { $_ -match '^  Memory dump:.*kept outside the zip' }).Count -gt 0) { $problems.Add("the summary on screen names the path next to the zip") }
     $correctedLog = '\] ' + [regex]::Escape('  Memory dump:    ' + (ConvertTo-LogText $final.Dump) + ' (not moved out, the folder is not zipped)') + '$'
     Test-LinesInOrder -Lines $final.Log -Expected @('kept outside the zip\)$', 'WARNING: Could not move the memory dump out', $correctedLog) -Problems $problems -Where "collection_log.txt"
-    if (@($final.Screen | Where-Object { $_ -match 'Compressing to:' }).Count -gt 0) { $problems.Add("compression started") }
+    if (@($final.Screen | Where-Object { $_ -match 'Compressing to:|row now names' }).Count -gt 0) { $problems.Add("compression started, or the manifest row changed") }
     if ($final.Zip -or -not $final.Folder -or (Get-FileLength $final.Dump) -ne 4) { $problems.Add("zip $($final.Zip), folder kept $($final.Folder), dump in it $((Get-FileLength $final.Dump) -eq 4)") }
+    Test-ManifestAfter -Before $final.ManifestBefore -After $final.FolderManifest -Tool "DumpIt" -DestPath $final.Dump -RelativePath "Memory\memory_dump.dmp" -Problems $problems -Where "in the folder"
     Add-Result "compression: dump not movable -> no zip, folder kept" $problems
 
     # A failed dump still in Memory\ (the section could neither set it
@@ -932,18 +1109,28 @@ try {
     if (-not $final.Zip -or $final.Folder) { $problems.Add("zip $($final.Zip), folder kept $($final.Folder)") }
     if ((Get-FileLength $final.SetAside) -ne 4) { $problems.Add("not set aside at $($final.SetAside)") }
     if (@($final.Entries | Where-Object { $_ -like "*memory_dump*" }).Count -gt 0) { $problems.Add("dump in the zip") }
+    Test-ManifestAfter -Before $final.ManifestBefore -After $final.ZipManifest -Tool "DumpIt" -DestPath "" -RelativePath "" -Problems $problems -Where "in the zip"
     Add-Result "compression: failed dump set aside at the end -> zip" $problems
 
+    # -MemoryOutputPath (or a drive chosen at the prompt): the dump stays
+    # there, its row names it, and the summary says the timeline builder
+    # finds it through the manifest
     $final = Invoke-Final -Name "dumpdir" -DumpDir (Join-Path $workDir "dumpdir-final")
     $problems = New-Problems
+    $hintLines = @('(the timeline builder finds it through collection_manifest.csv;', '-MemoryDumpPath only if the dump is moved or analyzed on another machine)')
     Test-LinesInOrder -Lines $final.Screen -Expected @(
         ('Memory dump:    ' + [regex]::Escape($final.Dump) + '$'),
-        '  \(timeline builder: pass it as -MemoryDumpPath\)$',
+        ('\] {19}' + [regex]::Escape($hintLines[0]) + '$'),
+        ('\] {19}' + [regex]::Escape($hintLines[1]) + '$'),
         'OK: Compressed to ',
+        ('^ {18}' + [regex]::Escape($hintLines[0]) + '$'),
+        ('^ {18}' + [regex]::Escape($hintLines[1]) + '$'),
         ('^  Memory dump:    ' + [regex]::Escape($final.Dump) + ' \(')
     ) -Problems $problems -Where "screen"
+    if (@($final.Screen | Where-Object { $_ -match 'pass it as' }).Count -gt 0) { $problems.Add("the old -MemoryDumpPath hint") }
     if (-not $final.Zip -or (Get-FileLength $final.Dump) -ne 4) { $problems.Add("zip $($final.Zip), dump left $((Get-FileLength $final.Dump) -eq 4)") }
-    if (@($final.Screen | Where-Object { $_ -match 'Memory dump detected' }).Count -gt 0) { $problems.Add("dump moved") }
+    if (@($final.Screen | Where-Object { $_ -match 'Memory dump detected|row now names' }).Count -gt 0) { $problems.Add("dump moved, or its row changed") }
+    Test-ManifestAfter -Before $final.ManifestBefore -After $final.ZipManifest -Tool "DumpIt" -DestPath $final.Dump -RelativePath "" -Problems $problems -Where "in the zip"
     Add-Result "compression: -MemoryOutputPath dump left in place" $problems
 
     $final = Invoke-Final -Name "nozip" -NoZip
@@ -952,6 +1139,7 @@ try {
     if ($final.Zip -or -not $final.Folder) { $problems.Add("zip $($final.Zip), folder kept $($final.Folder)") }
     $logged = @(Get-Content -LiteralPath $logFile)
     Test-LinesInOrder -Lines $logged -Expected @(('Memory dump:    ' + [regex]::Escape((ConvertTo-LogText $final.Dump)) + '$')) -Problems $problems -Where "collection_log.txt"
+    Test-ManifestAfter -Before $final.ManifestBefore -After $final.FolderManifest -Tool "DumpIt" -DestPath $final.Dump -RelativePath "Memory\memory_dump.dmp" -Problems $problems -Where "in the folder"
     Add-Result "summary: -NoCompress names the dump" $problems
 
     $final = Invoke-Final -Name "incomplete" -NoZip -Incomplete
@@ -969,6 +1157,7 @@ try {
     Test-LinesInOrder -Lines $final.Screen -Expected @(('\]   Memory dump:    ' + [regex]::Escape($final.Dump) + '$'), 'OK: Compressed to ', ('^  Memory dump:    ' + [regex]::Escape($final.Dump) + '$')) -Problems $problems -Where "screen"
     if (@($final.Screen | Where-Object { $_ -match 'timeline builder|Memory dump detected' }).Count -gt 0) { $problems.Add("-MemoryDumpPath hint, or the dump moved") }
     if (-not $final.Zip -or (Get-FileLength $final.Dump) -ne 4 -or @($final.Entries | Where-Object { $_ -like "*memory_dump*" }).Count -gt 0) { $problems.Add("zip $($final.Zip), dump left $((Get-FileLength $final.Dump) -eq 4)") }
+    Test-ManifestAfter -Before $final.ManifestBefore -After $final.ZipManifest -Tool "DumpIt" -DestPath $final.Dump -RelativePath "" -Problems $problems -Where "in the zip"
     Add-Result "summary: -MemoryOutputPath next to the zip, no hint" $problems
 }
 catch {

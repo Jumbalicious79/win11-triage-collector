@@ -139,6 +139,10 @@ jobs:
         if: ${{ !cancelled() }}
         run: ./tests/Test-MemoryAcquisitionLog.ps1
 
+      - name: Run memory space check test
+        if: ${{ !cancelled() }}
+        run: ./tests/Test-MemorySpaceCheck.ps1
+
   analyze:
     name: PSScriptAnalyzer
     runs-on: windows-latest

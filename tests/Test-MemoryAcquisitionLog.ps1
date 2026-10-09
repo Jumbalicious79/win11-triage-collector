@@ -243,7 +243,8 @@ try {
 
         # Where it runs: a statement of the capture try block itself (not in
         # an if, switch, catch or finally), after the statement that runs the
-        # tool and before the check of the dump file, so the log is saved and
+        # tool and before the check of the dump file (the first statement
+        # after the tool run that reads $dumpFile), so the log is saved and
         # listed whatever the dump result (a failed capture needs it most)
         $callLine = $helperCalls[0].Extent.StartLineNumber
         $statement = $helperCalls[0]
@@ -258,16 +259,16 @@ try {
             $dumpCheckIndex = -1
             for ($k = 0; $k -lt $statements.Count; $k++) {
                 if ($statements[$k].Find({ param($node) $node -is [System.Management.Automation.Language.CommandAst] -and $node.InvocationOperator -eq "Ampersand" -and $node.CommandElements[0].Extent.Text -eq '$memTool' }, $true)) { $toolIndex = $k }
-                if ($dumpCheckIndex -lt 0 -and $statements[$k] -is [System.Management.Automation.Language.IfStatementAst]) {
-                    foreach ($clause in $statements[$k].Clauses) {
-                        if ($clause.Item1.Find({ param($node) $node -is [System.Management.Automation.Language.VariableExpressionAst] -and $node.VariablePath.UserPath -eq "dumpFile" }, $true)) { $dumpCheckIndex = $k }
-                    }
+            }
+            if ($toolIndex -ge 0) {
+                for ($k = $toolIndex + 1; $k -lt $statements.Count; $k++) {
+                    if ($statements[$k].Find({ param($node) $node -is [System.Management.Automation.Language.VariableExpressionAst] -and $node.VariablePath.UserPath -eq "dumpFile" }, $true)) { $dumpCheckIndex = $k; break }
                 }
             }
             if ($toolIndex -lt 0) { $problems.Add("no statement of the try block around Save-MemoryAcquisitionLog runs the tool (& `$memTool)") }
             elseif ($callIndex -lt $toolIndex) { $problems.Add("Save-MemoryAcquisitionLog (line $callLine) runs before the tool (line $($statements[$toolIndex].Extent.StartLineNumber))") }
-            if ($dumpCheckIndex -lt 0) { $problems.Add("no if on `$dumpFile in the try block around Save-MemoryAcquisitionLog") }
-            elseif ($callIndex -gt $dumpCheckIndex) { $problems.Add("Save-MemoryAcquisitionLog (line $callLine) runs after the dump check (line $($statements[$dumpCheckIndex].Extent.StartLineNumber))") }
+            if ($toolIndex -ge 0 -and $dumpCheckIndex -lt 0) { $problems.Add("no statement after the tool run reads `$dumpFile (the dump check) in the try block around Save-MemoryAcquisitionLog") }
+            elseif ($dumpCheckIndex -ge 0 -and $callIndex -gt $dumpCheckIndex) { $problems.Add("Save-MemoryAcquisitionLog (line $callLine) runs after the dump check (line $($statements[$dumpCheckIndex].Extent.StartLineNumber))") }
         }
     }
     # Writes to $memLogFile: a writing cmdlet given it (-Path $x or

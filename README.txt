@@ -72,6 +72,10 @@ more than forensic purity:
   1. Copy win11-triage-collector to a USB drive
   2. Plug the USB into the target machine
   3. Double-click Run-TriageCollector.bat (collects to reports\ on the USB)
+     With memory capture the dump, as large as the RAM, goes there too:
+     FAT32 (common on USB sticks) cannot hold a file of 4 GB or more, so
+     use an NTFS or exFAT drive. The memory prompt checks the free space
+     first and offers another drive when the dump does not fit.
   4. Unplug the USB and take it to your analysis workstation
   5. Place win11-timeline-builder alongside the collector (or anywhere)
   6. Double-click Run-TimelineBuilder.bat -- it auto-finds the triage zips
@@ -181,6 +185,11 @@ needed -- plug in, double-click, collect, analyze.
   powershell -ExecutionPolicy Bypass -NoProfile -File "path\to\triage-collector.ps1" -SkipLargeFiles
   powershell -ExecutionPolicy Bypass -NoProfile -File "path\to\triage-collector.ps1" -Categories "Network","Persistence","EventLogs"
   powershell -ExecutionPolicy Bypass -NoProfile -File "path\to\triage-collector.ps1" -NoCompress
+  powershell -ExecutionPolicy Bypass -NoProfile -File "path\to\triage-collector.ps1" -MemoryOutputPath D:\TriageMemory
+
+  -MemoryOutputPath and -MinFreeSpaceGB (see Parameters) are only available
+  this way: the .bat passes only the drive letter and fast / nozip. Its
+  memory prompt offers another drive for the dump by itself when needed.
 
 
 ## How It Handles Windows Defender
@@ -223,6 +232,13 @@ not inside it (it is as large as the machine's RAM):
 DumpIt writes a Microsoft crash dump (.dmp); WinPmem and Magnet RAM Capture
 write a raw image (memory_dump.raw).
 
+With -MemoryOutputPath <folder> (or another drive chosen at the memory
+prompt) the dump is written to that folder from the start, under the same
+<collection>_memory_dump.dmp name; Memory\memory_acquisition_log.txt stays
+in the collection. The summary names the dump's location (also with
+-NoCompress). Unless that folder is the one the zip is in, give the dump to
+the timeline builder with -MemoryDumpPath.
+
 Use -NoCompress to keep the uncompressed folder instead.
 
 Entry names in the zip use "/" as the ZIP format requires, so tools on Linux
@@ -231,7 +247,10 @@ versions run by the .bat launcher (Windows PowerShell 5.1) use "\"; Windows
 tools and the timeline builder read both. A file already at the zip path
 (an earlier run with the same -OutputPath) is replaced, and the log says so.
 If compression fails, the incomplete zip is deleted, the uncompressed folder
-is kept and the log says why.
+is kept and the log says why. If the memory dump cannot be moved out of the
+collection folder (another program has it open), the folder is not zipped,
+so the dump does not end up in the zip; the log and the summary say where it
+is.
 
 Inside the zip:
 
@@ -395,7 +414,9 @@ Inside the zip:
                      Dump size equals installed RAM. Runs first to capture
                      pristine memory state before other collection.
                      Requires a capture tool in tools\ -- see Optional Tools.
-                     Saved separately from the zip due to size.
+                     Saved separately from the zip due to size. The free
+                     space is checked before the capture and the dump
+                     after it (see Memory Capture Setup).
   Acquisition log    memory_acquisition_log.txt: the capture tool's output,
                      for DumpIt the only record of its SHA-256 of the dump
                      and its NtStatus. Kept in the zip and listed in the
@@ -808,7 +829,8 @@ when the analysis machine uses a different time zone or locale.
   SizeBytes            Size of the copy
   CollectedAt          Collector's local time when the file was recorded
   RelativePath         Path inside the collection, e.g.
-                       Execution\Prefetch\CMD.EXE-0BD30981.pf
+                       Execution\Prefetch\CMD.EXE-0BD30981.pf; blank for a
+                       memory dump written to -MemoryOutputPath
   SourceCreatedUtc     Created / modified / accessed times of the ORIGINAL
   SourceModifiedUtc    file (the copies in the collection get new times).
   SourceAccessedUtc    Blank for command output, reg save exports, or unknown.
@@ -1013,6 +1035,32 @@ The fastest path from collection to analysis:
     output drive. When the zip step fails, the incomplete zip is deleted and
     the uncompressed collection folder is kept (see the log), so it can be
     compressed with another tool; -NoCompress skips the zip step.
+
+  - Memory capture is skipped, and counted as an error, when the dump would
+    not fit where it goes: less than 1 GB would be left, or the drive is
+    FAT32 and the dump is 4 GB or more. It is also skipped as an error when
+    a file is already at the dump's path (an earlier dump is never
+    overwritten). The other artifacts are still collected. With less than
+    the system drive's reserve left it runs with a warning (on a run
+    without the prompt, e.g. -Categories Memory).
+    Error: "Memory capture skipped: less than 1 GB would be left free on C:\. ..."
+    Error: "Memory capture skipped: a file is already at <dump path> (an earlier run?). ..."
+    Warning: "Capturing anyway: C:\ would be left with ~3.9 GB free, less than the 20 GB to keep free on the system drive. ..."
+
+  - A memory dump that fails the checks after the capture (see Memory
+    Capture Setup) is an error, is not recorded in the manifest and is not
+    zipped: an empty one is deleted, anything else is renamed to
+    <name>.incomplete -- for a dump in Memory\, next to the collection
+    folder (<collection>_memory_dump.dmp.incomplete); for one written with
+    -MemoryOutputPath (or to a drive chosen at the prompt), in that folder
+    (<collection>_memory_dump.dmp.incomplete there). If it cannot be
+    renamed it is deleted. One that can be neither renamed nor deleted
+    (another program has it open) is tried again at the end of the run; if
+    it is then still in the collection folder, the folder is not zipped.
+    The summary names a failed dump as INCOMPLETE; one still under the
+    dump's name must be deleted by hand before the collection is analyzed.
+    Error: "Memory capture failed: DumpIt reported NtStatus 0xC000007F; ..."
+    Warning: "Could not delete the incomplete memory dump, delete it by hand (it is not complete, do not analyze it): ..."
 
   - Per-user live registry data (Run/RunOnce keys, RecentApps) covers every
     user whose hive is loaded, i.e. users logged in at collection time, not
@@ -1251,6 +1299,21 @@ the mounted image for a non-invasive collection.
                    cookies were exposed), session/token-theft cases (cookie
                    decryption), authorized access to cloud evidence, and
                    evidence integrity (copies that hash-match the originals).
+  -MemoryOutputPath
+                   Folder for the memory dump, e.g. D:\TriageMemory on a
+                   second drive (created if missing; must be outside the
+                   collection folder). The dump is written there as
+                   <collection>_memory_dump.dmp (.raw for WinPmem and Magnet
+                   RAM Capture); the acquisition log stays in the
+                   collection. Default: Memory\ in the collection, moved
+                   next to the zip at the end.
+  -MinFreeSpaceGB  Free space in GB to keep on the system drive after the
+                   memory dump and the collection. Default: -1 (automatic:
+                   10% of the volume, at least 4 and at most 20 GB). 0
+                   keeps only the 1 GB that every drive keeps.
+
+  -MemoryOutputPath and -MinFreeSpaceGB are not passed by the .bat; run the
+  script directly to use them (see Quick Start, PowerShell (Admin)).
 
 
 ## Optional Tools (tools\ directory)
@@ -1309,9 +1372,44 @@ capture before collection begins.
   and skips the others with a note.
 
   Output: Memory\memory_dump.dmp (DumpIt) or memory_dump.raw, saved next to
-          the zip as <collection>_memory_dump.dmp / .raw
+          the zip as <collection>_memory_dump.dmp / .raw. With
+          -MemoryOutputPath <folder> (or another drive chosen at the
+          prompt), written to that folder under that name from the start.
+          The acquisition log always stays in the collection.
   Storage: Dump size equals installed RAM (16 GB RAM = ~16 GB file).
-           Ensure the output drive has enough free space.
+           Before the capture the script checks the free space where the
+           dump goes, for the dump (RAM + 1 MB for DumpIt, RAM x 1.05 for
+           a raw image) and, on the collection's drive, ~5 GB for the
+           collection and its zip (4 GB with the raw NTFS copies, else
+           1 GB; x 1.25 unless -NoCompress). That is a typical size, not
+           an upper limit: the parts with size caps of their own are not
+           counted at those caps (e-mail attachments, up to 2 GB; SRUM;
+           the browser history snapshots; the larger event logs;
+           -IncludeThunderbirdIndex) and can add several GB. On the system
+           drive it keeps a reserve free, since Windows keeps writing
+           there: 10% of the volume, at least 4 and at most 20 GB, or
+           -MinFreeSpaceGB (raise it when those parts are expected to be
+           large). On other drives 1 GB. The prompt shows these numbers,
+           for example
+             Free space on C:\: 40.8 GB; memory dump ~31.9 GB + collection
+             ~5 GB would leave ~3.9 GB (to keep free on the system drive:
+             20 GB)
+           and, when the dump does not fit or would eat into the reserve,
+           offers other drives where it fits ([1] D:\TriageMemory --
+           recommended, [2] here anyway, [3] skip). The check is repeated
+           right before the capture and logged; if the dump does not fit
+           then, the capture is skipped as an error and the rest of the
+           collection still runs. The output drive is also checked for the
+           collection at the start of every run (a warning only).
+           Writing the dump to the system drive being examined overwrites
+           free space that can still hold deleted files: another drive is
+           better. FAT32 (common on USB sticks) cannot hold a dump of 4 GB
+           or more.
+  Checks: After the capture, DumpIt's "Error:" lines are copied into the
+          log, and the dump is kept only when it exists, is not empty,
+          DumpIt reported NtStatus 0x00000000 and the size the file has,
+          and it holds at least 95% of the RAM. Otherwise the capture is an
+          error, and the dump is set aside (see Known Limitations).
   Timing: Adds 2-5 minutes depending on RAM size.
   Ordering: Runs FIRST to capture pristine RAM before other collection.
   Live only: Memory capture is skipped for mounted forensic images.
@@ -1471,6 +1569,29 @@ capture before collection begins.
     manifest matches the file.
       powershell -ExecutionPolicy Bypass -File tests\Test-MemoryAcquisitionLog.ps1
 
+  tests\Test-MemorySpaceCheck.ps1 (no admin needed; also runs in CI)
+    Checks the free space check before a memory capture and the check of
+    its result, without capturing anything. The space check with run 2's
+    numbers (C: 40.8 GB free, 32 GB of RAM: low reserve) and other cases:
+    no room, another drive, a FAT32 stick, -MinFreeSpaceGB, unknown free
+    space or RAM, the collection's share, and the log line. Free space read
+    from the temp folder's drive, its UNC admin share (when reachable) and
+    a missing drive. The prompt, with stand-ins for the drives and the
+    answers: the numbers, the system drive warning, other drives offered
+    (D: for run 2, not a FAT32 or too-small drive). The result check on a
+    redacted DumpIt log (tests\fixtures\memory) and a failing variant
+    (nonzero NtStatus, short file, an "Error:" line). The memory section
+    with a stand-in tool: no room (an error, no capture), low reserve (a
+    warning), a complete, failed, empty or missing dump, an earlier dump at
+    the path, -MemoryOutputPath, a failed dump that cannot be renamed or is
+    held open. The summary and compression step: the dump moved next to the
+    zip, or the folder kept unzipped (and the summary corrected) when it
+    cannot be moved; the -MemoryDumpPath hint only for a dump that is not
+    next to the zip; a failed dump still in the folder set aside then, or
+    the folder not zipped. The prompt asks again after a bad answer (also a
+    number too large for an [int]) and is not shown with -Unattended.
+      powershell -ExecutionPolicy Bypass -File tests\Test-MemorySpaceCheck.ps1
+
   Planted-activity test (both tools, end to end, on a live machine)
     1. In a normal (not elevated) PowerShell window, as the user to test:
          powershell -ExecutionPolicy Bypass -File tests\Invoke-PlantedActivity.ps1
@@ -1594,6 +1715,10 @@ This script is read-only by design, with these minimal exceptions:
   - Creates the output directory and files (in reports\ next to the script)
   - Creates and removes a Volume Shadow Copy snapshot (for locked file access)
   - Adds and removes a temporary Windows Defender exclusion (output path only)
+  - With memory capture: the capture tool loads its kernel driver, and the
+    dump (as large as the RAM) is written to the output drive or to
+    -MemoryOutputPath; on the system drive this overwrites free space that
+    can hold deleted files
   - Compiles small Add-Type helpers (registry key times, raw NTFS reader);
     Windows PowerShell writes and deletes temporary compiler files in %TEMP%
     for this

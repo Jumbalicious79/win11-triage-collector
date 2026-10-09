@@ -376,7 +376,9 @@ try {
     foreach ($check in $logChecks.Keys) {
         Write-TestResult -Succeeded ($log.Contains($logChecks[$check])) -Message $check
     }
-    $logErrors = @($log -split "`r?`n" | Where-Object { $_ -match '\] (ERROR|WARNING): ' -and $_ -notmatch 'time zone could not be read' })
+    # Not counted: the fake image's time zone and the start-of-run free space
+    # warning (the temp folder's drive may be low)
+    $logErrors = @($log -split "`r?`n" | Where-Object { $_ -match '\] (ERROR|WARNING): ' -and $_ -notmatch 'time zone could not be read' -and $_ -notmatch 'WARNING: The output drive may run short of space' })
     Write-TestResult -Succeeded ($logErrors.Count -eq 0) -Message "no errors or warnings in the collection log$(if ($logErrors) { ': ' + ($logErrors[0]) })"
 
     # --- Second run: -IncludeThunderbirdIndex copies the search index;

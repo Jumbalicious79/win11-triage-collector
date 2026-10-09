@@ -1,0 +1,54 @@
+
+  DumpIt 3.6.20230117 (X64) (Jan 17 2023)
+  Copyright (C) 2007 - 2021, Matt Suiche (msuiche)
+  Copyright (C) 2016 - 2021, Comae Technologies DMCC <https://www.comae.com>
+  Copyright (c) 2022, Magnet Forensics, Inc. <https://www.magnetforensics.com/>
+  All rights reserved.
+
+  Thanks for using DumpIt! Always use Microsoft crash dumps!
+
+    Destination path:           \??\C:\Triage\reports\TriageCollection_2026-01-02_03-04\Memory\memory_dump.dmp
+
+
+
+    Computer name:              TRIAGE-TEST
+
+
+
+
+
+    --> Proceed with the acquisition ? [y/n] y
+
+
+    [+] Information:
+    Dump Type:                   Microsoft Crash Dump
+
+
+    [+] Machine Information:
+    Windows version:             10.0.26200
+    MachineId:                   00000000-1111-2222-3333-444444444444
+    TimeStamp:                   134117966450000000
+    Cr3:                         0x1ad000
+    KdCopyDataBlock:             0xfffff80000001000
+    KdDebuggerData:              0xfffff80000002000
+    KdpDataBlockEncoded:         0xfffff80000003000
+
+    Current date/time:          [2026-01-02 (YYYY-MM-DD) 3:04:05 (UTC)]
+
+    + Processing... Done.
+
+    Error: Not enough disk space to save dump file.
+
+    Acquisition finished at:    [2026-01-02 (YYYY-MM-DD) 3:05:05 (UTC)]
+    Time elapsed:               1:00 minutes:seconds (60 secs)
+
+    Created file size:           17179869184 bytes (16384 Mb)
+    Total physical memory size:  32571 Mb
+
+    NtStatus (troubleshooting):   0xC000007F
+    Total of written pages:       4194304
+    Total of inacessible pages:         0
+    Total of accessible pages:    8338368
+
+
+

@@ -143,6 +143,10 @@ jobs:
         if: ${{ !cancelled() }}
         run: ./tests/Test-MemorySpaceCheck.ps1
 
+      - name: Run console mode test
+        if: ${{ !cancelled() }}
+        run: ./tests/Test-ConsoleMode.ps1
+
   analyze:
     name: PSScriptAnalyzer
     runs-on: windows-latest

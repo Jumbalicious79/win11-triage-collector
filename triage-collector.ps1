@@ -56,6 +56,85 @@ $ErrorActionPreference = "Continue"
 $script:startTime = Get-Date
 $timestamp = Get-Date -Format "yyyy-MM-dd_HH-mm"
 
+# --- Console QuickEdit: off for the run ---
+# With QuickEdit on, a click in the console window starts a text selection,
+# and while it lasts every write to the console waits. Log writes to the
+# console before it writes to the log file, so the whole run stops (no CPU,
+# the log file stops too) until the selection ends. QuickEdit is turned off
+# here, and Restore-ConsoleMode puts the console's mode back: before an
+# early exit, in the main finally block when the run is stopped (Ctrl+C),
+# and before the last prompt. Text can still be copied with the window menu
+# (Edit > Mark). With no console, or with input redirected (tests, CI),
+# nothing is changed, and nothing here can stop the run.
+$script:consoleModeSaved = $null   # the mode before the run, while this script has it changed
+
+# The console input mode with QuickEdit off: ENABLE_QUICK_EDIT_MODE (0x40)
+# cleared and ENABLE_EXTENDED_FLAGS (0x80) set (SetConsoleMode changes
+# QuickEdit only with that flag). Unchanged when QuickEdit is already off
+# and the flag is set
+function Get-ConsoleModeWithoutQuickEdit {
+    [OutputType([uint32])]
+    param([uint32]$Mode)
+    return [uint32](([long]$Mode -band (-bnot [long]0x40)) -bor [long]0x80)
+}
+
+# Turns QuickEdit off in the console of standard input and returns the mode
+# it had, or $null when nothing was changed: no console or input redirected
+# (GetConsoleMode fails), QuickEdit already off, or an error (Write-Verbose
+# only). The type is compiled once per session; a second run in the same
+# window reuses it
+function Disable-ConsoleQuickEdit {
+    try {
+        if (-not ('TriageNative.ConsoleMode' -as [type])) {
+            Add-Type -Namespace TriageNative -Name ConsoleMode -ErrorAction Stop -MemberDefinition @'
+[DllImport("kernel32.dll", SetLastError = true)]
+public static extern IntPtr GetStdHandle(int nStdHandle);
+[DllImport("kernel32.dll", SetLastError = true)]
+public static extern bool GetConsoleMode(IntPtr hConsoleHandle, out uint lpMode);
+[DllImport("kernel32.dll", SetLastError = true)]
+public static extern bool SetConsoleMode(IntPtr hConsoleHandle, uint dwMode);
+'@
+        }
+        $handle = [TriageNative.ConsoleMode]::GetStdHandle(-10)   # STD_INPUT_HANDLE
+        $mode = [uint32]0
+        if (-not [TriageNative.ConsoleMode]::GetConsoleMode($handle, [ref]$mode)) {
+            Write-Verbose "Console QuickEdit not changed: standard input is not a console"
+            return $null
+        }
+        $newMode = Get-ConsoleModeWithoutQuickEdit $mode
+        if ($newMode -eq $mode) { return $null }
+        if (-not [TriageNative.ConsoleMode]::SetConsoleMode($handle, $newMode)) {
+            Write-Verbose "Console QuickEdit not changed: SetConsoleMode failed"
+            return $null
+        }
+        $script:consoleModeSaved = $mode
+        return $mode
+    } catch {
+        Write-Verbose "Console QuickEdit not changed: $($_.Exception.Message)"
+        return $null
+    }
+}
+
+# Puts back the mode Disable-ConsoleQuickEdit found, once; does nothing when
+# that changed nothing. A mode read without ENABLE_EXTENDED_FLAGS did not
+# say whether QuickEdit was on: it is put back as read, and QuickEdit stays
+# off. Never throws
+function Restore-ConsoleMode {
+    if ($null -eq $script:consoleModeSaved) { return }
+    $mode = [uint32]$script:consoleModeSaved
+    $script:consoleModeSaved = $null
+    try {
+        $handle = [TriageNative.ConsoleMode]::GetStdHandle(-10)   # STD_INPUT_HANDLE
+        if (-not [TriageNative.ConsoleMode]::SetConsoleMode($handle, $mode)) {
+            Write-Verbose "Console mode not restored: SetConsoleMode failed"
+        }
+    } catch {
+        Write-Verbose "Console mode not restored: $($_.Exception.Message)"
+    }
+}
+
+$consoleModeAtStart = Disable-ConsoleQuickEdit
+
 # -IncludeSecrets (see the param comment): read in the Browser section (every
 # privacy redaction is skipped so the copies hash-equal the originals) and the
 # Secrets section (credential material). Set here so it is available before
@@ -161,6 +240,7 @@ if (-not $TargetDrive) {
             $selection = Read-Host "Select a drive (1-$($availableDrives.Count))"
             if ($selection -eq "0") {
                 Write-Host "Cancelled." -ForegroundColor Yellow
+                Restore-ConsoleMode
                 exit 0
             }
         } while (-not ($selection -match '^\d+$' -and [int]$selection -ge 1 -and [int]$selection -le $availableDrives.Count))
@@ -192,6 +272,7 @@ $script:IsLive = ("${TargetDrive}:" -eq $env:SystemDrive)
 # Validate target drive
 if (-not (Test-Path $script:TargetRoot)) {
     Write-Host "ERROR: Drive ${TargetDrive}: does not exist or is not accessible." -ForegroundColor Red
+    Restore-ConsoleMode
     if (-not $Unattended) { pause }
     exit 1
 }
@@ -285,6 +366,7 @@ if ($MemoryOutputPath) {
     } catch {
         # e.g. a drive that does not exist
         Write-Host "ERROR: -MemoryOutputPath $MemoryOutputPath -- $($_.Exception.Message)" -ForegroundColor Red
+        Restore-ConsoleMode
         if (-not $Unattended) { pause }
         exit 1
     }
@@ -294,6 +376,7 @@ if ($MemoryOutputPath) {
     if (($MemoryOutputPath.TrimEnd('\') + '\').StartsWith($OutputPath.TrimEnd('\') + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
         Write-Host "ERROR: -MemoryOutputPath $MemoryOutputPath is inside the collection folder $OutputPath," -ForegroundColor Red
         Write-Host "  so the memory dump would be zipped. Choose a folder outside it." -ForegroundColor Red
+        Restore-ConsoleMode
         if (-not $Unattended) { pause }
         exit 1
     }
@@ -1714,6 +1797,9 @@ if ($script:IsLive) {
 Log "Categories: $($Categories -join ', ')"
 Log "SkipLargeFiles: $SkipLargeFiles"
 if ($MemoryOutputPath) { Log "Memory dump folder: $MemoryOutputPath" }
+if ($null -ne $consoleModeAtStart) {
+    Log "Console QuickEdit is off for this run, so a click in the window cannot pause it (copy text with the window menu: Edit > Mark)."
+}
 # Free space for the collection and its zip on the output drive (a warning
 # only; a memory dump is checked right before the capture)
 $outputSpace = Get-TriageSpaceCheck -Path $OutputPath -NoDump
@@ -6630,6 +6716,11 @@ $script:collectionCompleted = $true
 } finally {
     $global:FormatEnumerationLimit = $savedFormatEnumerationLimit
     Invoke-CollectionCleanup
+    # A stopped run ends here: the console's mode back as it was (after
+    # the cleanup, which a click must not pause). A finished run keeps
+    # QuickEdit off through the summary and the zip, and puts it back
+    # before the last prompt
+    if (-not $script:collectionCompleted) { Restore-ConsoleMode }
 }
 
 # =============================================================
@@ -6927,6 +7018,10 @@ if ($memDumpMovedTo -and (Test-Path -LiteralPath $memDumpMovedTo)) {
     $dumpGB = [math]::Round((Get-FileLength $script:memDumpPath) / 1GB, 2)
     Write-Host "  Memory dump:    $($script:memDumpPath) ($dumpGB GB)"
 }
+
+# The run is done: the console's mode back as it was before it (QuickEdit),
+# so the summary can be selected with the mouse again
+Restore-ConsoleMode
 
 if (-not $Unattended) {
     Write-Host ""

@@ -1583,7 +1583,7 @@ capture before collection begins.
     cannot be moved; the -MemoryDumpPath hint only for a dump that is not
     next to the zip; a failed dump still in the folder set aside then, or
     the folder not zipped. The prompt asks again after a bad answer (also a
-    number too large for an [int]).
+    number too large for an [int]) and is not shown with -Unattended.
       powershell -ExecutionPolicy Bypass -File tests\Test-MemorySpaceCheck.ps1
 
   Planted-activity test (both tools, end to end, on a live machine)

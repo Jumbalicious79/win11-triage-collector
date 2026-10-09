@@ -11,6 +11,7 @@
 #     drive;
 #   - the prompt (run with stand-ins for the drives and the answers): the
 #     numbers, the warning about the system drive, other drives offered;
+#     none of it with -Unattended;
 #   - the result check (Get-MemoryCaptureResult) on a redacted DumpIt log
 #     (fixtures\memory) and a failing variant;
 #   - the memory section, run with a stand-in capture tool: no room (an
@@ -72,7 +73,7 @@ foreach ($name in @("Get-VolumeSpace", "Get-MemoryCaptureSpaceCheck", "Format-Sp
 # section (in the main try block) and the summary and compression steps at
 # the end (up to the final "Press any key")
 $topStatements = @($ast.EndBlock.Statements)
-$promptStatement = @($topStatements | Where-Object { $_ -is [System.Management.Automation.Language.IfStatementAst] -and $_.Clauses[0].Item1.Extent.Text -eq '$script:IsLive -and ($Categories -notcontains "Memory")' })
+$promptStatement = @($topStatements | Where-Object { $_ -is [System.Management.Automation.Language.IfStatementAst] -and $_.Clauses[0].Item1.Extent.Text -eq '$script:IsLive -and ($Categories -notcontains "Memory") -and -not $Unattended' })
 $sectionStatement = @($ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.IfStatementAst] -and $node.Clauses[0].Item1.Extent.Text -eq '$Categories -contains "Memory"' }, $true) |
     Where-Object { -not (Test-InsideFunction $_) })
 $firstFinal = -1
@@ -376,10 +377,11 @@ try {
     $script:NoCompress = $false
     $script:MinFreeSpaceGB = -1
     $script:IsLive = $true
+    $script:Unattended = $false
     $script:testRamBytes = $ram2
     # E: FAT32, F: too small, H: free space unknown: none of them offered
     $script:testDriveRoots = @("C:\", "D:\", "E:\", "F:\", "H:\")
-    $defaultCategories = @("FileSystem", "Registry", "EventLogs", "Execution", "Network", "UserActivity", "Browser", "USB", "Persistence", "AntiVirus")
+    $defaultCategories = @("FileSystem", "Registry", "EventLogs", "Execution", "Network", "UserActivity", "Browser", "USB", "Persistence", "AntiVirus", "Email")
 
     # Runs the prompt with these answers; returns what it showed and set
     function Invoke-Prompt {
@@ -522,6 +524,18 @@ try {
     Test-LinesInOrder -Lines $run.Screen -Expected @('^  Free space on C:\\: unknown', '^  Free space not checked: the free space could not be read\.$', '^  \[1\] Yes -- capture memory', '^Memory capture enabled\.') -Problems $problems -Where "screen"
     if (-not $run.Accepted) { $problems.Add("not marked as accepted") }
     Add-Result "prompt: free space unknown" $problems
+
+    # -Unattended: no prompt at all (memory only with -Categories Memory,
+    # checked by the memory section)
+    $script:Unattended = $true
+    $run = Invoke-Prompt -Answers @()
+    $script:Unattended = $false
+    $problems = New-Problems
+    if ($run.Thrown) { $problems.Add("prompt threw: $($run.Thrown)") }
+    if ($run.Screen.Count -gt 0) { $problems.Add("shown: $($run.Screen -join ' | ')") }
+    if ($run.Prompts.Count -ne 0) { $problems.Add("asked: $($run.Prompts -join ' | ')") }
+    if ($run.Categories -contains "Memory" -or $run.MemoryOutputPath -or $run.Accepted) { $problems.Add("Categories $($run.Categories -join ','), MemoryOutputPath '$($run.MemoryOutputPath)', accepted $($run.Accepted)") }
+    Add-Result "prompt: not shown with -Unattended" $problems
 
     # The choices themselves (Get-MemoryCaptureChoices)
     $problems = New-Problems

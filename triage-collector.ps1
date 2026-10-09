@@ -285,7 +285,7 @@ if ($MemoryOutputPath) {
     } catch {
         # e.g. a drive that does not exist
         Write-Host "ERROR: -MemoryOutputPath $MemoryOutputPath -- $($_.Exception.Message)" -ForegroundColor Red
-        pause
+        if (-not $Unattended) { pause }
         exit 1
     }
     if ($MemoryOutputPath.TrimEnd('\') -ne [System.IO.Path]::GetPathRoot($MemoryOutputPath).TrimEnd('\')) {
@@ -294,7 +294,7 @@ if ($MemoryOutputPath) {
     if (($MemoryOutputPath.TrimEnd('\') + '\').StartsWith($OutputPath.TrimEnd('\') + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
         Write-Host "ERROR: -MemoryOutputPath $MemoryOutputPath is inside the collection folder $OutputPath," -ForegroundColor Red
         Write-Host "  so the memory dump would be zipped. Choose a folder outside it." -ForegroundColor Red
-        pause
+        if (-not $Unattended) { pause }
         exit 1
     }
 }

@@ -330,8 +330,11 @@ $failed = @($steps.Keys | Where-Object { $steps[$_].Status -eq "Failed" })
 Write-Host ""
 Write-Host "Planted: $plantedFile" -ForegroundColor Cyan
 if ($failed.Count -gt 0) { Write-Host "Not planted (the check will skip them): $($failed -join ', ')" -ForegroundColor Yellow }
+# Full paths, so the commands also work when these scripts are kept outside
+# the repository
+$checker = Join-Path $PSScriptRoot "Test-PlantedActivity.ps1"
 Write-Host "Next:"
 Write-Host "  1. Run-TriageCollector.bat (live system), then Run-TimelineBuilder.bat on the new collection"
-Write-Host "  2. powershell -ExecutionPolicy Bypass -File tests\Test-PlantedActivity.ps1"
-Write-Host "  3. powershell -ExecutionPolicy Bypass -File tests\Invoke-PlantedActivity.ps1 -Cleanup"
+Write-Host "  2. powershell -ExecutionPolicy Bypass -File `"$checker`""
+Write-Host "  3. powershell -ExecutionPolicy Bypass -File `"$PSCommandPath`" -Cleanup"
 Write-Host "Optional: restart Windows before collecting to also get ShimCache entries (written at shutdown)." -ForegroundColor DarkGray

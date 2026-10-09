@@ -49,7 +49,14 @@ $planted = Get-Content -LiteralPath $PlantedFile -Raw | ConvertFrom-Json
 $plantedUtc = ConvertTo-UtcTime $planted.FinishedUtc
 
 if (-not $TimelinePath) {
-    $builderReports = Join-Path (Split-Path (Split-Path $PSScriptRoot -Parent) -Parent) "win11-timeline-builder\reports"
+    # win11-timeline-builder next to this repository (script in tests\), or next to
+    # the folder holding this script when it is kept outside the repository
+    $candidates = @(
+        (Join-Path (Split-Path (Split-Path $PSScriptRoot -Parent) -Parent) "win11-timeline-builder\reports"),
+        (Join-Path (Split-Path $PSScriptRoot -Parent) "win11-timeline-builder\reports")
+    )
+    $builderReports = $candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+    if (-not $builderReports) { $builderReports = $candidates[0] }
     $TimelinePath = Get-ChildItem -Path (Join-Path $builderReports "timeline_*\timeline.csv") -File -ErrorAction SilentlyContinue |
         Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1 -ExpandProperty FullName
     if (-not $TimelinePath) {
@@ -276,5 +283,5 @@ if ($requiredPassed -lt $requiredTotal) {
     exit 1
 }
 Write-Host "PASS" -ForegroundColor Green
-Write-Host "Clean up with: powershell -ExecutionPolicy Bypass -File tests\Invoke-PlantedActivity.ps1 -Cleanup" -ForegroundColor DarkGray
+Write-Host "Clean up with: powershell -ExecutionPolicy Bypass -File `"$(Join-Path $PSScriptRoot 'Invoke-PlantedActivity.ps1')`" -Cleanup" -ForegroundColor DarkGray
 exit 0

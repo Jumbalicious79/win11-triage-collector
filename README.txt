@@ -72,6 +72,10 @@ more than forensic purity:
   1. Copy win11-triage-collector to a USB drive
   2. Plug the USB into the target machine
   3. Double-click Run-TriageCollector.bat (collects to reports\ on the USB)
+     With memory capture the dump, as large as the RAM, goes there too:
+     FAT32 (common on USB sticks) cannot hold a file of 4 GB or more, so
+     use an NTFS or exFAT drive. The memory prompt checks the free space
+     first and offers another drive when the dump does not fit.
   4. Unplug the USB and take it to your analysis workstation
   5. Place win11-timeline-builder alongside the collector (or anywhere)
   6. Double-click Run-TimelineBuilder.bat -- it auto-finds the triage zips
@@ -118,7 +122,8 @@ is not the live system drive and switches to MOUNTED IMAGE mode:
   Skipped (requires live system):
     - Network state (DNS, ARP, TCP connections, firewall, Wi-Fi)
     - Live registry queries (Run keys, BAM, RecentApps, USB registry,
-      mounted devices) -- the same data is in the collected hives
+      mounted devices) -- the same data is in the collected hives (the
+      timeline builder reads MountedDevices from the SYSTEM hive)
     - USB PnP device timestamps (usb_storage_devices.csv)
     - Scheduled task run times (scheduled_tasks.csv)
     - WMI queries (services, startup commands, drivers, WMI subscriptions)
@@ -173,6 +178,19 @@ needed -- plug in, double-click, collect, analyze.
   tools\dumpit\README.txt). The script prompts on live system runs when a
   capture tool is detected. See the "Optional Tools" section below.
 
+  While it runs, QuickEdit is off in its console window, so a click in the
+  window cannot pause the run. (With QuickEdit on, a click starts a text
+  selection, and while it lasts every write to the window waits: the run
+  stops, and its log file with it, until the selection ends.) The
+  console's mouse input is turned off with it, so the mouse wheel still
+  scrolls the window. To copy text during the run, open the window menu
+  (Alt+Space, or right-click the title bar), choose Edit > Mark, select,
+  and press Enter; marking pauses the run the same way until Enter or
+  Esc. QuickEdit is turned back on at the end of the run, before "Press
+  any key to exit", so the summary can be selected with the mouse. In
+  Windows Terminal a selection does not pause the run, and text is
+  selected and copied as usual.
+
 ### PowerShell (Admin)
 
   powershell -ExecutionPolicy Bypass -NoProfile -File "path\to\triage-collector.ps1"
@@ -180,6 +198,11 @@ needed -- plug in, double-click, collect, analyze.
   powershell -ExecutionPolicy Bypass -NoProfile -File "path\to\triage-collector.ps1" -SkipLargeFiles
   powershell -ExecutionPolicy Bypass -NoProfile -File "path\to\triage-collector.ps1" -Categories "Network","Persistence","EventLogs"
   powershell -ExecutionPolicy Bypass -NoProfile -File "path\to\triage-collector.ps1" -NoCompress
+  powershell -ExecutionPolicy Bypass -NoProfile -File "path\to\triage-collector.ps1" -MemoryOutputPath D:\TriageMemory
+
+  -MemoryOutputPath and -MinFreeSpaceGB (see Parameters) are only available
+  this way: the .bat passes only the drive letter and fast / nozip. Its
+  memory prompt offers another drive for the dump by itself when needed.
 
 
 ## How It Handles Windows Defender
@@ -222,7 +245,35 @@ not inside it (it is as large as the machine's RAM):
 DumpIt writes a Microsoft crash dump (.dmp); WinPmem and Magnet RAM Capture
 write a raw image (memory_dump.raw).
 
+With -MemoryOutputPath <folder> (or another drive chosen at the memory
+prompt) the dump is written to that folder from the start, under the same
+<collection>_memory_dump.dmp name; Memory\memory_acquisition_log.txt stays
+in the collection. The summary names the dump's location (also with
+-NoCompress). The timeline builder finds the dump through the collection
+manifest: collection_manifest.csv records its full path and size wherever
+it ends up (next to the zip, or in that folder), so Run-TimelineBuilder.bat
+finds it with no parameter. If the dump is moved, or the collection is
+analyzed on another machine (where the drive may have another letter), put
+the dump next to the zip under its <collection>_memory_dump.dmp name (next
+to the collection folder with -NoCompress): the timeline builder looks
+there too, and the summary says so. The timeline builder never opens a
+network path (\\server\share\...) named in a manifest, so a dump written
+to one must be put next to the zip the same way. (Run directly,
+timeline-builder.ps1 also takes the dump's path as -MemoryDumpPath.)
+
 Use -NoCompress to keep the uncompressed folder instead.
+
+Entry names in the zip use "/" as the ZIP format requires, so tools on Linux
+and macOS (unzip, Python zipfile) extract the folders too. Zips from earlier
+versions run by the .bat launcher (Windows PowerShell 5.1) use "\"; Windows
+tools and the timeline builder read both. A file already at the zip path
+(an earlier run with the same -OutputPath) is replaced, and the log says so.
+If compression fails, the incomplete zip is deleted, the uncompressed folder
+is kept and the log says why; a memory dump moved out for the zip is moved
+back into Memory\, and its manifest row with it. If the memory dump cannot
+be moved out of the collection folder (another program has it open), the
+folder is not zipped, so the dump does not end up in the zip; the log and
+the summary say where it is.
 
 Inside the zip:
 
@@ -309,7 +360,11 @@ Inside the zip:
                                          times (UTC)
       usb_storage_devices.txt         -- USB storage device registry entries
       usb_devices.txt                 -- all USB device entries
-      mounted_devices.txt             -- volume GUID to drive letter mapping
+      mounted_devices.csv             -- MountedDevices, decoded: each drive
+                                         letter and volume GUID with its GPT
+                                         partition, MBR disk and offset, or
+                                         device path
+      mounted_devices.txt             -- same rows as text
     Persistence\
       scheduled_tasks.csv             -- all scheduled tasks (incl. disabled) with
                                          run-as account, actions, triggers,
@@ -382,7 +437,13 @@ Inside the zip:
                      Dump size equals installed RAM. Runs first to capture
                      pristine memory state before other collection.
                      Requires a capture tool in tools\ -- see Optional Tools.
-                     Saved separately from the zip due to size.
+                     Saved separately from the zip due to size. The free
+                     space is checked before the capture and the dump
+                     after it (see Memory Capture Setup).
+  Acquisition log    memory_acquisition_log.txt: the capture tool's output,
+                     for DumpIt the only record of its SHA-256 of the dump
+                     and its NtStatus. Kept in the zip and listed in the
+                     manifest.
 
 ### FileSystem
 
@@ -576,7 +637,13 @@ Inside the zip:
                              not connected, with first install, install, last
                              arrival and last removal times. Live system only.
   USB storage/device registry  Serial numbers, vendor IDs, mount points.
-  Mounted devices            Volume GUID to drive letter mapping.
+  Mounted devices            MountedDevices, decoded (mounted_devices.csv):
+                             each drive letter and volume GUID with the GPT
+                             partition GUID, the MBR disk signature and
+                             partition offset, or the device path (for a USB
+                             disk with vendor, product and serial). Live
+                             system only; for a mounted image the timeline
+                             builder reads the collected SYSTEM hive.
 
 ### Persistence
 
@@ -778,12 +845,21 @@ when the analysis machine uses a different time zone or locale.
   SourcePath           Original path; "HKLM\..." / "HKU\..." for reg save,
                        "(shadow)..." for shadow copies, "(command: ...)" for
                        command output, "(raw NTFS \\.\C: $MFT)" etc. for the
-                       raw NTFS copies
-  DestPath             Full path of the copy at collection time
+                       raw NTFS copies, "(memory dump via <tool>)" and
+                       "(memory capture tool output: <tool>)" for the memory
+                       dump and Memory\memory_acquisition_log.txt
+  DestPath             Full path of the copy at collection time; for the
+                       memory dump, where it is at the end of the run (next
+                       to the zip, in the -MemoryOutputPath folder, or in
+                       Memory\ when the folder is not zipped). The timeline
+                       builder finds the dump through this row (not on a
+                       network path, which it never opens).
   SizeBytes            Size of the copy
   CollectedAt          Collector's local time when the file was recorded
   RelativePath         Path inside the collection, e.g.
-                       Execution\Prefetch\CMD.EXE-0BD30981.pf
+                       Execution\Prefetch\CMD.EXE-0BD30981.pf; blank for a
+                       memory dump outside the collection (next to the zip,
+                       or written to -MemoryOutputPath)
   SourceCreatedUtc     Created / modified / accessed times of the ORIGINAL
   SourceModifiedUtc    file (the copies in the collection get new times).
   SourceAccessedUtc    Blank for command output, reg save exports, or unknown.
@@ -866,6 +942,38 @@ run_keys.txt lists the same keys plus Shell Folders / User Shell Folders.
 
 Devices that are no longer connected are included.
 
+### USB\mounted_devices.csv  (live system only)
+
+One row per value of HKLM\SYSTEM\MountedDevices, the key that maps drive
+letters (\DosDevices\E:) and volume GUIDs (\??\Volume{...}) to the volumes
+they belong to. Entries of devices that are no longer connected stay in it.
+
+  Name                 Value name, e.g. \DosDevices\E: or \??\Volume{...}
+  Kind                 How the data was decoded:
+                         GPT         a GPT partition (also dynamic volumes)
+                         MBR         a partition on an MBR disk
+                         DevicePath  a device path, e.g. a USB disk
+                         Other       none of these (see HexData)
+  DiskSignature        MBR: disk signature, 8 hex digits
+  PartitionOffset      MBR: start of the partition, in bytes from the start
+                       of the disk
+  PartitionGuid        GPT: partition GUID, {...}
+  DevicePath           DevicePath: the path as stored, e.g.
+                       _??_USBSTOR#Disk&Ven_...&Prod_...&Rev_...#<serial>&0#{...}
+                       (a "/" in a name is stored as "#": Prod_SD#MMC is the
+                       product "SD/MMC")
+  DataLength           Size of the value data in bytes (0 for a value that is
+                       not binary; its data is in HexData)
+  HexData              The value data as hex (as text for a value that is
+                       not binary)
+  KeyLastWriteUtc      Last-write time of the key (the whole key, not the
+                       single value)
+
+mounted_devices.txt lists the same rows as text. Earlier versions wrote only
+mounted_devices.txt, which showed the first 4 bytes of each value. The
+volume GUIDs also appear under each user's MountPoints2 key (NTUSER.DAT);
+MountedDevices is what links them to a disk or a device.
+
 ### Email\<user>\...\*_files.csv  (live system and mounted images)
 
 outlook_temp_files.csv, outlook_data_files.csv, olk_files.csv,
@@ -899,8 +1007,10 @@ The fastest path from collection to analysis:
   1. Double-click Run-TimelineBuilder.bat (no arguments needed)
   2. It auto-finds triage zips in the sibling reports\ directory
   3. Pick a collection number
-  4. If a memory dump is detected alongside the zip and Volatility 3 is
-     installed, the script prompts to include memory analysis
+  4. If the collection's memory dump is found (next to the zip, or where
+     collection_manifest.csv says it was written, e.g. D:\TriageMemory)
+     and Volatility 3 is installed, the script prompts to include memory
+     analysis
   5. Timeline builds (~2 minutes for ~56,000 events, longer with memory)
   6. Color-coded Excel (.xlsx) is generated with rows colored by EventType
   7. Choose a viewer: Excel (colored), Timeline Explorer, Both, or None
@@ -948,9 +1058,48 @@ The fastest path from collection to analysis:
     letter to get them.
     Warning: "Raw $MFT, $LogFile and $UsnJrnl:$J not collected: cannot open \\.\C: (...)"
 
-  - Very large volumes (millions of files) can have a $MFT over 2 GB. If the
-    zip step fails on it, the uncompressed collection folder is kept (see the
-    log); run with -NoCompress and compress with another tool in that case.
+  - Very large volumes (millions of files) can have a $MFT of several GB,
+    and the SRUM database (copied up to 16 GB) can also pass 4 GB.
+    The zip handles files that large (Zip64), but a FAT32 output drive
+    (common on USB sticks) cannot hold any file over 4 GB, so on FAT32 such
+    a copy, or a zip that would grow past 4 GB, fails: use an NTFS or exFAT
+    output drive. When the zip step fails, the incomplete zip is deleted and
+    the uncompressed collection folder is kept (see the log), so it can be
+    compressed with another tool; -NoCompress skips the zip step.
+
+  - Memory capture is skipped, and counted as an error, when the dump would
+    not fit where it goes: less than 1 GB would be left, or the drive is
+    FAT32 and the dump is 4 GB or more. It is also skipped as an error when
+    a file is already at the dump's path (an earlier dump is never
+    overwritten). The other artifacts are still collected. With less than
+    the system drive's reserve left it runs with a warning (on a run
+    without the prompt, e.g. -Categories Memory).
+    Error: "Memory capture skipped: less than 1 GB would be left free on C:\. ..."
+    Error: "Memory capture skipped: a file is already at <dump path> (an earlier run?). ..."
+    Warning: "Capturing anyway: C:\ would be left with ~3.9 GB free, less than the 20 GB to keep free on the system drive. ..."
+
+  - A memory dump that fails the checks after the capture (see Memory
+    Capture Setup) is an error, is not recorded in the manifest and is not
+    zipped: an empty one is deleted, anything else is renamed to
+    <name>.incomplete -- for a dump in Memory\, next to the collection
+    folder (<collection>_memory_dump.dmp.incomplete); for one written with
+    -MemoryOutputPath (or to a drive chosen at the prompt), in that folder
+    (<collection>_memory_dump.dmp.incomplete there). If it cannot be
+    renamed it is deleted. One that can be neither renamed nor deleted
+    (another program has it open) is tried again at the end of the run; if
+    it is then still in the collection folder, the folder is not zipped.
+    The summary names a failed dump as INCOMPLETE; one still under the
+    dump's name must be deleted by hand before the collection is analyzed.
+    Error: "Memory capture failed: DumpIt reported NtStatus 0xC000007F; ..."
+    Warning: "Could not delete the incomplete memory dump, delete it by hand (it is not complete, do not analyze it): ..."
+
+  - The memory dump's row in collection_manifest.csv is changed when the
+    dump is moved next to the zip (and back if the zip fails). If the
+    manifest cannot be changed (another program has it open), it is kept
+    as it was, the row still names the path in Memory\, and the log warns.
+    The dump is still next to the zip, where the timeline builder also
+    looks.
+    Warning: "Could not update the memory dump's row in collection_manifest.csv, it still names ...: ..."
 
   - Per-user live registry data (Run/RunOnce keys, RecentApps) covers every
     user whose hive is loaded, i.e. users logged in at collection time, not
@@ -961,6 +1110,22 @@ The fastest path from collection to analysis:
     the run is stopped with Ctrl+C or ends with an error. If the console
     window is closed or the machine loses power mid-run, cleanup may not get
     to run: check Windows Security exclusions and "vssadmin list shadows".
+
+  - QuickEdit (see Quick Start) is off in the console window while the
+    script runs, and the console's mouse input with it. The console's mode
+    is put back at the end of the run, after an error that stops the
+    script before the collection, after Cancel at the drive prompt, and
+    when the collection is stopped with Ctrl+C. When the run is stopped
+    with Ctrl+C at a prompt before the collection starts, or during the
+    summary and zip step, or its process is ended from Task Manager,
+    QuickEdit stays off in that window. The window of
+    Run-TriageCollector.bat closes after its last prompt; in a PowerShell
+    window you opened yourself, turn it back on in the window's
+    Properties, or open a new window. Only that window's setting changes,
+    not the saved console defaults. With QuickEdit already off, no
+    console, or input redirected (scripts, CI), nothing is changed and the
+    line below is not logged.
+    Log: "Console QuickEdit is off for this run, so a click in the window cannot pause it (copy text with the window menu: Edit > Mark)."
 
   - Locked files (live system): when a normal copy fails because a program
     has the file open, the script tries, in order:
@@ -973,18 +1138,34 @@ The fastest path from collection to analysis:
     A raw read is not a point-in-time snapshot: a file being written during
     the read can come out inconsistent. NTFS-compressed and EFS-encrypted
     files cannot be read this way. Empty files are skipped (there is nothing
-    to collect; Chromium browsers keep 0-byte SQLite journals open).
+    to collect; Chromium browsers keep 0-byte SQLite journals open). A file
+    that is 0 bytes in the shadow copy is skipped the same way and is not
+    counted as an error; the live file is still tried next, in case it has
+    grown since the snapshot.
     Log: "Collected by raw NTFS read (file in use, not available from a
     shadow copy)"
 
   - NTUSER.DAT and UsrClass.dat for the active user are locked. The script
     tries reg save via HKU\SID (works for logged-in users), then VSS shadow
-    copy, then direct copy. On most systems reg save succeeds.
+    copy, then direct copy. On most systems reg save succeeds. Each hive
+    gets one outcome line naming the method that collected it. A locked
+    file that the direct copy reads by raw NTFS read (see above) also gets
+    that read's own line, with the path.
+    Log: "Collected NTUSER.DAT for <user> via reg save" (or "via shadow
+    copy", "via direct copy", "via raw NTFS read")
 
-  - System service accounts (e.g., WsiAccount) may have locked or inaccessible
-    hive files. Shadow copy attempts will fail for these. This is normal --
-    these are not real user accounts and contain minimal forensic data.
-    Warning: "Shadow copy of Users\WsiAccount\NTUSER.DAT did not produce output"
+  - Hives of system service accounts (e.g., WsiAccount) are usually not
+    loaded, so reg save does not apply; they are taken from the shadow copy.
+    These are not real user accounts and contain minimal forensic data. If
+    the shadow copy cannot provide a hive, the direct copy is tried next
+    (for a locked file it falls back to a raw NTFS read). When the direct
+    copy succeeds, nothing is counted as an error (if the shadow copy
+    failed, the line gives its reason). Only a hive that no method
+    collects gives a warning and counts as one error. If the direct copy
+    logged a warning of its own ("Could not copy ..."), that warning comes
+    first, and the error is still counted once.
+    Log: "Collected NTUSER.DAT for WsiAccount via shadow copy"
+    Warning: "Could not collect NTUSER.DAT for WsiAccount -- shadow copy: <reason>"
 
   - Hidden files are collected, including the Amcache.hve transaction logs
     (.LOG1/.LOG2) and the hidden NTUSER.DAT / UsrClass.dat of users who are
@@ -992,9 +1173,18 @@ The fastest path from collection to analysis:
     jump lists, browser profiles, scheduled task XML, Defender and
     third-party AV logs) include hidden and system files. (Earlier versions
     skipped those in listings, and copied hidden files and then deleted
-    them as "empty".) Locked Amcache logs are taken from the shadow copy or
-    by raw NTFS read; if the hive is still dirty without its logs, the
-    timeline builder skips Amcache parsing for that collection.
+    them as "empty".) Amcache.hve and its logs are taken from the shadow
+    copy, else by direct copy (raw NTFS read for a locked file), with one
+    outcome line per file as for the user hives; if the hive is still
+    dirty without its logs, the timeline builder skips Amcache parsing for
+    that collection. It is normal for one of .LOG1/.LOG2 to be 0 bytes
+    (Windows can write only one of them for long periods): an empty log
+    holds nothing to collect, is logged as skipped (info) and is not
+    counted as an error. A hive or log missing from the target altogether
+    (e.g. no Amcache in an image of an older Windows) is a warning, not an
+    error.
+    Log: "Skipped empty file (0 bytes in the shadow copy): Windows\AppCompat\Programs\Amcache.hve.LOG2"
+    Warning: "Amcache.hve not found at <path>"
 
   - A file is reported as not collected only when the normal copy, the
     shadow copy and the raw NTFS read all fail.
@@ -1015,10 +1205,15 @@ The fastest path from collection to analysis:
   - SRUM: on a live system SRUDB.dat is open, so its copy is normally in
     "dirty shutdown" state; its logs are collected with it from the same
     shadow copy and the timeline builder replays them into a temp copy.
-    When SRUDB.dat cannot be read from the shadow copy, the files come from
-    the volume and may be from slightly different moments; the builder may
-    then have to repair its copy, which can lose the newest records. A
-    system without the sru folder gets an info line, not a warning.
+    When SRUDB.dat cannot be read from the shadow copy (the line gives the
+    reason when the copy failed), the files come from the volume and may be
+    from slightly different moments; the builder may then have to repair
+    its copy, which can lose the newest records. A file that is 0 bytes in
+    the shadow copy is skipped with an info line and is not counted as an
+    error (it is not taken from the volume instead, so all files stay from
+    one moment); a failed copy from the shadow copy gives a warning with
+    the reason. A system without the sru folder gets an info line, not a
+    warning.
     Message: "SRUDB.dat could not be read from the shadow copy -- the SRUM files are copied from the volume ..."
     Warning: "Skipped SRUM file ... larger than the 16384 MB size cap"
 
@@ -1159,6 +1354,24 @@ the mounted image for a non-invasive collection.
                    cookies were exposed), session/token-theft cases (cookie
                    decryption), authorized access to cloud evidence, and
                    evidence integrity (copies that hash-match the originals).
+  -MemoryOutputPath
+                   Folder for the memory dump, e.g. D:\TriageMemory on a
+                   second drive (created if missing; must be outside the
+                   collection folder). The dump is written there as
+                   <collection>_memory_dump.dmp (.raw for WinPmem and Magnet
+                   RAM Capture); the acquisition log stays in the
+                   collection, and collection_manifest.csv records the
+                   dump's full path, where the timeline builder finds it
+                   (not on a network path: put such a dump next to the
+                   zip under its name). Default: Memory\ in the
+                   collection, moved next to the zip at the end.
+  -MinFreeSpaceGB  Free space in GB to keep on the system drive after the
+                   memory dump and the collection. Default: -1 (automatic:
+                   10% of the volume, at least 4 and at most 20 GB). 0
+                   keeps only the 1 GB that every drive keeps.
+
+  -MemoryOutputPath and -MinFreeSpaceGB are not passed by the .bat; run the
+  script directly to use them (see Quick Start, PowerShell (Admin)).
 
 
 ## Optional Tools (tools\ directory)
@@ -1217,9 +1430,45 @@ capture before collection begins.
   and skips the others with a note.
 
   Output: Memory\memory_dump.dmp (DumpIt) or memory_dump.raw, saved next to
-          the zip as <collection>_memory_dump.dmp / .raw
+          the zip as <collection>_memory_dump.dmp / .raw. With
+          -MemoryOutputPath <folder> (or another drive chosen at the
+          prompt), written to that folder under that name from the start.
+          The acquisition log always stays in the collection, and
+          collection_manifest.csv records where the dump ends up.
   Storage: Dump size equals installed RAM (16 GB RAM = ~16 GB file).
-           Ensure the output drive has enough free space.
+           Before the capture the script checks the free space where the
+           dump goes, for the dump (RAM + 1 MB for DumpIt, RAM x 1.05 for
+           a raw image) and, on the collection's drive, ~5 GB for the
+           collection and its zip (4 GB with the raw NTFS copies, else
+           1 GB; x 1.25 unless -NoCompress). That is a typical size, not
+           an upper limit: the parts with size caps of their own are not
+           counted at those caps (e-mail attachments, up to 2 GB; SRUM;
+           the browser history snapshots; the larger event logs;
+           -IncludeThunderbirdIndex) and can add several GB. On the system
+           drive it keeps a reserve free, since Windows keeps writing
+           there: 10% of the volume, at least 4 and at most 20 GB, or
+           -MinFreeSpaceGB (raise it when those parts are expected to be
+           large). On other drives 1 GB. The prompt shows these numbers,
+           for example
+             Free space on C:\: 40.8 GB; memory dump ~31.9 GB + collection
+             ~5 GB would leave ~3.9 GB (to keep free on the system drive:
+             20 GB)
+           and, when the dump does not fit or would eat into the reserve,
+           offers other drives where it fits ([1] D:\TriageMemory --
+           recommended, [2] here anyway, [3] skip). The check is repeated
+           right before the capture and logged; if the dump does not fit
+           then, the capture is skipped as an error and the rest of the
+           collection still runs. The output drive is also checked for the
+           collection at the start of every run (a warning only).
+           Writing the dump to the system drive being examined overwrites
+           free space that can still hold deleted files: another drive is
+           better. FAT32 (common on USB sticks) cannot hold a dump of 4 GB
+           or more.
+  Checks: After the capture, DumpIt's "Error:" lines are copied into the
+          log, and the dump is kept only when it exists, is not empty,
+          DumpIt reported NtStatus 0x00000000 and the size the file has,
+          and it holds at least 95% of the RAM. Otherwise the capture is an
+          error, and the dump is set aside (see Known Limitations).
   Timing: Adds 2-5 minutes depending on RAM size.
   Ordering: Runs FIRST to capture pristine RAM before other collection.
   Live only: Memory capture is skipped for mounted forensic images.
@@ -1313,6 +1562,125 @@ capture before collection begins.
     powershell -ExecutionPolicy Bypass -File tests\Test-CollectBrowser.ps1
     powershell -ExecutionPolicy Bypass -File tests\Test-CollectEmail.ps1 -AllowSystemChanges
 
+  tests\Test-ShadowCopy.ps1 (no admin needed; also runs in CI)
+    Checks how a copy from the shadow copy is reported, with a folder
+    standing in for the snapshot: a hidden file is copied and listed in the
+    manifest with its hash and original time; an empty one is logged as
+    skipped and is not an error; a missing one is "Not present"; a locked
+    one gives a warning with the reason and counts one error; with -Quiet
+    nothing is logged or counted. Also checks the SRUM collection, which
+    reports these outcomes itself: an empty SRUM file in the snapshot is an
+    info line, not an error; a locked one is a warning with the reason;
+    with SRUDB.dat locked in the snapshot, the files come from the volume
+    and the info line gives the reason.
+      powershell -ExecutionPolicy Bypass -File tests\Test-ShadowCopy.ps1
+
+  tests\Test-CollectionLogging.ps1 (no admin needed; also runs in CI)
+    Checks what is logged and counted when a hive (Amcache.hve and its
+    logs, NTUSER.DAT, UsrClass.dat) is taken from the shadow copy or by
+    direct copy, with folders standing in for the snapshot and the volume
+    and a stand-in for the raw NTFS read: one outcome line per hive naming
+    the method (also "via raw NTFS read" for a locked file); an empty one
+    is info; a shadow copy failure that the direct copy recovers is no
+    error; a hive that no method collects is a warning and one error, even
+    when the direct copy has logged and counted its own failure. Also
+    checks that the LNK, jump-list, Prefetch and task XML counts include a
+    file saved under a shortened name or with [ ] in its name, and that
+    the browser copies made within a size cap (session files, history
+    snapshots, extension manifests) count such a file and its size toward
+    the cap.
+      powershell -ExecutionPolicy Bypass -File tests\Test-CollectionLogging.ps1
+
+  tests\Test-CollectionZip.ps1 (no admin needed; also runs in CI)
+    Zips a small folder the way the collector zips the collection and
+    checks the zip: every entry name uses "/" and starts with the folder
+    name; an empty folder has its own entry; a hidden system file, a
+    non-ASCII name and a name with [ ] are included; contents (SHA256) and
+    file times (within 2 seconds) match. A zip path inside the folder is
+    refused, and a zip that fails (a locked file) is deleted. In Windows
+    PowerShell 5.1 it also checks that ZipFile.CreateFromDirectory, used by
+    earlier versions, writes "\" there.
+      powershell -ExecutionPolicy Bypass -File tests\Test-CollectionZip.ps1
+
+  tests\Test-MountedDevices.ps1 (no admin needed; also runs in CI)
+    Decodes synthetic MountedDevices values: GPT, MBR (one offset above 4
+    GiB), USB and "\??\" device paths with and without a trailing NUL, and
+    values that are none of these. Then saves the same values from a test
+    key under HKCU (removed afterwards) and checks mounted_devices.csv (the
+    columns the timeline builder reads, the key's last-write time),
+    mounted_devices.txt (every value whole), the manifest and the log line;
+    a missing key gives a header-only CSV and a warning. Also checks that
+    the collector lifts $FormatEnumerationLimit for the run, so lists in
+    the .txt files are not cut after 4 items, also when it is run from an
+    open PowerShell window, and restores it afterwards.
+      powershell -ExecutionPolicy Bypass -File tests\Test-MountedDevices.ps1
+
+  tests\Test-MemoryAcquisitionLog.ps1 (no admin needed; also runs in CI)
+    Runs a stand-in capture tool (a .cmd file that prints DumpIt-like
+    lines, one of them on stderr) and saves its output the way the
+    collector does: every line is in Memory\memory_acquisition_log.txt,
+    which is listed in the manifest with its hash and size, with no log
+    line and no error; a tool that prints nothing gives a log with a note,
+    also listed. The collection folders have [ ] in their names. Also
+    checks that the collector saves the log only this way, right after
+    the tool runs and before it checks the dump (so a failed capture also
+    has its log), and writes nothing to it afterwards, so the hash in the
+    manifest matches the file.
+      powershell -ExecutionPolicy Bypass -File tests\Test-MemoryAcquisitionLog.ps1
+
+  tests\Test-MemorySpaceCheck.ps1 (no admin needed; also runs in CI)
+    Checks the free space check before a memory capture and the check of
+    its result, without capturing anything. The space check with run 2's
+    numbers (C: 40.8 GB free, 32 GB of RAM: low reserve) and other cases:
+    no room, another drive, a FAT32 stick, -MinFreeSpaceGB, unknown free
+    space or RAM, the collection's share, and the log line. Free space read
+    from the temp folder's drive, its UNC admin share (when reachable) and
+    a missing drive. The prompt, with stand-ins for the drives and the
+    answers: the numbers, the system drive warning, other drives offered
+    (D: for run 2, not a FAT32 or too-small drive). The result check on a
+    redacted DumpIt log (tests\fixtures\memory) and a failing variant
+    (nonzero NtStatus, short file, an "Error:" line). The memory section
+    with a stand-in tool: no room (an error, no capture), low reserve (a
+    warning), a complete, failed, empty or missing dump, an earlier dump at
+    the path, -MemoryOutputPath, WinPmem and Magnet RAM Capture, a failed
+    dump that cannot be renamed or is held open; the dump's manifest row
+    has its full path, size and hash. The summary and compression step:
+    the dump moved next to the zip (the manifest in the zip then names that
+    path), or the folder kept unzipped (and the summary corrected) when it
+    cannot be moved; moved back with its manifest row when the zip fails;
+    the rest of the manifest unchanged, and kept as it was (a warning) when
+    it cannot be changed; for a dump that is not next to the zip, the lines
+    that the timeline builder finds it through the manifest (or, on a
+    network path, does not) and that a moved dump goes next to the zip
+    (next to the folder with -NoCompress), never "pass -MemoryDumpPath"; a
+    failed dump still in the folder set aside then, or the folder not
+    zipped. The prompt asks again after a bad answer (also a number too
+    large for an [int]) and is not shown with -Unattended.
+      powershell -ExecutionPolicy Bypass -File tests\Test-MemorySpaceCheck.ps1
+
+  tests\Test-ConsoleMode.ps1 (no admin needed; also runs in CI)
+    Checks that QuickEdit is turned off for the run and the console's mode
+    put back, without touching the console the test runs in. The new mode
+    is checked for QuickEdit on (0x01F7 becomes 0x01A7: QuickEdit and
+    mouse input off), already off (unchanged, mouse input included), and
+    a mode without the extended flags bit. The helpers run in child
+    processes of the same PowerShell edition that the test starts with no
+    window: with input redirected, with no standard input handle, and with
+    a type of the helper's name that lacks its methods, nothing is changed
+    and nothing is written (no error, no warning, exit code 0); in a
+    console of the child's own, QuickEdit and mouse input are turned off,
+    stay off through a Read-Host (the child types the answer into its own
+    console), and the mode is put back exactly, once, and a console with
+    QuickEdit already off is left as it is (skipped when the child gets no
+    console of its own, or shares it with another process). In the
+    collector's code: QuickEdit is turned off right after the
+    Administrator check (before the first prompt), every exit after that
+    turns it back on first (before its pause), a run stopped during the
+    collection turns it back on in the finally block after the cleanup,
+    and a finished run right before the last prompt (after the zip); the
+    log line.
+      powershell -ExecutionPolicy Bypass -File tests\Test-ConsoleMode.ps1
+
   Planted-activity test (both tools, end to end, on a live machine)
     1. In a normal (not elevated) PowerShell window, as the user to test:
          powershell -ExecutionPolicy Bypass -File tests\Invoke-PlantedActivity.ps1
@@ -1401,6 +1769,11 @@ are downloaded, bundled, or required.
   (Add-Type)           Add-Type definition to read registry key last-write
                        times (services, drivers, Run keys).
 
+  GetConsoleMode /     Windows API (kernel32.dll), called through a small
+  SetConsoleMode       Add-Type definition to turn QuickEdit (and mouse
+  (Add-Type)           input) off in the console window for the run and
+                       back on at the end.
+
   Raw NTFS reader      Built into the script (C# compiled via Add-Type). Opens
   (CreateFile,         the volume (\\.\C:) read-only with the kernel32.dll
   Add-Type)            CreateFile API and reads $MFT, $LogFile and
@@ -1452,8 +1825,16 @@ This script is read-only by design, with these minimal exceptions:
   - Creates the output directory and files (in reports\ next to the script)
   - Creates and removes a Volume Shadow Copy snapshot (for locked file access)
   - Adds and removes a temporary Windows Defender exclusion (output path only)
-  - Compiles small Add-Type helpers (registry key times, raw NTFS reader);
-    Windows PowerShell writes and deletes temporary compiler files in %TEMP%
-    for this
+  - With memory capture: the capture tool loads its kernel driver, and the
+    dump (as large as the RAM) is written to the output drive or to
+    -MemoryOutputPath; on the system drive this overwrites free space that
+    can hold deleted files
+  - Turns QuickEdit and mouse input off in its console window for the run,
+    and puts the console's mode back at the end (that window only, not the
+    saved console defaults)
+  - Compiles small Add-Type helpers (registry key times, raw NTFS reader,
+    console mode); Windows PowerShell writes and deletes temporary compiler
+    files in %TEMP% for this
   - All modifications are cleaned up at script end, also when the run is
-    stopped with Ctrl+C or ends with an error
+    stopped with Ctrl+C or ends with an error (QuickEdit: see Known
+    Limitations)

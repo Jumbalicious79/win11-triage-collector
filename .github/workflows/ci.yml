@@ -3,8 +3,9 @@ name: CI
 on:
   push:
     branches: [master]
+  # Every pull request, whatever its base branch: a PR stacked on another
+  # PR's branch gets the same checks as a PR into master
   pull_request:
-    branches: [master]
 
 permissions:
   contents: read
@@ -101,6 +102,50 @@ jobs:
       - name: Run secrets collection test
         if: ${{ !cancelled() }}
         run: ./tests/Test-CollectSecrets.ps1
+
+  unit-tests:
+    # Tests of single collector functions, loaded from the script's syntax
+    # tree: no collection runs and no admin rights are needed. Steps after
+    # the first run under !cancelled(), so one failing test does not hide
+    # the results of the others
+    name: Unit tests (${{ matrix.shell }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shell: [powershell, pwsh]
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Run shadow copy test
+        run: ./tests/Test-ShadowCopy.ps1
+
+      - name: Run collection logging test
+        if: ${{ !cancelled() }}
+        run: ./tests/Test-CollectionLogging.ps1
+
+      - name: Run collection zip test
+        if: ${{ !cancelled() }}
+        run: ./tests/Test-CollectionZip.ps1
+
+      - name: Run mounted devices test
+        if: ${{ !cancelled() }}
+        run: ./tests/Test-MountedDevices.ps1
+
+      - name: Run memory acquisition log test
+        if: ${{ !cancelled() }}
+        run: ./tests/Test-MemoryAcquisitionLog.ps1
+
+      - name: Run memory space check test
+        if: ${{ !cancelled() }}
+        run: ./tests/Test-MemorySpaceCheck.ps1
+
+      - name: Run console mode test
+        if: ${{ !cancelled() }}
+        run: ./tests/Test-ConsoleMode.ps1
 
   analyze:
     name: PSScriptAnalyzer

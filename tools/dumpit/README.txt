@@ -37,8 +37,19 @@ HOW THE COLLECTOR USES IT
   - Command line: DumpIt.exe /TYPE DMP /NOCOMPRESS /QUIET /OUTPUT <file>
   - Output: a full Microsoft crash dump, saved NEXT TO the collection zip
     as reports\TriageCollection_<timestamp>_memory_dump.dmp (it is as large
-    as the machine's RAM, so it is not zipped). Make sure the output drive
-    has at least that much free space.
+    as the machine's RAM, so it is not zipped). With -MemoryOutputPath
+    <folder>, or another drive chosen at the prompt, it is written to that
+    folder under the same name.
+  - Free space: before the capture the collector checks that the dump (RAM
+    + 1 MB) and an estimate of the rest of the collection fit, and on the
+    system drive keeps a reserve free (10% of the volume, 4 to 20 GB;
+    -MinFreeSpaceGB). The prompt shows the numbers and offers other drives
+    when it does not fit; DumpIt's own check only makes sure the file fits.
+    A FAT32 drive cannot hold a dump of 4 GB or more. See the main
+    README.txt, "Memory Capture Setup".
+  - After the capture the collector copies DumpIt's "Error:" lines into its
+    log and keeps the dump only if DumpIt reported NtStatus 0x00000000 and
+    the size the file has, and it holds at least 95% of the RAM.
   - DumpIt is preferred over WinPmem and Magnet RAM Capture because it is
     signed and has native x86, x64 and ARM64 builds.
 

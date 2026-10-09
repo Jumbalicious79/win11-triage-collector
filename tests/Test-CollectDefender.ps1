@@ -220,7 +220,9 @@ try {
     Assert-Equal -Name "support log still collected" -Expected $true -Actual (Test-Path -LiteralPath (Join-Path $output "AntiVirus\Defender\MPLog-20260301-100000.log"))
     Assert-Equal -Name "log: DetectionHistory count" -Expected $true -Actual ($logText -match 'OK: Collected 2 Defender DetectionHistory file\(s\)\.')
     Assert-Equal -Name "log: quarantine entry count" -Expected $true -Actual ($logText -match 'OK: Collected 1 Defender quarantine entry file\(s\)\.')
-    $errorLines = @($logText -split "`r?`n" | Where-Object { $_ -match '\] (ERROR|WARNING): ' -and $_ -notmatch 'target time zone could not be read' })
+    # Not counted: the fake image's time zone and the start-of-run free space
+    # warning (the temp folder's drive may be low; the output is tiny)
+    $errorLines = @($logText -split "`r?`n" | Where-Object { $_ -match '\] (ERROR|WARNING): ' -and $_ -notmatch 'target time zone could not be read' -and $_ -notmatch 'WARNING: The output drive may run short of space' })
     Write-TestResult -Name "log: no errors or warnings" -Passed ($errorLines.Count -eq 0) -Message ($errorLines -join "`n")
 
     # --- Run 2: image without Defender data ---
@@ -236,7 +238,7 @@ try {
     if (Test-Path -LiteralPath (Join-Path $output2 "collection_log.txt")) { $logText2 = [System.IO.File]::ReadAllText((Join-Path $output2 "collection_log.txt")) }
     Assert-Equal -Name "log: no DetectionHistory folder (info line)" -Expected $true -Actual ($logText2 -match '\] No Defender DetectionHistory folder on the target')
     Assert-Equal -Name "log: no Quarantine\Entries folder (info line)" -Expected $true -Actual ($logText2 -match '\] No Defender Quarantine\\Entries folder on the target')
-    $errorLines2 = @($logText2 -split "`r?`n" | Where-Object { $_ -match '\] (ERROR|WARNING): ' -and $_ -notmatch 'target time zone could not be read' })
+    $errorLines2 = @($logText2 -split "`r?`n" | Where-Object { $_ -match '\] (ERROR|WARNING): ' -and $_ -notmatch 'target time zone could not be read' -and $_ -notmatch 'WARNING: The output drive may run short of space' })
     Write-TestResult -Name "log: no errors or warnings (no Defender data)" -Passed ($errorLines2.Count -eq 0) -Message ($errorLines2 -join "`n")
     Assert-Equal -Name "no Defender folder in the collection (no Defender data)" -Expected $false -Actual (Test-Path -LiteralPath (Join-Path $output2 "AntiVirus\Defender"))
 

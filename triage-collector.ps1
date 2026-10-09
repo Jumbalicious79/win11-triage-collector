@@ -4,6 +4,7 @@
 # Use Run-TriageCollector.bat to launch (handles elevation + policy)
 # =============================================================
 
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute("PSReviewUnusedParameter", "MinFreeSpaceGB", Justification = "Read by Get-TriageSpaceCheck through script scope")]
 param(
     [string]$OutputPath = "",
     [switch]$SkipLargeFiles,
@@ -28,7 +29,14 @@ param(
     # passwords and session cookies and must be handled like a password store.
     # Chrome/Edge App-Bound Encryption can only be undone on the live machine;
     # that is not attempted here (see README).
-    [switch]$IncludeSecrets
+    [switch]$IncludeSecrets,
+    # Folder for the memory dump, written there as <collection>_memory_dump.dmp
+    # (.raw); default: inside the collection, moved next to the zip at the end
+    [string]$MemoryOutputPath = "",
+    # Free space (GB) to keep on the system drive after the memory dump and
+    # the collection; -1 = automatic (10% of the volume, 4 to 20 GB)
+    [ValidateRange(-1, 1048576)]
+    [int]$MinFreeSpaceGB = -1
 )
 
 # --- Require Administrator ---
@@ -47,6 +55,92 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
 $ErrorActionPreference = "Continue"
 $script:startTime = Get-Date
 $timestamp = Get-Date -Format "yyyy-MM-dd_HH-mm"
+
+# --- Console QuickEdit: off for the run ---
+# With QuickEdit on, a click in the console window starts a text selection,
+# and while it lasts every write to the console waits. Log writes to the
+# console before it writes to the log file, so the whole run stops (no CPU,
+# the log file stops too) until the selection ends. QuickEdit is turned off
+# here, mouse input with it, and Restore-ConsoleMode puts the console's
+# mode back: before an early exit, in the main finally block when the run
+# is stopped (Ctrl+C), and before the last prompt. Text can still be copied
+# with the window menu (Edit > Mark). With no console, or with input
+# redirected (tests, CI), nothing is changed, and nothing here can stop the
+# run.
+$script:consoleModeSaved = $null   # the mode before the run, while this script has it changed
+
+# The console input mode for the run: ENABLE_QUICK_EDIT_MODE (0x0040) and
+# ENABLE_MOUSE_INPUT (0x0010) cleared and ENABLE_EXTENDED_FLAGS (0x0080)
+# set, without which SetConsoleMode leaves QuickEdit as it is. Mouse input
+# goes with QuickEdit: with mouse input on and QuickEdit off, the console
+# passes the mouse wheel and clicks to the script, which never reads them,
+# so the wheel stops scrolling the window, and Windows Terminal switches
+# to mouse reporting (a drag no longer selects text). Every other bit is
+# kept. A mode with QuickEdit already off (and that flag set) comes back
+# as it is.
+function Get-ConsoleModeWithoutQuickEdit {
+    [OutputType([uint32])]
+    param([uint32]$Mode)
+    if (([long]$Mode -band [long]0x00C0) -eq [long]0x0080) { return $Mode }
+    return [uint32](([long]$Mode -band (-bnot [long]0x0050)) -bor [long]0x0080)
+}
+
+# Turns QuickEdit (and mouse input) off in the console of standard input
+# and returns the mode it had, or $null when nothing was changed: no
+# console or input redirected (GetConsoleMode fails), QuickEdit already
+# off, or an error (Write-Verbose only). The type is compiled once per
+# session; a second run in the same window reuses it
+function Disable-ConsoleQuickEdit {
+    try {
+        if (-not ('TriageNative.ConsoleMode' -as [type])) {
+            Add-Type -Namespace TriageNative -Name ConsoleMode -ErrorAction Stop -MemberDefinition @'
+[DllImport("kernel32.dll", SetLastError = true)]
+public static extern IntPtr GetStdHandle(int nStdHandle);
+[DllImport("kernel32.dll", SetLastError = true)]
+public static extern bool GetConsoleMode(IntPtr hConsoleHandle, out uint lpMode);
+[DllImport("kernel32.dll", SetLastError = true)]
+public static extern bool SetConsoleMode(IntPtr hConsoleHandle, uint dwMode);
+'@
+        }
+        $handle = [TriageNative.ConsoleMode]::GetStdHandle(-10)   # STD_INPUT_HANDLE
+        $mode = [uint32]0
+        if (-not [TriageNative.ConsoleMode]::GetConsoleMode($handle, [ref]$mode)) {
+            Write-Verbose "Console QuickEdit not changed: standard input is not a console"
+            return $null
+        }
+        $newMode = Get-ConsoleModeWithoutQuickEdit $mode
+        if ($newMode -eq $mode) { return $null }
+        if (-not [TriageNative.ConsoleMode]::SetConsoleMode($handle, $newMode)) {
+            Write-Verbose "Console QuickEdit not changed: SetConsoleMode failed"
+            return $null
+        }
+        $script:consoleModeSaved = $mode
+        return $mode
+    } catch {
+        Write-Verbose "Console QuickEdit not changed: $($_.Exception.Message)"
+        return $null
+    }
+}
+
+# Puts back the mode Disable-ConsoleQuickEdit found, once; does nothing when
+# that changed nothing. A mode read without ENABLE_EXTENDED_FLAGS did not
+# say whether QuickEdit was on: it is put back as read, and QuickEdit stays
+# off. Never throws
+function Restore-ConsoleMode {
+    if ($null -eq $script:consoleModeSaved) { return }
+    $mode = [uint32]$script:consoleModeSaved
+    $script:consoleModeSaved = $null
+    try {
+        $handle = [TriageNative.ConsoleMode]::GetStdHandle(-10)   # STD_INPUT_HANDLE
+        if (-not [TriageNative.ConsoleMode]::SetConsoleMode($handle, $mode)) {
+            Write-Verbose "Console mode not restored: SetConsoleMode failed"
+        }
+    } catch {
+        Write-Verbose "Console mode not restored: $($_.Exception.Message)"
+    }
+}
+
+$consoleModeAtStart = Disable-ConsoleQuickEdit
 
 # -IncludeSecrets (see the param comment): read in the Browser section (every
 # privacy redaction is skipped so the copies hash-equal the originals) and the
@@ -153,6 +247,7 @@ if (-not $TargetDrive) {
             $selection = Read-Host "Select a drive (1-$($availableDrives.Count))"
             if ($selection -eq "0") {
                 Write-Host "Cancelled." -ForegroundColor Yellow
+                Restore-ConsoleMode
                 exit 0
             }
         } while (-not ($selection -match '^\d+$' -and [int]$selection -ge 1 -and [int]$selection -le $availableDrives.Count))
@@ -184,6 +279,7 @@ $script:IsLive = ("${TargetDrive}:" -eq $env:SystemDrive)
 # Validate target drive
 if (-not (Test-Path $script:TargetRoot)) {
     Write-Host "ERROR: Drive ${TargetDrive}: does not exist or is not accessible." -ForegroundColor Red
+    Restore-ConsoleMode
     if (-not $Unattended) { pause }
     exit 1
 }
@@ -255,9 +351,328 @@ function Find-MemoryCaptureTool {
     return $null
 }
 
+# --- Output folder (resolved before the memory prompt, which checks the
+# free space where the dump would go) ---
+if (-not $OutputPath) {
+    $OutputPath = Join-Path $PSScriptRoot "reports\TriageCollection_$timestamp"
+}
+# Use an absolute path: .NET file APIs resolve relative paths against the
+# process directory, not the PowerShell location
+$OutputPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputPath)
+# No trailing '\' (except for a root such as D:\ or \\server\share\): the zip
+# and a memory dump are written next to the folder as "<folder>.zip" and
+# "<folder>_memory_dump.dmp", and D:\out\ would put them inside it
+if ($OutputPath.TrimEnd('\') -ne [System.IO.Path]::GetPathRoot($OutputPath).TrimEnd('\')) {
+    $OutputPath = $OutputPath.TrimEnd('\')
+}
+# -MemoryOutputPath the same way. It must be outside the collection folder:
+# everything in that folder is zipped
+if ($MemoryOutputPath) {
+    try {
+        $MemoryOutputPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($MemoryOutputPath)
+    } catch {
+        # e.g. a drive that does not exist
+        Write-Host "ERROR: -MemoryOutputPath $MemoryOutputPath -- $($_.Exception.Message)" -ForegroundColor Red
+        Restore-ConsoleMode
+        if (-not $Unattended) { pause }
+        exit 1
+    }
+    if ($MemoryOutputPath.TrimEnd('\') -ne [System.IO.Path]::GetPathRoot($MemoryOutputPath).TrimEnd('\')) {
+        $MemoryOutputPath = $MemoryOutputPath.TrimEnd('\')
+    }
+    if (($MemoryOutputPath.TrimEnd('\') + '\').StartsWith($OutputPath.TrimEnd('\') + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+        Write-Host "ERROR: -MemoryOutputPath $MemoryOutputPath is inside the collection folder $OutputPath," -ForegroundColor Red
+        Write-Host "  so the memory dump would be zipped. Choose a folder outside it." -ForegroundColor Red
+        Restore-ConsoleMode
+        if (-not $Unattended) { pause }
+        exit 1
+    }
+}
+
+# ----------------------------------------------------------
+# Helpers: free space for the memory dump and the collection
+# ----------------------------------------------------------
+# Free and total bytes and the file system of the volume a path is on (the
+# path need not exist yet), or $null when they cannot be read. DriveInfo
+# takes drive letters only; a UNC path (\\server\share) goes through
+# Scripting.FileSystemObject. Free bytes are what this user may write
+# (quotas included).
+function Get-VolumeSpace {
+    param([string]$Path)
+    $root = ""
+    try { $root = [System.IO.Path]::GetPathRoot([System.IO.Path]::GetFullPath($Path)) }
+    catch { Write-Verbose "Reading the volume of ${Path}: $($_.Exception.Message)" }
+    if (-not $root) { return $null }
+    try {
+        if ($root -match '^[A-Za-z]:\\$') {
+            $drive = New-Object System.IO.DriveInfo($root)
+            if (-not $drive.IsReady) { return $null }
+            return [PSCustomObject]@{
+                Root       = $drive.RootDirectory.FullName
+                FreeBytes  = [long]$drive.AvailableFreeSpace
+                TotalBytes = [long]$drive.TotalSize
+                FileSystem = [string]$drive.DriveFormat
+            }
+        }
+        $fso = New-Object -ComObject Scripting.FileSystemObject
+        $drive = $fso.GetDrive($fso.GetDriveName($root))
+        if (-not $drive.IsReady) { return $null }
+        return [PSCustomObject]@{
+            Root       = $root
+            FreeBytes  = [long]$drive.AvailableSpace
+            TotalBytes = [long]$drive.TotalSize
+            FileSystem = [string]$drive.FileSystem
+        }
+    } catch {
+        Write-Verbose "Reading the free space of ${root}: $($_.Exception.Message)"
+        return $null
+    }
+}
+
+# Physical memory in bytes (what a full memory dump holds), 0 if unknown
+function Get-PhysicalMemoryBytes {
+    try {
+        return [long](Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).TotalPhysicalMemory
+    } catch {
+        Write-Verbose "Reading the size of the RAM: $($_.Exception.Message)"
+        return [long]0
+    }
+}
+
+# Bytes as GB with one decimal, for log lines and the prompt
+function Format-SpaceGB {
+    param([long]$Bytes)
+    return [math]::Round($Bytes / 1GB, 1)
+}
+
+# Free space check for a memory dump (and the rest of the collection) on
+# one volume. Pure: it works only on the values passed in.
+#   Volume: Get-VolumeSpace result (Root, FreeBytes, TotalBytes,
+#     FileSystem), or $null when unknown.
+#   Dump: RAM + 1 MB for DumpIt (a crash dump is the RAM plus a header;
+#     run 2: RAM + 8 KB), RAM x 1.05 for the raw images of WinPmem and
+#     Magnet RAM Capture. -NoDump checks the collection alone.
+#   Collection: counted only when the collection folder is on this volume
+#     too (-WithCollection): 4 GB with the raw NTFS copies (FileSystem
+#     without -SkipLargeFiles), else 1 GB; x 1.25 when it is zipped (the
+#     folder and the zip exist at the same time). A typical size, not an
+#     upper limit: the parts with size caps of their own (e-mail
+#     attachments, SRUM, browser history snapshots, the larger event logs,
+#     -IncludeThunderbirdIndex) are not counted at those caps: that would
+#     rate many captures that fit as NoFit and skip them. The reserve on
+#     the system drive is the margin for them.
+#   Reserve: on the system drive (the one being examined; Windows keeps
+#     writing to it, and Storage Sense deletes files when it runs low),
+#     10% of the volume, at least 4 and at most 20 GB, or -MinFreeSpaceGB.
+#     On other drives a 1 GB margin.
+# Result: NoFit (FAT and a dump of 4 GB or more, or less than 1 GB would be
+# left), LowReserve (less than the reserve would be left), Ok, or Unknown
+# (free space or RAM size not known). Reason says why when not Ok.
+function Get-MemoryCaptureSpaceCheck {
+    param(
+        [object]$Volume,
+        [long]$RamBytes,
+        [string]$ToolName = "DumpIt",
+        [bool]$OnSystemDrive,
+        [bool]$WithCollection,
+        [bool]$LargeFiles = $true,
+        [bool]$Compress = $true,
+        [int]$MinFreeSpaceGB = -1,
+        [switch]$NoDump
+    )
+    $check = [PSCustomObject]@{
+        Result          = "Unknown"
+        Reason          = ""
+        Root            = ""
+        FileSystem      = ""
+        FreeBytes       = [long]-1
+        TotalBytes      = [long]-1
+        DumpBytes       = [long]0
+        CollectionBytes = [long]0
+        ReserveBytes    = [long]1GB
+        LeftBytes       = [long]0
+        OnSystemDrive   = $OnSystemDrive
+    }
+    if ($Volume) {
+        $check.Root = [string]$Volume.Root
+        $check.FileSystem = [string]$Volume.FileSystem
+        $check.FreeBytes = [long]$Volume.FreeBytes
+        $check.TotalBytes = [long]$Volume.TotalBytes
+    }
+    if (-not $NoDump) {
+        if ($RamBytes -le 0) { $check.DumpBytes = [long]-1 }
+        elseif ($ToolName -eq "DumpIt") { $check.DumpBytes = $RamBytes + 1MB }
+        else { $check.DumpBytes = [long][math]::Ceiling($RamBytes * 1.05) }
+    }
+    if ($WithCollection) {
+        $collectionBytes = 1GB
+        if ($LargeFiles) { $collectionBytes = 4GB }
+        if ($Compress) { $collectionBytes = $collectionBytes * 1.25 }
+        $check.CollectionBytes = [long]$collectionBytes
+    }
+    if ($OnSystemDrive) {
+        if ($MinFreeSpaceGB -ge 0) {
+            $check.ReserveBytes = [long]$MinFreeSpaceGB * 1GB
+        } else {
+            $check.ReserveBytes = [long][math]::Min([math]::Max([math]::Floor($check.TotalBytes * 0.1), 4GB), 20GB)
+        }
+    }
+
+    if ($check.FreeBytes -lt 0) {
+        $check.Reason = "the free space could not be read"
+        return $check
+    }
+    if ($check.DumpBytes -lt 0) {
+        $check.Reason = "the size of the RAM could not be read"
+        return $check
+    }
+    $check.LeftBytes = $check.FreeBytes - $check.DumpBytes - $check.CollectionBytes
+    if ($check.FileSystem -match '^FAT' -and $check.DumpBytes -ge 4GB) {
+        $check.Result = "NoFit"
+        $check.Reason = "$($check.Root) is $($check.FileSystem), which cannot hold a file of 4 GB or more"
+    } elseif ($check.LeftBytes -lt 1GB) {
+        $check.Result = "NoFit"
+        $check.Reason = "less than 1 GB would be left free on $($check.Root)"
+    } elseif ($check.LeftBytes -lt $check.ReserveBytes) {
+        $check.Result = "LowReserve"
+        $check.Reason = "$($check.Root) would be left with ~$(Format-SpaceGB $check.LeftBytes) GB free, less than the $(Format-SpaceGB $check.ReserveBytes) GB to keep free on the system drive"
+    } else {
+        $check.Result = "Ok"
+    }
+    return $check
+}
+
+# One line for the log and the prompt, e.g. "Free space on C:\: 40.8 GB;
+# memory dump ~31.9 GB + collection ~5 GB would leave ~3.9 GB (to keep free
+# on the system drive: 20 GB)"
+function Format-SpaceCheck {
+    param([object]$Check)
+    if ($Check.FreeBytes -lt 0) { return "Free space on $($Check.Root): unknown" }
+    $text = "Free space on $($Check.Root): $(Format-SpaceGB $Check.FreeBytes) GB"
+    $parts = @()
+    if ($Check.DumpBytes -lt 0) { $parts += "memory dump of unknown size" }
+    elseif ($Check.DumpBytes -gt 0) { $parts += "memory dump ~$(Format-SpaceGB $Check.DumpBytes) GB" }
+    if ($Check.CollectionBytes -gt 0) { $parts += "collection ~$(Format-SpaceGB $Check.CollectionBytes) GB" }
+    if ($parts.Count -gt 0) { $text += "; " + ($parts -join " + ") }
+    if ($Check.DumpBytes -ge 0 -and $parts.Count -gt 0) {
+        if ($Check.LeftBytes -ge 0) { $text += " would leave ~$(Format-SpaceGB $Check.LeftBytes) GB" }
+        else { $text += " would need ~$(Format-SpaceGB (-$Check.LeftBytes)) GB more" }
+    }
+    if ($Check.OnSystemDrive) { $text += " (to keep free on the system drive: $(Format-SpaceGB $Check.ReserveBytes) GB)" }
+    else { $text += " (to keep free: $(Format-SpaceGB $Check.ReserveBytes) GB)" }
+    return $text
+}
+
+# The space check for a file this run writes to Path: the memory dump
+# (ToolName, RamBytes), or with -NoDump the collection itself (Path =
+# $OutputPath). Uses the run's settings: Path's drive is the system drive
+# or not, the collection counts when Path is on the output drive, and
+# FileSystem, -SkipLargeFiles, -NoCompress and -MinFreeSpaceGB.
+function Get-TriageSpaceCheck {
+    param(
+        [string]$Path,
+        [long]$RamBytes = 0,
+        [string]$ToolName = "",
+        [switch]$NoDump
+    )
+    $root = ""
+    $outputRoot = ""
+    try {
+        $root = [System.IO.Path]::GetPathRoot($Path).TrimEnd('\')
+        $outputRoot = [System.IO.Path]::GetPathRoot($OutputPath).TrimEnd('\')
+    } catch { Write-Verbose "Reading the drive of ${Path}: $($_.Exception.Message)" }
+    $check = Get-MemoryCaptureSpaceCheck -Volume (Get-VolumeSpace $Path) -RamBytes $RamBytes -ToolName $ToolName `
+        -OnSystemDrive ($root -ne "" -and $root -eq $env:SystemDrive) `
+        -WithCollection ($root -ne "" -and $root -eq $outputRoot) `
+        -LargeFiles (($Categories -contains "FileSystem") -and -not $SkipLargeFiles) `
+        -Compress (-not $NoCompress) -MinFreeSpaceGB $MinFreeSpaceGB -NoDump:$NoDump
+    if (-not $check.Root) { $check.Root = $root + '\' }
+    return $check
+}
+
+# Where the memory dump is written: <collection>\Memory\memory_dump.dmp, or
+# with a DumpDir (-MemoryOutputPath) <DumpDir>\<collection>_memory_dump.dmp,
+# the name the timeline builder looks for next to the zip. DumpIt writes a
+# Microsoft crash dump (.dmp: WinDbg, Volatility); WinPmem and Magnet RAM
+# Capture write a raw image (.raw). (Path.Combine: Join-Path in Windows
+# PowerShell 5.1 fails for a drive that does not exist.)
+function Get-MemoryDumpPath {
+    param([string]$ToolName, [string]$DumpDir = "")
+    $ext = "raw"
+    if ($ToolName -eq "DumpIt") { $ext = "dmp" }
+    if ($DumpDir) {
+        return [System.IO.Path]::Combine($DumpDir, [System.IO.Path]::GetFileName($OutputPath) + "_memory_dump.$ext")
+    }
+    return [System.IO.Path]::Combine($OutputPath, "Memory", "memory_dump.$ext")
+}
+
+# Ready fixed and removable drives, as roots ("D:\"). A function of its
+# own so the tests can stand in for the machine's drives
+function Get-MemoryDumpDriveRoots {
+    $roots = @()
+    try {
+        foreach ($drive in [System.IO.DriveInfo]::GetDrives()) {
+            try {
+                if ($drive.IsReady -and ($drive.DriveType -eq [System.IO.DriveType]::Fixed -or $drive.DriveType -eq [System.IO.DriveType]::Removable)) {
+                    $roots += $drive.RootDirectory.FullName
+                }
+            } catch { Write-Verbose "Checking drive $($drive.Name): $($_.Exception.Message)" }
+        }
+    } catch { Write-Verbose "Listing drives: $($_.Exception.Message)" }
+    return $roots
+}
+
+# Drives to offer for the memory dump instead: not the system drive, not
+# ExcludeRoot (where it would go now), and only where it fits (Ok). The
+# dump goes to <drive>\TriageMemory there
+function Get-MemoryDumpOtherDrives {
+    param([long]$RamBytes, [string]$ToolName, [string]$ExcludeRoot = "")
+    $drives = @()
+    foreach ($root in @(Get-MemoryDumpDriveRoots)) {
+        $key = $root.TrimEnd('\')
+        if ($key -eq $env:SystemDrive -or $key -eq $ExcludeRoot.TrimEnd('\')) { continue }
+        $dumpDir = [System.IO.Path]::Combine($root, "TriageMemory")
+        $check = Get-TriageSpaceCheck -Path (Get-MemoryDumpPath -ToolName $ToolName -DumpDir $dumpDir) -RamBytes $RamBytes -ToolName $ToolName
+        if ($check.Result -eq "Ok") {
+            $drives += [PSCustomObject]@{ Root = $root; DumpDir = $dumpDir; Check = $check }
+        }
+    }
+    return $drives
+}
+
+# Choices of the memory capture prompt for a space check. Action: Here
+# (capture to the planned place), Other (to DumpDir on another drive) or
+# Skip. Ok and Unknown: Yes / No. LowReserve: each other drive (the first
+# one recommended), here anyway, skip. NoFit: each other drive, skip; with
+# no other drive only Skip, and the prompt asks nothing
+function Get-MemoryCaptureChoices {
+    param([object]$Check, [object[]]$OtherDrives = @())
+    $choices = @()
+    if ($Check.Result -eq "LowReserve" -or $Check.Result -eq "NoFit") {
+        foreach ($drive in $OtherDrives) {
+            $label = "Write the dump to $($drive.DumpDir) ($(Format-SpaceGB $drive.Check.FreeBytes) GB free)"
+            if ($choices.Count -eq 0) { $label += " -- recommended" }
+            $choices += [PSCustomObject]@{ Action = "Other"; DumpDir = $drive.DumpDir; Label = $label }
+        }
+        if ($Check.Result -eq "LowReserve") {
+            $choices += [PSCustomObject]@{ Action = "Here"; DumpDir = ""; Label = "Write the dump to $($Check.Root) anyway" }
+        }
+        $choices += [PSCustomObject]@{ Action = "Skip"; DumpDir = ""; Label = "Skip memory, collect artifacts only" }
+    } else {
+        $choices += [PSCustomObject]@{ Action = "Here"; DumpDir = ""; Label = "Yes -- capture memory (recommended for incident response)" }
+        $choices += [PSCustomObject]@{ Action = "Skip"; DumpDir = ""; Label = "No  -- skip memory, collect artifacts only" }
+    }
+    return $choices
+}
+
 # --- Interactive memory capture prompt ---
 # Only show if: live system, Memory not already in Categories, a tool exists,
-# and not -Unattended
+# and not -Unattended. It shows the free space the dump would leave where it
+# would be written and, when it does not fit or would eat into the system
+# drive's reserve, offers other drives where it fits (the dump then goes to
+# <drive>\TriageMemory, as with -MemoryOutputPath). The memory section
+# checks again right before the capture.
+$script:memorySpaceAccepted = $false   # "anyway" chosen here (LowReserve or Unknown)
 if ($script:IsLive -and ($Categories -notcontains "Memory") -and -not $Unattended) {
     $memCaptureTool = Find-MemoryCaptureTool
     foreach ($skipped in $script:skippedMemTools) {
@@ -266,7 +681,15 @@ if ($script:IsLive -and ($Categories -notcontains "Memory") -and -not $Unattende
 
     if ($memCaptureTool) {
         $memToolInfo = "$($memCaptureTool.Name) ($($memCaptureTool.RelPath))"
-        $ramGB = [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 0)
+        $ramBytes = Get-PhysicalMemoryBytes
+        $ramGB = [math]::Round($ramBytes / 1GB, 0)
+        $memDumpTarget = Get-MemoryDumpPath -ToolName $memCaptureTool.Name -DumpDir $MemoryOutputPath
+        $memSpace = Get-TriageSpaceCheck -Path $memDumpTarget -RamBytes $ramBytes -ToolName $memCaptureTool.Name
+        $memOtherDrives = @()
+        if ($memSpace.Result -eq "LowReserve" -or $memSpace.Result -eq "NoFit") {
+            $memOtherDrives = @(Get-MemoryDumpOtherDrives -RamBytes $ramBytes -ToolName $memCaptureTool.Name -ExcludeRoot $memSpace.Root)
+        }
+        $memChoices = @(Get-MemoryCaptureChoices -Check $memSpace -OtherDrives $memOtherDrives)
         Write-Host ""
         Write-Host "========================================" -ForegroundColor Cyan
         Write-Host "  Memory Capture" -ForegroundColor Cyan
@@ -276,35 +699,60 @@ if ($script:IsLive -and ($Categories -notcontains "Memory") -and -not $Unattende
         Write-Host ""
         Write-Host "  Captures a full RAM dump (~$ramGB GB on this system)." -ForegroundColor White
         Write-Host "  Runs FIRST to preserve pristine memory state." -ForegroundColor DarkGray
-        Write-Host "  Requires ~$ramGB GB free disk space on the output drive." -ForegroundColor DarkGray
-        Write-Host ""
-        Write-Host "  [1] Yes -- capture memory (recommended for incident response)" -ForegroundColor Green
-        Write-Host "  [2] No  -- skip memory, collect artifacts only" -ForegroundColor White
+        Write-Host "  Dump file: $memDumpTarget" -ForegroundColor DarkGray
+        Write-Host "  $(Format-SpaceCheck $memSpace)" -ForegroundColor DarkGray
+        if ($memSpace.OnSystemDrive) {
+            Write-Host "  The dump would be written to the system drive being examined, over free" -ForegroundColor Yellow
+            Write-Host "  space that can still hold deleted files: another drive is better." -ForegroundColor Yellow
+        }
+        if ($memSpace.Result -eq "NoFit") {
+            Write-Host "  Not enough free space: $($memSpace.Reason)." -ForegroundColor Red
+        } elseif ($memSpace.Result -eq "LowReserve") {
+            Write-Host "  Low free space: $($memSpace.Reason)." -ForegroundColor Yellow
+        } elseif ($memSpace.Result -eq "Unknown") {
+            Write-Host "  Free space not checked: $($memSpace.Reason)." -ForegroundColor Yellow
+        }
         Write-Host ""
 
-        do {
-            $memChoice = Read-Host "Include memory capture? (1-2)"
-        } while ($memChoice -notin @("1", "2"))
+        if ($memChoices.Count -eq 1) {
+            # NoFit and no other drive: nothing to choose
+            $memChoice = $memChoices[0]
+            Write-Host "  No other drive has room for the dump." -ForegroundColor Yellow
+        } else {
+            for ($i = 0; $i -lt $memChoices.Count; $i++) {
+                $choiceColor = "White"
+                if ($memChoices[$i].Action -eq "Other" -or ($memChoices[$i].Action -eq "Here" -and $memSpace.Result -ne "LowReserve")) { $choiceColor = "Green" }
+                Write-Host "  [$($i + 1)] $($memChoices[$i].Label)" -ForegroundColor $choiceColor
+            }
+            Write-Host ""
+            # The answers as text: no cast that can fail on a long number
+            $memAnswers = @(1..$memChoices.Count | ForEach-Object { "$_" })
+            do {
+                $memAnswer = Read-Host "Include memory capture? (1-$($memChoices.Count))"
+            } while ($memAnswer -notin $memAnswers)
+            $memChoice = $memChoices[[int]$memAnswer - 1]
+        }
 
-        if ($memChoice -eq "1") {
+        if (-not $memChoice -or $memChoice.Action -eq "Skip") {
+            Write-Host ""
+            Write-Host "Memory capture skipped." -ForegroundColor DarkGray
+            Write-Host ""
+        } else {
+            if ($memChoice.Action -eq "Other") {
+                $MemoryOutputPath = $memChoice.DumpDir
+            } elseif ($memSpace.Result -ne "Ok") {
+                $script:memorySpaceAccepted = $true
+            }
             $Categories = @("Memory") + $Categories
             Write-Host ""
             Write-Host "Memory capture enabled. Will run first." -ForegroundColor Cyan
-            Write-Host ""
-        } else {
-            Write-Host ""
-            Write-Host "Memory capture skipped." -ForegroundColor DarkGray
+            if ($memChoice.Action -eq "Other") {
+                Write-Host "Memory dump: $(Get-MemoryDumpPath -ToolName $memCaptureTool.Name -DumpDir $MemoryOutputPath)" -ForegroundColor Cyan
+            }
             Write-Host ""
         }
     }
 }
-
-if (-not $OutputPath) {
-    $OutputPath = Join-Path $PSScriptRoot "reports\TriageCollection_$timestamp"
-}
-# Use an absolute path: .NET file APIs resolve relative paths against the
-# process directory, not the PowerShell location
-$OutputPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputPath)
 
 # Create output directory structure
 New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null
@@ -457,6 +905,12 @@ function Get-TargetRelativePath {
 $script:fileCount = 0
 $script:errorCount = 0
 $script:totalBytes = 0
+# How the last Copy-ForensicFile call made its copy, for callers that report
+# the outcome themselves (Copy-HiveFile): "direct copy", or for a locked file
+# (with -FallbackOnAccessDenied also an access-denied one) "shadow copy" /
+# "raw NTFS read"; "" when it made none. Whether the copy was kept (recorded
+# in the manifest) shows in $script:fileCount
+$script:lastForensicCopyMethod = ""
 
 function Copy-ForensicFile {
     [OutputType([void])]
@@ -471,6 +925,7 @@ function Copy-ForensicFile {
         [switch]$FallbackOnAccessDenied
     )
 
+    $script:lastForensicCopyMethod = ""
     # -LiteralPath: paths can contain [ ], which -Path treats as wildcards
     if (-not $SourcePath -or -not (Test-Path -LiteralPath $SourcePath)) {
         return
@@ -497,8 +952,11 @@ function Copy-ForensicFile {
         # create longer ones. Long names (e.g. Recent .lnk files named after web
         # searches) are shortened with a hash suffix; the full original path is
         # kept in the manifest's SourcePath column. Names are also capped at
-        # 100 characters so the zip still extracts under a deeper folder
-        # (the timeline builder extracts into %TEMP%).
+        # 100 characters so the zip still extracts under a deeper folder (by
+        # default the timeline builder extracts into a per-run folder under
+        # %LOCALAPPDATA%\TimelineBuilder, and shortens any path that is still
+        # over 240 characters). Callers therefore count collected files from
+        # $script:fileCount (Copy-ForensicFileSet), not by the original name.
         if ($DestName.Length -gt 100 -or $destPath.Length -gt 250) {
             $ext = [System.IO.Path]::GetExtension($DestName)
             $sha1 = New-Object System.Security.Cryptography.SHA1Managed
@@ -523,6 +981,7 @@ function Copy-ForensicFile {
     try {
         # Try direct copy first (also reads hidden/system files)
         [System.IO.File]::Copy($SourcePath, $destPath, $true)
+        $script:lastForensicCopyMethod = "direct copy"
         Record-Manifest -SourcePath $SourcePath -DestPath $destPath -SourceTimes $srcTimes
         return
     } catch {
@@ -535,6 +994,7 @@ function Copy-ForensicFile {
     # Try standard Copy-Item as fallback
     try {
         Copy-Item -LiteralPath $SourcePath -Destination $destPath -Force -ErrorAction Stop
+        $script:lastForensicCopyMethod = "direct copy"
         Record-Manifest -SourcePath $SourcePath -DestPath $destPath -SourceTimes $srcTimes
         return
     } catch { Write-Verbose "Copy-Item fallback for ${SourcePath}: $($_.Exception.Message)" }
@@ -551,12 +1011,14 @@ function Copy-ForensicFile {
         $relPath = Get-TargetRelativePath $SourcePath
         if ($relPath) {
             if (Copy-FromShadow -RelativePath $relPath -DestDir $DestDir -DestName $DestName -Quiet) {
+                $script:lastForensicCopyMethod = "shadow copy"
                 Log "Collected from shadow copy ($cause): $SourcePath"
                 return
             }
             # Not in the shadow copy (created after it was taken) or no shadow
             # copy possible: read the file straight from the volume
             if (Copy-TriageRawFile -SourcePath $SourcePath -DestPath $destPath -SourceTimes $srcTimes) {
+                $script:lastForensicCopyMethod = "raw NTFS read"
                 Log "Collected by raw NTFS read ($cause, not available from a shadow copy): $SourcePath"
                 return
             }
@@ -586,6 +1048,24 @@ function Copy-ForensicFile {
         Log-Warning "Could not copy: $SourcePath -- $reason"
     }
     $script:errorCount++
+}
+
+# Copy-ForensicFile for every file of a folder listing; returns how many
+# were collected, counted from $script:fileCount: a long name is saved
+# shortened, so looking for the original name in DestDir misses it (as
+# does Test-Path without -LiteralPath for a name with [ ]). Empty and
+# failed files do not count.
+function Copy-ForensicFileSet {
+    [OutputType([int])]
+    param(
+        [object[]]$Files,
+        [string]$DestDir
+    )
+    $filesBefore = $script:fileCount
+    foreach ($file in $Files) {
+        Copy-ForensicFile -SourcePath $file.FullName -DestDir $DestDir
+    }
+    return $script:fileCount - $filesBefore
 }
 
 # Manifest columns:
@@ -669,6 +1149,193 @@ function Save-CommandOutput {
 }
 
 # ----------------------------------------------------------
+# Helper: Save the memory capture tool's output as the acquisition log
+# (the only record of DumpIt's SHA-256 and NtStatus) and record it in the
+# manifest. It stays in the collection folder, so it is in the zip. A
+# write error is left to the caller's catch.
+# ----------------------------------------------------------
+function Save-MemoryAcquisitionLog {
+    [OutputType([void])]
+    param(
+        [object[]]$Output,
+        [string]$LogPath,
+        [string]$ToolName
+    )
+    # A tool that printed nothing would leave a 0-byte file (pwsh), which
+    # Record-Manifest deletes, or only a BOM (5.1): write a note instead
+    if ($null -eq $Output -or $Output.Count -eq 0) {
+        $Output = @("(no output from $ToolName)")
+    }
+    Ensure-Directory (Split-Path $LogPath -Parent)
+    $Output | Out-File -LiteralPath $LogPath -Encoding utf8
+    Record-Manifest -SourcePath "(memory capture tool output: $ToolName)" -DestPath $LogPath
+}
+
+# ----------------------------------------------------------
+# Helpers: check a finished memory capture
+# ----------------------------------------------------------
+# The memory dump of this run, set by the memory section only for a dump
+# that passed Get-MemoryCaptureResult; the compression step and the summary
+# use it. A dump that failed is set aside (memDumpIncompletePath)
+$script:memDumpPath = $null
+$script:memDumpIncompletePath = $null
+
+# Checks a finished memory capture. Output: the capture tool's output
+# (& <tool> ... 2>&1); DumpBytes: size of the dump file, -1 if there is
+# none (Get-FileLength); RamBytes: 0 if unknown. Reads what DumpIt reports
+# ("NtStatus (troubleshooting): 0x...", "Created file size: N bytes") and
+# collects the tool's "Error:" lines. The dump is complete when it exists,
+# is not empty, the tool reported NtStatus 0 and the size the file has
+# (each only when reported), and it holds at least 95% of the RAM (when
+# known). Returns Complete, Problems (why not), ErrorLines, NtStatus (""
+# when not reported), ReportedBytes (-1 when not reported) and Summary.
+function Get-MemoryCaptureResult {
+    param(
+        [object[]]$Output,
+        [long]$DumpBytes,
+        [long]$RamBytes,
+        [string]$ToolName
+    )
+    $errorLines = @()
+    $ntStatus = ""
+    $reportedBytes = [long]-1
+    foreach ($item in @($Output)) {
+        if ($null -eq $item) { continue }
+        $line = [string]$item
+        if ($line -match '^\s*Error:') { $errorLines += $line.Trim() }
+        if ($line -match 'NtStatus[^:]*:\s*0x([0-9A-Fa-f]{1,8})\b') { $ntStatus = "0x" + $Matches[1].ToUpperInvariant() }
+        if ($line -match 'Created file size:\s*(\d+)\s*bytes') { $reportedBytes = [long]$Matches[1] }
+    }
+    $problems = @()
+    if ($DumpBytes -lt 0) { $problems += "no dump file was written" }
+    elseif ($DumpBytes -eq 0) { $problems += "the dump file is empty" }
+    if ($ntStatus -and [Convert]::ToUInt32($ntStatus.Substring(2), 16) -ne 0) {
+        $problems += "$ToolName reported NtStatus $ntStatus"
+    }
+    if ($DumpBytes -gt 0) {
+        if ($reportedBytes -ge 0 -and $reportedBytes -ne $DumpBytes) {
+            $problems += "$ToolName reported a file of $reportedBytes bytes, the dump has $DumpBytes bytes"
+        }
+        if ($RamBytes -gt 0 -and $DumpBytes -lt $RamBytes * 0.95) {
+            $problems += "the dump has $DumpBytes bytes, less than 95% of the RAM ($RamBytes bytes)"
+        }
+    }
+    $summary = "$DumpBytes bytes"
+    if ($RamBytes -gt 0 -and $DumpBytes -gt 0) { $summary += " ($([math]::Round($DumpBytes * 100.0 / $RamBytes, 1))% of the RAM)" }
+    $reported = @()
+    if ($ntStatus) { $reported += "NtStatus $ntStatus" }
+    if ($reportedBytes -ge 0) { $reported += "a file of $reportedBytes bytes" }
+    if ($reported.Count -gt 0) { $summary += "; $ToolName reported " + ($reported -join " and ") }
+    else { $summary += "; $ToolName reported no NtStatus or file size" }
+    return [PSCustomObject]@{
+        Complete      = ($problems.Count -eq 0)
+        Problems      = $problems
+        ErrorLines    = $errorLines
+        NtStatus      = $ntStatus
+        ReportedBytes = $reportedBytes
+        Summary       = $summary
+    }
+}
+
+# A memory dump that failed the checks must not be zipped or taken for a
+# good one. An empty file is deleted. Anything else is kept for a look but
+# renamed to <name>.incomplete; one in the collection folder is moved out
+# of it, next to it (<collection>_memory_dump.dmp.incomplete). If that
+# fails it is deleted: left under the dump's name, the zip or the timeline
+# builder would take it. Returns the path the file is left at (the dump's
+# own path when it could be neither set aside nor deleted), or $null.
+function Move-IncompleteMemoryDump {
+    param([string]$DumpPath)
+    $length = Get-FileLength $DumpPath
+    if ($length -lt 0) { return $null }
+    if ($length -gt 0) {
+        $target = "$DumpPath.incomplete"
+        if (Get-CollectionRelativePath $DumpPath) { $target = "${OutputPath}_$([System.IO.Path]::GetFileName($DumpPath)).incomplete" }
+        try {
+            Move-Item -LiteralPath $DumpPath -Destination $target -Force -ErrorAction Stop
+            Log-Warning "Incomplete memory dump kept outside the collection (not zipped, not for analysis): $target ($([math]::Round($length / 1GB, 2)) GB)"
+            return $target
+        } catch {
+            Log-Warning "Could not set the incomplete memory dump aside as $target, deleting it so it is not taken for a good dump: $($_.Exception.Message)"
+        }
+    }
+    Remove-Item -LiteralPath $DumpPath -Force -ErrorAction SilentlyContinue
+    if ((Get-FileLength $DumpPath) -ge 0) {
+        Log-Warning "Could not delete the incomplete memory dump, delete it by hand (it is not complete, do not analyze it): $DumpPath"
+        return $DumpPath
+    }
+    if ($length -eq 0) { Log "Deleted the empty memory dump file: $DumpPath" }
+    else { Log "Deleted the incomplete memory dump: $DumpPath" }
+    return $null
+}
+
+# The timeline builder finds the memory dump through its row in
+# collection_manifest.csv (DestPath, SizeBytes). The compression step moves
+# a dump in Memory\ next to the zip, and back if the zip fails, after that
+# row was written: this changes the DestPath of the row whose DestPath is
+# OldPath to NewPath, and its RelativePath to match (blank outside the
+# collection). Its hash, size and times stay, and so does every other line
+# (also one that has OldPath in another field). The new manifest is written
+# as collection_manifest.csv.new and renamed into place, so a failure
+# leaves the old one (a warning). Returns $true when the row was changed;
+# $false when that failed or there is no such row (a dump that could not
+# be hashed has none: Record-Manifest warned then).
+function Set-ManifestDumpPath {
+    [OutputType([bool])]
+    param(
+        [string]$OldPath,
+        [string]$NewPath
+    )
+    $newFile = "$manifestFile.new"
+    $oldFile = "$manifestFile.old"
+    try {
+        # UTF-8 with BOM, as the manifest is written; lines end in CRLF. Only
+        # the lines that hold OldPath (quoted, as a field) are looked at. The
+        # whole text is passed to one .NET call only, the write: PowerShell 7
+        # scans the arguments of each call (about 2 s for a 45 MB manifest)
+        $utf8 = New-Object System.Text.UTF8Encoding($true)
+        $text = [System.IO.File]::ReadAllText($manifestFile, $utf8)
+        $oldField = ConvertTo-CsvField $OldPath
+        $changed = $false
+        $at = $text.IndexOf($oldField, [System.StringComparison]::OrdinalIgnoreCase)
+        while ($at -ge 0) {
+            $start = $text.LastIndexOf([char]10, $at) + 1
+            $end = $text.IndexOf("`r`n", $at, [System.StringComparison]::Ordinal)
+            if ($end -lt 0) { $end = $text.Length }
+            # Every field is quoted, quotes in it doubled (ConvertTo-CsvField)
+            $fields = @([regex]::Matches($text.Substring($start, $end - $start), '"((?:[^"]|"")*)"(?:,|$)') | ForEach-Object { $_.Groups[1].Value.Replace('""', '"') })
+            if ($start -gt 0 -and $fields.Count -eq 9 -and $fields[2].Equals($OldPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+                $fields[2] = $NewPath
+                $fields[5] = Get-CollectionRelativePath $NewPath
+                $row = ($fields | ForEach-Object { ConvertTo-CsvField $_ }) -join ','
+                $text = $text.Substring(0, $start) + $row + $text.Substring($end)
+                $end = $start + $row.Length
+                $changed = $true
+            }
+            $at = $text.IndexOf($oldField, $end, [System.StringComparison]::OrdinalIgnoreCase)
+        }
+        if (-not $changed) { return $false }
+        [System.IO.File]::WriteAllText($newFile, $text, $utf8)
+        [System.IO.File]::Move($manifestFile, $oldFile)
+        try { [System.IO.File]::Move($newFile, $manifestFile) }
+        catch { [System.IO.File]::Move($oldFile, $manifestFile); throw }
+    } catch {
+        $left = ""
+        if ([System.IO.File]::Exists($manifestFile)) {
+            try { [System.IO.File]::Delete($newFile) } catch { Write-Verbose "Could not delete ${newFile}: $($_.Exception.Message)" }
+        } else {
+            $left = " The manifest is left as $oldFile."
+        }
+        Log-Warning "Could not update the memory dump's row in collection_manifest.csv, it still names ${OldPath}: $($_.Exception.Message)$left"
+        return $false
+    }
+    Log "collection_manifest.csv: the memory dump's row now names $NewPath"
+    try { [System.IO.File]::Delete($oldFile) }
+    catch { Log-Warning "Could not delete the manifest from before that change: $oldFile -- $($_.Exception.Message)" }
+    return $true
+}
+
+# ----------------------------------------------------------
 # Helper: Volume Shadow Copy for locked files
 # ----------------------------------------------------------
 $script:shadowId = $null
@@ -715,6 +1382,16 @@ function Initialize-ShadowCopy {
 
 # Copy a file (path relative to TargetRoot) out of the shadow copy.
 # -Quiet: the caller reports failures (no warning / error count here).
+# Returns $true only for a non-empty copy. The outcome is also left in
+# $script:lastShadowCopyResult for callers that report it themselves:
+#   Copied   -- collected and recorded in the manifest
+#   Empty    -- 0 bytes in the snapshot: nothing to collect, not an error
+#   NotFound -- not in the snapshot (e.g. created after it was taken)
+#   Failed   -- no shadow copy, or the copy failed; the reason is in
+#               $script:lastShadowCopyReason
+$script:lastShadowCopyResult = ""
+$script:lastShadowCopyReason = ""
+
 function Copy-FromShadow {
     param(
         [string]$RelativePath,
@@ -723,8 +1400,11 @@ function Copy-FromShadow {
         [switch]$Quiet
     )
 
+    $script:lastShadowCopyResult = "Failed"
+    $script:lastShadowCopyReason = ""
     if (-not $script:shadowPath) {
         if (-not (Initialize-ShadowCopy)) {
+            $script:lastShadowCopyReason = "no shadow copy available"
             return $false
         }
     }
@@ -748,43 +1428,137 @@ function Copy-FromShadow {
         # hidden/system files (NTUSER.DAT, UsrClass.dat, hive .LOG1/.LOG2),
         # which "cmd /c copy" reports as not found. cmd copy stays as fallback.
         $notFound = $false
+        $copied = $false          # .NET copy finished without an exception
+        $failReason = ""
         try {
             [System.IO.File]::Copy($shadowFile, $destPath, $true)
+            $copied = $true
         } catch {
             $copyError = $_.Exception
             if ($copyError.InnerException) { $copyError = $copyError.InnerException }
             if ($copyError -is [System.IO.FileNotFoundException] -or $copyError -is [System.IO.DirectoryNotFoundException]) {
                 $notFound = $true
             } else {
+                $failReason = $copyError.Message
                 $null = cmd /c "copy /Y `"$shadowFile`" `"$destPath`"" 2>&1
             }
         }
 
-        if ((Get-FileLength $destPath) -gt 0) {
+        $destLength = Get-FileLength $destPath
+        if ($destLength -gt 0) {
             Record-Manifest -SourcePath "(shadow)$RelativePath" -DestPath $destPath -SourceTimes $srcTimes
+            $script:lastShadowCopyResult = "Copied"
             return $true
         }
-
         # Remove empty/corrupt shadow copy output
-        if ((Get-FileLength $destPath) -ge 0) {
-            Remove-Item -LiteralPath $destPath -Force -ErrorAction SilentlyContinue
+        if ($destLength -ge 0) { Remove-Item -LiteralPath $destPath -Force -ErrorAction SilentlyContinue }
+
+        # A complete copy of a file that is 0 bytes in the snapshot: nothing to
+        # collect, not an error (same rule as Copy-ForensicFile). Common for
+        # hive transaction logs: one of .LOG1/.LOG2 is often empty. Checked
+        # after the copy, not before: a symlink itself has 0 bytes.
+        $shadowLength = Get-FileLength $shadowFile
+        if ($copied -and $destLength -eq 0 -and $shadowLength -eq 0) {
+            $script:lastShadowCopyResult = "Empty"
+            $msg = "Skipped empty file (0 bytes in the shadow copy): $RelativePath"
+            if ($Quiet) { Write-Verbose $msg } else { Log $msg }
+            return $false     # callers keep their live fallback
         }
+        if ($notFound) {
+            $script:lastShadowCopyResult = "NotFound"
+            if (-not $Quiet) { Log "Not present in shadow copy: $RelativePath" }
+            return $false
+        }
+        if (-not $failReason) {
+            if ($destLength -lt 0) { $failReason = "the copy left no file" }
+            else { $failReason = "the copy is empty but the snapshot file is $shadowLength bytes" }
+        }
+        $script:lastShadowCopyReason = $failReason
         if (-not $Quiet) {
-            if ($notFound) {
-                Log "Not present in shadow copy: $RelativePath"
-            } else {
-                Log-Warning "Shadow copy of $RelativePath did not produce output file"
-                $script:errorCount++
-            }
+            Log-Warning "Shadow copy of $RelativePath did not produce output file -- $failReason"
+            $script:errorCount++
         }
         return $false
     } catch {
+        $script:lastShadowCopyReason = $_.Exception.Message
         if (-not $Quiet) {
             Log-Warning "Could not copy from shadow: $RelativePath -- $($_.Exception.Message)"
             $script:errorCount++
         }
         return $false
     }
+}
+
+# Collect a registry hive or hive transaction log (path relative to
+# TargetRoot) from the shadow copy, else by direct copy (Copy-ForensicFile,
+# which falls back to a raw NTFS read for a locked file). Logs one outcome
+# per file, so a shadow copy failure that the direct copy recovers is not
+# an error:
+#   OK      -- "Collected <Label> via shadow copy" / "via direct copy" /
+#              "via raw NTFS read" (with the shadow copy's reason if it
+#              failed for this file); a locked file's fallback read also
+#              gets Copy-ForensicFile's own line, with the path
+#   info    -- empty (0 bytes): nothing to collect
+#   warning -- not found on the target (no error, as for the system hives)
+#   warning -- not collected; one error in all (Copy-ForensicFile may have
+#              logged and counted the direct copy's failure already)
+function Copy-HiveFile {
+    [OutputType([void])]
+    param(
+        [string]$RelativePath,
+        [string]$DestDir,
+        [string]$Label
+    )
+
+    $destName = [System.IO.Path]::GetFileName($RelativePath)
+    $sourcePath = $script:TargetRoot.TrimEnd('\') + '\' + $RelativePath
+
+    if (Copy-FromShadow -RelativePath $RelativePath -DestDir $DestDir -DestName $destName -Quiet) {
+        Log-Success "Collected $Label via shadow copy"
+        return
+    }
+    # Kept before the direct copy, which can try the shadow copy again.
+    # "Failed" without a shadow copy (image mode, or none could be made) is
+    # no failure of this file: there was nothing to try
+    $shadowResult = $script:lastShadowCopyResult
+    $shadowReason = $script:lastShadowCopyReason
+    $shadowFailed = ($shadowResult -eq "Failed") -and [bool]$script:shadowPath
+
+    $filesBefore = $script:fileCount
+    $errorsBefore = $script:errorCount
+    Copy-ForensicFile -SourcePath $sourcePath -DestDir $DestDir -DestName $destName
+    if ($script:fileCount -gt $filesBefore) {
+        # Copy-ForensicFile reads a locked file by raw NTFS read (or from
+        # the shadow copy, if a second try works: no failure to report then)
+        $method = $script:lastForensicCopyMethod
+        if ($shadowFailed -and $method -ne "shadow copy") {
+            Log-Success "Collected $Label via $method (shadow copy: $shadowReason)"
+        } else {
+            Log-Success "Collected $Label via $method"
+        }
+        return
+    }
+
+    # Nothing to collect: empty, or not on the target at all. Not when the
+    # snapshot file could not be read: it may have held data
+    $liveLength = Get-FileLength $sourcePath
+    if ($script:errorCount -eq $errorsBefore -and -not $shadowFailed -and $liveLength -le 0) {
+        if ($shadowResult -eq "Empty") {
+            Log "Skipped empty file (0 bytes in the shadow copy): $RelativePath"
+        } elseif ($liveLength -eq 0) {
+            Log "Skipped empty file (0 bytes): $RelativePath"
+        } else {
+            Log-Warning "$Label not found at $sourcePath"
+        }
+        return
+    }
+
+    if ($shadowFailed) {
+        Log-Warning "Could not collect $Label -- shadow copy: $shadowReason"
+    } else {
+        Log-Warning "Could not collect $Label"
+    }
+    if ($script:errorCount -eq $errorsBefore) { $script:errorCount++ }
 }
 
 # Names of the files (not folders) in a folder of the shadow copy (path
@@ -971,6 +1745,17 @@ function Write-CollectionInfo {
     }
 }
 
+# Format-List and Format-Table show only the first $FormatEnumerationLimit
+# items of a list (4 by default) and then "...", which cut, for example,
+# the HardwareID lists in usb_storage_devices.txt and the exclusion lists
+# in defender_preferences.txt. No limit for this run; the finally block of
+# the try below restores the old value. The formatter reads only the
+# global variable: a plain assignment here works when the script is
+# started with -File (its top level is then the global scope), but not
+# when it is run from an open PowerShell window.
+$savedFormatEnumerationLimit = $global:FormatEnumerationLimit
+$global:FormatEnumerationLimit = -1
+
 # =============================================================
 # Collection body. Everything from here down to the "Cleanup"
 # banner runs inside this try block. Its finally block (at the
@@ -1018,6 +1803,17 @@ if ($script:IsLive) {
 }
 Log "Categories: $($Categories -join ', ')"
 Log "SkipLargeFiles: $SkipLargeFiles"
+if ($MemoryOutputPath) { Log "Memory dump folder: $MemoryOutputPath" }
+if ($null -ne $consoleModeAtStart) {
+    Log "Console QuickEdit is off for this run, so a click in the window cannot pause it (copy text with the window menu: Edit > Mark)."
+}
+# Free space for the collection and its zip on the output drive (a warning
+# only; a memory dump is checked right before the capture)
+$outputSpace = Get-TriageSpaceCheck -Path $OutputPath -NoDump
+Log (Format-SpaceCheck $outputSpace)
+if ($outputSpace.Result -eq "NoFit" -or $outputSpace.Result -eq "LowReserve") {
+    Log-Warning "The output drive may run short of space for the collection: $($outputSpace.Reason)."
+}
 if ($script:triageIncludeSecrets) {
     Log-Warning "============================================================="
     Log-Warning "-IncludeSecrets is set: browser settings and session files are collected UNREDACTED"
@@ -1083,50 +1879,93 @@ if ($Categories -contains "Memory") {
             $memToolName = $memCaptureTool.Name
             $memDir = Join-Path $OutputPath "Memory"
             Ensure-Directory $memDir
-            # DumpIt writes a Microsoft crash dump (.dmp: WinDbg, Volatility);
-            # WinPmem and Magnet RAM Capture write a raw image
-            if ($memToolName -eq "DumpIt") {
-                $dumpFile = Join-Path $memDir "memory_dump.dmp"
-            } else {
-                $dumpFile = Join-Path $memDir "memory_dump.raw"
-            }
+            # Memory\memory_dump.dmp (DumpIt) or .raw, or with
+            # -MemoryOutputPath <folder>\<collection>_memory_dump.dmp (.raw);
+            # the acquisition log always stays in Memory\
+            $dumpFile = Get-MemoryDumpPath -ToolName $memToolName -DumpDir $MemoryOutputPath
             $memLogFile = Join-Path $memDir "memory_acquisition_log.txt"
 
-            $ramGB = [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 0)
+            $ramBytes = Get-PhysicalMemoryBytes
+            $ramGB = [math]::Round($ramBytes / 1GB, 0)
             Log "Memory capture tool: $memToolName ($memTool)"
+            Log "Memory dump file: $dumpFile"
             Log "Expected dump size: ~$ramGB GB"
-            Log "Capturing memory -- this may take several minutes..."
 
-            try {
-                switch ($memToolName) {
-                    "WinPmem" {
-                        $result = & $memTool acquire $dumpFile 2>&1
-                    }
-                    "DumpIt" {
-                        # Uncompressed crash dump, no prompts (DumpIt may
-                        # otherwise compress automatically)
-                        $result = & $memTool /TYPE DMP /NOCOMPRESS /QUIET /OUTPUT $dumpFile 2>&1
-                    }
-                    "MagnetRAM" {
-                        $result = & $memTool /accepteula /go /output $dumpFile 2>&1
-                    }
-                }
-
-                # Save tool output as acquisition log
-                $result | Out-File $memLogFile -Encoding utf8
-
-                if ((Get-FileLength $dumpFile) -gt 0) {
-                    $dumpSizeGB = [math]::Round((Get-FileLength $dumpFile) / 1GB, 2)
-                    Record-Manifest -SourcePath "(memory dump via $memToolName)" -DestPath $dumpFile
-                    Log-Success "Memory dump captured: $dumpFile ($dumpSizeGB GB)"
-                } else {
-                    Log-Warning "Memory dump failed or produced empty file."
-                    Log-Warning "Check acquisition log: $memLogFile"
-                }
-            }
-            catch {
-                Log-Error "Memory capture failed: $($_.Exception.Message)"
+            # Free space, checked again right before the capture: this check
+            # decides (the prompt's ran before the run started, and with
+            # -Categories Memory there was none). No room: no capture, an
+            # error, and the artifacts are still collected. Low reserve or
+            # unknown: a warning, and the capture runs
+            $memSpace = Get-TriageSpaceCheck -Path $dumpFile -RamBytes $ramBytes -ToolName $memToolName
+            Log (Format-SpaceCheck $memSpace)
+            $memCaptureAllowed = $true
+            if ($memSpace.Result -eq "NoFit") {
+                Log-Error "Memory capture skipped: $($memSpace.Reason). Free up space, or write the dump to another drive with -MemoryOutputPath."
                 $script:errorCount++
+                $memCaptureAllowed = $false
+            } elseif ((Get-FileLength $dumpFile) -ge 0) {
+                # Never overwrite (or take for this run's) an earlier dump
+                Log-Error "Memory capture skipped: a file is already at $dumpFile (an earlier run?). Move it away, or use another -OutputPath or -MemoryOutputPath."
+                $script:errorCount++
+                $memCaptureAllowed = $false
+            } elseif ($memSpace.Result -eq "LowReserve") {
+                if ($script:memorySpaceAccepted) { Log-Warning "Capturing anyway (chosen at the prompt): $($memSpace.Reason)." }
+                else { Log-Warning "Capturing anyway: $($memSpace.Reason). -MemoryOutputPath writes the dump to another drive." }
+            } elseif ($memSpace.Result -eq "Unknown") {
+                Log-Warning "Capturing without a free space check: $($memSpace.Reason)."
+            }
+            if ($memSpace.OnSystemDrive -and $memCaptureAllowed) {
+                Log "The memory dump is written to the system drive being examined (over free space that can hold deleted files)."
+            }
+
+            if ($memCaptureAllowed) {
+                Log "Capturing memory -- this may take several minutes..."
+                try {
+                    Ensure-Directory (Split-Path $dumpFile -Parent)
+                    switch ($memToolName) {
+                        "WinPmem" {
+                            $result = & $memTool acquire $dumpFile 2>&1
+                        }
+                        "DumpIt" {
+                            # Uncompressed crash dump, no prompts (DumpIt may
+                            # otherwise compress automatically)
+                            $result = & $memTool /TYPE DMP /NOCOMPRESS /QUIET /OUTPUT $dumpFile 2>&1
+                        }
+                        "MagnetRAM" {
+                            $result = & $memTool /accepteula /go /output $dumpFile 2>&1
+                        }
+                    }
+
+                    # Save tool output as acquisition log, listed in the manifest
+                    Save-MemoryAcquisitionLog -Output $result -LogPath $memLogFile -ToolName $memToolName
+
+                    # Then check the dump: the tool's "Error:" lines go to this
+                    # log too, and only a complete dump is recorded and kept
+                    $memResult = Get-MemoryCaptureResult -Output $result -DumpBytes (Get-FileLength $dumpFile) -RamBytes $ramBytes -ToolName $memToolName
+                    foreach ($memErrorLine in $memResult.ErrorLines) { Log-Warning "${memToolName}: $memErrorLine" }
+                    if ($memResult.Complete) {
+                        $dumpSizeGB = [math]::Round((Get-FileLength $dumpFile) / 1GB, 2)
+                        # The compression step changes the row's path when
+                        # it moves the dump (Set-ManifestDumpPath)
+                        Record-Manifest -SourcePath "(memory dump via $memToolName)" -DestPath $dumpFile
+                        $script:memDumpPath = $dumpFile
+                        Log "Memory dump check: $($memResult.Summary)"
+                        Log-Success "Memory dump captured: $dumpFile ($dumpSizeGB GB)"
+                    } else {
+                        Log-Error "Memory capture failed: $($memResult.Problems -join '; ')."
+                        Log-Warning "Check acquisition log: $memLogFile"
+                        $script:errorCount++
+                    }
+                }
+                catch {
+                    Log-Error "Memory capture failed: $($_.Exception.Message)"
+                    $script:errorCount++
+                }
+                # A dump that is not complete (or not checked: an error above)
+                # is set aside or deleted, never zipped
+                if (-not $script:memDumpPath) {
+                    $script:memDumpIncompletePath = Move-IncompleteMemoryDump -DumpPath $dumpFile
+                }
             }
         } else {
             Log-Warning "Memory capture: no tool found in tools\ directory. Skipping."
@@ -2242,31 +3081,10 @@ if ($Categories -contains "Registry") {
 
     # Amcache (hive + transaction logs so dirty hives can be recovered)
     Log "Collecting Amcache.hve..."
-    $amcacheSrc = "${script:TargetRoot}Windows\AppCompat\Programs\Amcache.hve"
-    $amcachePath = "Windows\AppCompat\Programs\Amcache.hve"
-    $result = Copy-FromShadow -RelativePath $amcachePath -DestDir $regDir -DestName "Amcache.hve"
-    if (-not $result) {
-        Copy-ForensicFile -SourcePath $amcacheSrc -DestDir $regDir
-    }
-    if ((Get-FileLength (Join-Path $regDir "Amcache.hve")) -gt 0) {
-        Log-Success "Collected Amcache.hve"
-    } else {
-        Log-Warning "Could not collect Amcache.hve"
-    }
+    Copy-HiveFile -RelativePath "Windows\AppCompat\Programs\Amcache.hve" -DestDir $regDir -Label "Amcache.hve"
     # Collect transaction logs for dirty hive recovery (locked + hidden, need shadow copy)
     foreach ($logExt in @(".LOG1", ".LOG2")) {
-        $logRelPath = "Windows\AppCompat\Programs\Amcache.hve${logExt}"
-        $logResult = Copy-FromShadow -RelativePath $logRelPath -DestDir $regDir -DestName "Amcache.hve${logExt}"
-        if (-not $logResult) {
-            # Fallback to direct copy
-            $logSrc = "${amcacheSrc}${logExt}"
-            if (Test-Path -LiteralPath $logSrc) {
-                Copy-ForensicFile -SourcePath $logSrc -DestDir $regDir
-            }
-        }
-        if ((Get-FileLength (Join-Path $regDir "Amcache.hve${logExt}")) -gt 0) {
-            Log-Success "Collected Amcache.hve${logExt}"
-        }
+        Copy-HiveFile -RelativePath "Windows\AppCompat\Programs\Amcache.hve${logExt}" -DestDir $regDir -Label "Amcache.hve${logExt}"
     }
 
     # Per-user hives: NTUSER.DAT and UsrClass.dat
@@ -2333,16 +3151,10 @@ if ($Categories -contains "Registry") {
                 } catch { Write-Verbose "reg save of HKU\$userSid for ${userName}: $($_.Exception.Message)" }
             }
 
-            # Method 2: Shadow copy
+            # Method 2: Shadow copy, then Method 3: Direct copy (works for
+            # non-active users); either way the outcome is logged once
             if (-not $collected) {
-                $relPath = "Users\$userName\NTUSER.DAT"
-                $result = Copy-FromShadow -RelativePath $relPath -DestDir $userRegDir -DestName "NTUSER.DAT"
-                if ($result) { $collected = $true }
-            }
-
-            # Method 3: Direct copy (works for non-active users)
-            if (-not $collected) {
-                Copy-ForensicFile -SourcePath $ntuser -DestDir $userRegDir -DestName "NTUSER.DAT"
+                Copy-HiveFile -RelativePath "Users\$userName\NTUSER.DAT" -DestDir $userRegDir -Label "NTUSER.DAT for $userName"
             }
         }
 
@@ -2365,16 +3177,10 @@ if ($Categories -contains "Registry") {
                 } catch { Write-Verbose "reg save of HKU\${userSid}_Classes for ${userName}: $($_.Exception.Message)" }
             }
 
-            # Method 2: Shadow copy
+            # Method 2: Shadow copy, then Method 3: Direct copy (works for
+            # non-active users); either way the outcome is logged once
             if (-not $collected) {
-                $relPath = "Users\$userName\AppData\Local\Microsoft\Windows\UsrClass.dat"
-                $result = Copy-FromShadow -RelativePath $relPath -DestDir $userRegDir -DestName "UsrClass.dat"
-                if ($result) { $collected = $true }
-            }
-
-            # Method 3: Direct copy (works for non-active users)
-            if (-not $collected) {
-                Copy-ForensicFile -SourcePath $usrclass -DestDir $userRegDir -DestName "UsrClass.dat"
+                Copy-HiveFile -RelativePath "Users\$userName\AppData\Local\Microsoft\Windows\UsrClass.dat" -DestDir $userRegDir -Label "UsrClass.dat for $userName"
             }
         }
     }
@@ -2779,11 +3585,14 @@ function Copy-TriageSrumFiles {
         if ($dbSize -le $MaxBytes) {
             $useShadow = Copy-FromShadow -RelativePath "$relDir\SRUDB.dat" -DestDir $DestDir -DestName "SRUDB.dat" -Quiet
             if (-not $useShadow) {
-                Log "SRUDB.dat could not be read from the shadow copy -- the SRUM files are copied from the volume (the database and its logs may be from slightly different moments)."
+                $why = ""
+                if ($script:lastShadowCopyReason) { $why = " ($($script:lastShadowCopyReason))" }
+                Log "SRUDB.dat could not be read from the shadow copy$why -- the SRUM files are copied from the volume (the database and its logs may be from slightly different moments)."
             }
         }
     }
 
+    $dbCollected = $useShadow
     if ($useShadow) {
         $count++
         $shadowNames = Get-ShadowFileNames -RelativePath $relDir
@@ -2799,12 +3608,18 @@ function Copy-TriageSrumFiles {
             }
             if (Copy-FromShadow -RelativePath "$relDir\$name" -DestDir $DestDir -DestName $name -Quiet) {
                 $count++
-            } elseif ($null -ne $shadowNames) {
-                Log-Warning "Could not copy SRUM file $name from the shadow copy"
-                $script:errorCount++
-            } else {
+            } elseif ($script:lastShadowCopyResult -eq "Empty") {
+                # 0 bytes in the snapshot: nothing to collect, not an error.
+                # Not taken from the volume instead: all files are from one moment
+                Log "Skipped empty file (0 bytes in the shadow copy): $relDir\$name"
+            } elseif ($script:lastShadowCopyResult -eq "NotFound" -and $null -eq $shadowNames) {
                 # Listed on the volume only: newer than the shadow copy
                 Log "SRUM file not in the shadow copy (newer than the database copy) -- skipped: $name"
+            } else {
+                $reason = $script:lastShadowCopyReason
+                if (-not $reason) { $reason = "not found in the shadow copy" }
+                Log-Warning "Could not copy SRUM file $name from the shadow copy -- $reason"
+                $script:errorCount++
             }
         }
     } else {
@@ -2813,12 +3628,18 @@ function Copy-TriageSrumFiles {
                 Log-Warning "Skipped SRUM file $($vf.FullName) ($([math]::Round($vf.Length / 1MB, 1)) MB): larger than the $capText"
                 continue
             }
+            # Counted from $script:fileCount, not by the original name: a
+            # copy under a deep output folder is saved with a shortened name
+            $filesBefore = $script:fileCount
             Copy-ForensicFile -SourcePath $vf.FullName -DestDir $DestDir
-            if ((Get-FileLength (Join-Path $DestDir $vf.Name)) -gt 0) { $count++ }
+            if ($script:fileCount -gt $filesBefore) {
+                $count++
+                if ($vf.Name -eq "SRUDB.dat") { $dbCollected = $true }
+            }
         }
     }
 
-    if ((Get-FileLength (Join-Path $DestDir "SRUDB.dat")) -gt 0) {
+    if ($dbCollected) {
         $note = ""
         if ($useShadow) {
             $note = " (from the shadow copy)"
@@ -2872,6 +3693,115 @@ function Get-TriageUsbStorageRows {
         Log-Warning "Could not read PnP install/arrival/removal times of $failedDevices USB storage device(s) -- last error: $lastError"
     }
     return $rows
+}
+
+# One MountedDevices value, decoded. Kind:
+#   GPT         "DMIO:ID:" + partition GUID (24 bytes; also dynamic volumes)
+#   MBR         disk signature (4 bytes) + partition offset in bytes (8)
+#   DevicePath  UTF-16 device path starting "_??_" or "\??\", such as
+#               _??_USBSTOR#Disk&Ven_...&Prod_...#<serial>&0#{...}
+#   Other       anything else, including a value that is not binary
+# HexData is the raw data (as text for a value that is not binary)
+function ConvertFrom-TriageMountedDeviceValue {
+    param([string]$Name, $Data)
+    $row = [ordered]@{
+        Name            = $Name
+        Kind            = "Other"
+        DiskSignature   = ""
+        PartitionOffset = ""
+        PartitionGuid   = ""
+        DevicePath      = ""
+        DataLength      = 0
+        HexData         = ""
+    }
+    if ($Data -isnot [byte[]]) {
+        $row.HexData = Format-TriageRegValue $Data
+        return [PSCustomObject]$row
+    }
+    $row.DataLength = $Data.Length
+    $row.HexData = [BitConverter]::ToString($Data).Replace("-", "")
+    if ($Data.Length -eq 24 -and [Text.Encoding]::ASCII.GetString($Data, 0, 8) -eq "DMIO:ID:") {
+        $row.Kind = "GPT"
+        $row.PartitionGuid = (New-Object Guid (, [byte[]]$Data[8..23])).ToString("B")
+    } elseif ($Data.Length -eq 12) {
+        $row.Kind = "MBR"
+        $row.DiskSignature = "{0:X8}" -f [BitConverter]::ToUInt32($Data, 0)
+        $row.PartitionOffset = [string][BitConverter]::ToUInt64($Data, 4)
+    } elseif ($Data.Length -ge 8 -and $Data.Length % 2 -eq 0 -and $Data[1] -eq 0) {
+        $text = [Text.Encoding]::Unicode.GetString($Data).TrimEnd([char]0)
+        if ($text -match '^(_\?\?_|\\\?\?\\)') {
+            $row.Kind = "DevicePath"
+            $row.DevicePath = $text
+        }
+    }
+    return [PSCustomObject]$row
+}
+
+# Every value of HKLM\SYSTEM\MountedDevices, decoded, with the key's
+# last-write time (Hive and KeyPath as for Open-TriageRegKey)
+function Get-TriageMountedDeviceRows {
+    param(
+        [string]$Hive = "HKLM",
+        [string]$KeyPath = "SYSTEM\MountedDevices"
+    )
+    $rows = @()
+    $key = Open-TriageRegKey -Hive $Hive -SubKey $KeyPath
+    if ($null -eq $key) { return $rows }
+    try {
+        $lastWrite = Get-TriageRegLastWriteUtc -Key $key
+        foreach ($valueName in $key.GetValueNames()) {
+            $data = $key.GetValue($valueName, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+            $row = ConvertFrom-TriageMountedDeviceValue -Name $valueName -Data $data
+            $row | Add-Member -NotePropertyName KeyLastWriteUtc -NotePropertyValue $lastWrite
+            $rows += $row
+        }
+    } catch {
+        Log-Warning "Could not read $Hive\$KeyPath for mounted_devices.csv -- $($_.Exception.Message)"
+    } finally {
+        $key.Close()
+    }
+    return $rows
+}
+
+# Write mounted_devices.csv and mounted_devices.txt (the same rows for
+# humans) and log the number of values of each kind
+function Save-TriageMountedDevices {
+    [OutputType([void])]
+    param(
+        [string]$UsbDir,
+        [string]$Hive = "HKLM",
+        [string]$KeyPath = "SYSTEM\MountedDevices"
+    )
+    # The timeline builder reads these columns
+    $columns = @("Name", "Kind", "DiskSignature", "PartitionOffset", "PartitionGuid", "DevicePath",
+        "DataLength", "HexData", "KeyLastWriteUtc")
+    $mountedRows = @(Get-TriageMountedDeviceRows -Hive $Hive -KeyPath $KeyPath)
+    Export-TriageCsv -Description "Mounted devices (decoded)" `
+        -DestPath (Join-Path $UsbDir "mounted_devices.csv") `
+        -Columns $columns `
+        -Rows $mountedRows
+
+    # Out-String with a wide width keeps each value on one line (Out-File
+    # in Windows PowerShell wraps list values at the console width)
+    Save-CommandOutput -Description "Mounted devices" `
+        -DestPath (Join-Path $UsbDir "mounted_devices.txt") `
+        -Command {
+            if ($mountedRows.Count -gt 0) {
+                $mountedRows | Select-Object -Property $columns | Format-List | Out-String -Width 4096
+            } else {
+                Write-Output "(no values: $Hive\$KeyPath missing, empty or not readable)"
+            }
+        }
+
+    if ($mountedRows.Count -gt 0) {
+        $kindCounts = foreach ($kind in @("GPT", "MBR", "DevicePath", "Other")) {
+            $kindCount = @($mountedRows | Where-Object { $_.Kind -eq $kind }).Count
+            if ($kindCount -gt 0) { "$kindCount $kind" }
+        }
+        Log-Success "Collected $($mountedRows.Count) mounted device value(s): $($kindCounts -join ', ')."
+    } else {
+        Log-Warning "No mounted devices found ($Hive\$KeyPath missing, empty or not readable)."
+    }
 }
 
 # Task Scheduler time -> UTC "o"; "never" (1999-11-30 or MinValue) or missing -> ""
@@ -3159,12 +4089,7 @@ if ($Categories -contains "Execution") {
         # -Force here and at the other artifact listings: without it
         # Get-ChildItem silently skips hidden/system files
         $pfFiles = Get-ChildItem -Path $prefetchSource -Filter "*.pf" -Force -ErrorAction SilentlyContinue
-        $pfCount = 0
-        foreach ($pf in $pfFiles) {
-            Copy-ForensicFile -SourcePath $pf.FullName -DestDir $prefetchDir
-            $destFile = Join-Path $prefetchDir $pf.Name
-            if (Test-Path $destFile) { $pfCount++ }
-        }
+        $pfCount = Copy-ForensicFileSet -Files $pfFiles -DestDir $prefetchDir
         Log-Success "Collected $pfCount Prefetch files."
     } else {
         Log-Warning "Prefetch directory not found (may be disabled)."
@@ -3346,12 +4271,7 @@ if ($Categories -contains "UserActivity") {
             $recentDest = Join-Path $uaDir "$userName\RecentFiles"
             Ensure-Directory $recentDest
             $lnkFiles = Get-ChildItem -Path $recentSource -Filter "*.lnk" -Force -ErrorAction SilentlyContinue
-            $lnkCount = 0
-            foreach ($lnk in $lnkFiles) {
-                Copy-ForensicFile -SourcePath $lnk.FullName -DestDir $recentDest
-                $destFile = Join-Path $recentDest $lnk.Name
-                if (Test-Path $destFile) { $lnkCount++ }
-            }
+            $lnkCount = Copy-ForensicFileSet -Files $lnkFiles -DestDir $recentDest
             Log-Success "Collected $lnkCount recent LNK files for $userName"
         }
 
@@ -3361,12 +4281,7 @@ if ($Categories -contains "UserActivity") {
             $autoJumpDest = Join-Path $uaDir "$userName\JumpLists\AutomaticDestinations"
             Ensure-Directory $autoJumpDest
             $jlFiles = Get-ChildItem -Path $autoJumpSource -File -Force -ErrorAction SilentlyContinue
-            $jlCount = 0
-            foreach ($jl in $jlFiles) {
-                Copy-ForensicFile -SourcePath $jl.FullName -DestDir $autoJumpDest
-                $destFile = Join-Path $autoJumpDest $jl.Name
-                if (Test-Path $destFile) { $jlCount++ }
-            }
+            $jlCount = Copy-ForensicFileSet -Files $jlFiles -DestDir $autoJumpDest
             Log-Success "Collected $jlCount AutomaticDestinations for $userName"
         }
 
@@ -3376,12 +4291,7 @@ if ($Categories -contains "UserActivity") {
             $customJumpDest = Join-Path $uaDir "$userName\JumpLists\CustomDestinations"
             Ensure-Directory $customJumpDest
             $jlFiles = Get-ChildItem -Path $customJumpSource -File -Force -ErrorAction SilentlyContinue
-            $jlCount = 0
-            foreach ($jl in $jlFiles) {
-                Copy-ForensicFile -SourcePath $jl.FullName -DestDir $customJumpDest
-                $destFile = Join-Path $customJumpDest $jl.Name
-                if (Test-Path $destFile) { $jlCount++ }
-            }
+            $jlCount = Copy-ForensicFileSet -Files $jlFiles -DestDir $customJumpDest
             Log-Success "Collected $jlCount CustomDestinations for $userName"
         }
 
@@ -3722,7 +4632,8 @@ function Initialize-TriageRedactor {
 }
 
 # Copy a file unless it is larger than -MaxBytes (logged with its size).
-# Returns $true when the copy is in the collection.
+# Returns $true when the copy is in the collection (recorded in the
+# manifest; it may be saved under a shortened name, see Copy-ForensicFile).
 function Copy-TriageCappedFile {
     [OutputType([bool])]
     param(
@@ -3737,8 +4648,9 @@ function Copy-TriageCappedFile {
         Log "Skipped (larger than the $([math]::Round($MaxBytes / 1MB)) MB cap: $([math]::Round($size / 1MB, 1)) MB): $SourcePath"
         return $false
     }
+    $filesBefore = $script:fileCount
     Copy-ForensicFile -SourcePath $SourcePath -DestDir $DestDir -DestName $DestName
-    return (Test-Path -LiteralPath (Join-Path $DestDir $DestName))
+    return ($script:fileCount -gt $filesBefore)
 }
 
 # Copy files (already in the order of preference, e.g. newest first) to the
@@ -3768,6 +4680,10 @@ function Copy-TriageFilesWithinCap {
         }
         $relDir = Split-Path ($file.FullName.Substring($root.Length + 1)) -Parent
         $destDir = if ($relDir) { Join-Path $DestRoot $relDir } else { $DestRoot }
+        # Counted (with the copy's size) from what the manifest recorded, not
+        # by the original name: a long name is saved shortened
+        $filesBefore = $script:fileCount
+        $bytesBefore = $script:totalBytes
         if ($Format) {
             # A blanked Firefox session copy is stored uncompressed: its own
             # size counts (it must fit in what is left)
@@ -3777,9 +4693,8 @@ function Copy-TriageFilesWithinCap {
         else {
             Copy-ForensicFile -SourcePath $file.FullName -DestDir $destDir -DestName $file.Name
         }
-        $copyLength = Get-FileLength (Join-Path $destDir $file.Name)
-        if ($copyLength -gt 0) {
-            $total += $copyLength
+        if ($script:fileCount -gt $filesBefore) {
+            $total += $script:totalBytes - $bytesBefore
             $copied++
         }
     }
@@ -3952,9 +4867,10 @@ function Copy-TriageChromiumProfileExtras {
                 if (-not (Copy-TriageCappedFile -SourcePath (Join-Path $versionDir.FullName "manifest.json") -DestDir $versionDest -DestName "manifest.json" -MaxBytes 1MB)) { continue }
                 $manifestCount++
                 # A name such as "__MSG_appName__" is looked up in the default
-                # locale's messages.json (read from the copy just made)
+                # locale's messages.json (read from the copy just made, which
+                # may have a shortened name)
                 $manifestText = ""
-                try { $manifestText = [System.IO.File]::ReadAllText((Join-Path $versionDest "manifest.json")) }
+                try { $manifestText = [System.IO.File]::ReadAllText($script:lastRecordedDestPath) }
                 catch { Write-Verbose "Reading the copied manifest of $($extensionDir.Name): $($_.Exception.Message)" }
                 if ($manifestText -match '__MSG_' -and $manifestText -match '"default_locale"\s*:\s*"([A-Za-z0-9_-]+)"') {
                     $locale = $Matches[1]
@@ -4255,12 +5171,11 @@ if ($Categories -contains "USB") {
                     Format-List
             }
 
-        # MountedDevices
-        Save-CommandOutput -Description "Mounted devices" `
-            -DestPath (Join-Path $usbDir "mounted_devices.txt") `
-            -Command {
-                Get-ItemProperty "HKLM:\SYSTEM\MountedDevices" -ErrorAction SilentlyContinue | Format-List
-            }
+        # MountedDevices: each drive letter and volume GUID with the GPT
+        # partition, MBR disk and offset, or device path behind it, decoded
+        # (the raw bytes stay in HexData)
+        Log "Collecting mounted devices..."
+        Save-TriageMountedDevices -UsbDir $usbDir
     } else {
         Log "Skipping USB registry queries (mounted image -- use collected SYSTEM hive for USB analysis)"
     }
@@ -4414,11 +5329,7 @@ if ($Categories -contains "Persistence") {
             # -Recurse -Force is safe here: the Tasks folder has no junctions
             $taskFiles = Get-ChildItem -Path $taskSourceDir -File -Recurse -Force -ErrorAction SilentlyContinue |
                 Where-Object { $_.Length -gt 0 } | Select-Object -First 200
-            $taskCount = 0
-            foreach ($tf in $taskFiles) {
-                Copy-ForensicFile -SourcePath $tf.FullName -DestDir $taskDestDir -DestName $tf.Name
-                if (Test-Path (Join-Path $taskDestDir $tf.Name)) { $taskCount++ }
-            }
+            $taskCount = Copy-ForensicFileSet -Files $taskFiles -DestDir $taskDestDir
             Log-Success "Collected $taskCount scheduled task XML file(s)."
         }
 
@@ -5810,7 +6721,13 @@ $script:collectionCompleted = $true
 # Defender exclusion are never left behind. (Closing the console window
 # kills the process outright; that cannot be caught.)
 } finally {
+    $global:FormatEnumerationLimit = $savedFormatEnumerationLimit
     Invoke-CollectionCleanup
+    # A stopped run ends here: the console's mode back as it was (after
+    # the cleanup, which a click must not pause). A finished run keeps
+    # QuickEdit off through the summary and the zip, and puts it back
+    # before the last prompt
+    if (-not $script:collectionCompleted) { Restore-ConsoleMode }
 }
 
 # =============================================================
@@ -5844,13 +6761,20 @@ try {
 $endTime = Get-Date
 $duration = $endTime - $script:startTime
 $zipPath = "$OutputPath.zip"
-# Memory dump, if captured: memory_dump.dmp (DumpIt) or memory_dump.raw
-$memDumpFile = $null
-foreach ($dumpExt in @("dmp", "raw")) {
-    $dumpCandidate = Join-Path $OutputPath "Memory\memory_dump.$dumpExt"
-    if ((Get-FileLength $dumpCandidate) -ge 0) { $memDumpFile = $dumpCandidate; break }
-}
+$zipCompleted = $false   # set once New-CollectionZip has written the whole zip
+# Memory dump: $script:memDumpPath, set by the memory section only for a
+# complete dump (in Memory\, or with -MemoryOutputPath outside the folder)
+$memDumpInCollection = [bool]($script:memDumpPath -and (Get-CollectionRelativePath $script:memDumpPath))
 $memDumpMovedTo = $null
+$memDumpRowMoved = $false     # its manifest row names the path next to the zip
+$memDumpMoveFailed = $false   # a dump could not be moved out of the folder: no zip
+# A failed dump the memory section could neither set aside nor delete (a
+# lock) is still under the dump's name: try once more. One still in the
+# collection folder then keeps the folder from being zipped
+if ($script:memDumpIncompletePath -and -not $script:memDumpIncompletePath.EndsWith(".incomplete", [System.StringComparison]::OrdinalIgnoreCase)) {
+    $script:memDumpIncompletePath = Move-IncompleteMemoryDump -DumpPath $script:memDumpIncompletePath
+}
+$memDumpIncompleteInCollection = [bool]($script:memDumpIncompletePath -and (Get-CollectionRelativePath $script:memDumpIncompletePath))
 
 $summaryLines = @(
     "============================================================="
@@ -5869,9 +6793,37 @@ if ($NoCompress) {
     $summaryLines += "  Output:         $OutputPath"
 } else {
     $summaryLines += "  Output:         $zipPath"
-    if ($memDumpFile) {
-        $summaryLines += "  Memory dump:    ${OutputPath}_$(Split-Path $memDumpFile -Leaf) (kept outside the zip)"
+}
+$memDumpSummaryIndex = -1   # the line to correct if the dump cannot be moved
+if ($memDumpInCollection -and -not $NoCompress) {
+    $memDumpSummaryIndex = $summaryLines.Count
+    $summaryLines += "  Memory dump:    ${OutputPath}_$([System.IO.Path]::GetFileName($script:memDumpPath)) (kept outside the zip)"
+} elseif ($script:memDumpPath) {
+    $summaryLines += "  Memory dump:    $($script:memDumpPath)"
+    # Not in the collection and not next to it (in the folder that holds
+    # the collection and its zip, under <collection>_memory_dump.<ext>, as
+    # -MemoryOutputPath names it): the timeline builder finds it through
+    # its row in the manifest, which has its full path and size, but only
+    # on a drive letter (it never opens a network path a manifest names).
+    # Next to the zip (or the folder) under this name it finds it on any
+    # machine, also when started from Run-TimelineBuilder.bat, which takes
+    # no path for the dump
+    if (-not $memDumpInCollection -and [System.IO.Path]::GetDirectoryName($script:memDumpPath) -ne [System.IO.Path]::GetDirectoryName($OutputPath)) {
+        $memDumpNextTo = "the zip"
+        if ($NoCompress) { $memDumpNextTo = "the collection folder" }
+        if ($script:memDumpPath -match '^[A-Za-z]:\\') {
+            $summaryLines += "                  (the timeline builder finds it here through collection_manifest.csv;"
+            $summaryLines += "                  if the dump is moved or analyzed on another machine, put it next"
+            $summaryLines += "                  to $memDumpNextTo under this name)"
+        } else {
+            $summaryLines += "                  (the timeline builder does not open a network path named in"
+            $summaryLines += "                  collection_manifest.csv: to analyze the dump, put it next to"
+            $summaryLines += "                  $memDumpNextTo under this name)"
+        }
     }
+}
+if ($script:memDumpIncompletePath) {
+    $summaryLines += "  Memory dump:    INCOMPLETE, not for analysis: $($script:memDumpIncompletePath)"
 }
 $summaryLines += "  Manifest:       collection_manifest.csv (inside collection)"
 $summaryLines += "============================================================="
@@ -5884,19 +6836,92 @@ Log "=== Windows Forensic Triage Collection Complete ==="
 # =============================================================
 # Compression
 # =============================================================
+
+# Zips a folder with '/' in every entry name, as the ZIP format requires
+# (APPNOTE 4.4.17.1); entries start with "<folder>/". Not
+# ZipFile.CreateFromDirectory: powershell.exe has no target framework, so
+# .NET Framework applies its 4.0 default for
+# Switch.System.IO.Compression.ZipFile.UseBackslash (true) and writes '\'
+# (turning the switch off is ignored once anything has read it). Same
+# writer as CreateFromDirectory (CreateEntryFromFile): Zip64 when needed,
+# Optimal, file times, every file (hidden ones too), and an entry per
+# empty folder. On any failure the partial zip is deleted and the error
+# is rethrown (the caller keeps the folder).
+function New-CollectionZip {
+    [OutputType([void])]
+    param(
+        [Parameter(Mandatory = $true)][string]$SourceDir,
+        [Parameter(Mandatory = $true)][string]$ZipPath
+    )
+    Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
+    $root = New-Object System.IO.DirectoryInfo ([System.IO.Path]::GetFullPath($SourceDir))
+    $rootPath = $root.FullName.TrimEnd('\')
+    $ZipPath = [System.IO.Path]::GetFullPath($ZipPath)
+    if ($ZipPath.StartsWith($rootPath + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Zip path $ZipPath is inside the folder being zipped"
+    }
+    if (-not $root.Parent) { throw "Cannot zip a drive root: $($root.FullName)" }
+    $prefixLen = $root.Parent.FullName.TrimEnd('\').Length + 1   # entries start with "<folder>/"
+    if ([System.IO.File]::Exists($ZipPath)) { [System.IO.File]::Delete($ZipPath) }
+    $archive = [System.IO.Compression.ZipFile]::Open($ZipPath, [System.IO.Compression.ZipArchiveMode]::Create)
+    $done = $false
+    try {
+        foreach ($item in $root.EnumerateFileSystemInfos('*', [System.IO.SearchOption]::AllDirectories)) {
+            $entryName = $item.FullName.Substring($prefixLen).Replace('\', '/')
+            if ($item -is [System.IO.FileInfo]) {
+                [void][System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($archive, $item.FullName, $entryName, [System.IO.Compression.CompressionLevel]::Optimal)
+            } else {
+                # Empty folder? The probe is disposed: an open one keeps the
+                # folder open until the GC runs, and the caller deletes it next
+                $probe = $item.EnumerateFileSystemInfos().GetEnumerator()
+                try { $isEmpty = -not $probe.MoveNext() } finally { $probe.Dispose() }
+                if ($isEmpty) { [void]$archive.CreateEntry($entryName + '/') }
+            }
+        }
+        $archive.Dispose()   # writes the central directory; can throw (disk full)
+        $done = $true
+    } finally {
+        if (-not $done) {
+            try { $archive.Dispose() } catch { Write-Verbose "Zip dispose after failure: $($_.Exception.Message)" }
+            try { [System.IO.File]::Delete($ZipPath) } catch { Write-Verbose "Could not delete partial zip: $($_.Exception.Message)" }
+        }
+    }
+}
+
 if (-not $NoCompress) {
     Log "============================================================="
     Log "  COMPRESSING OUTPUT"
     Log "============================================================="
 
     # Memory dump: kept next to the zip, not inside it (as large as RAM, slow
-    # to compress, and analysis tools need the file itself)
-    if ($memDumpFile) {
-        $dumpSizeGB = [math]::Round((Get-FileLength $memDumpFile) / 1GB, 2)
+    # to compress, and analysis tools need the file itself), and its row in
+    # the manifest names it there. One written with -MemoryOutputPath is
+    # already outside the folder. If it cannot be moved out, the folder is
+    # not zipped (the dump would be in the zip)
+    if ($memDumpInCollection) {
+        $dumpSizeGB = [math]::Round((Get-FileLength $script:memDumpPath) / 1GB, 2)
         Log "Memory dump detected ($dumpSizeGB GB) -- keeping it next to the zip."
         # Move dump out of the collection folder temporarily
-        $memDumpMovedTo = "${OutputPath}_$(Split-Path $memDumpFile -Leaf)"
-        Move-Item -LiteralPath $memDumpFile -Destination $memDumpMovedTo -Force
+        $memDumpMovedTo = "${OutputPath}_$([System.IO.Path]::GetFileName($script:memDumpPath))"
+        if ((Get-FileLength $memDumpMovedTo) -ge 0) {
+            Log-Warning "A file is already at the memory dump path next to the zip and will be replaced: $memDumpMovedTo"
+        }
+        try {
+            Move-Item -LiteralPath $script:memDumpPath -Destination $memDumpMovedTo -Force -ErrorAction Stop
+        } catch {
+            Log-Warning "Could not move the memory dump out of the collection folder, so the folder is not compressed: $($_.Exception.Message)"
+            Log "The collection is kept at: $OutputPath"
+            $memDumpMovedTo = $null
+            $memDumpMoveFailed = $true
+            # The summary (logged above, shown again at the end) names the
+            # path next to the zip: correct it
+            $summaryLines[$memDumpSummaryIndex] = "  Memory dump:    $($script:memDumpPath) (not moved out, the folder is not zipped)"
+            Log $summaryLines[$memDumpSummaryIndex]
+        }
+        # The manifest, zipped next, names where the dump is now
+        if ($memDumpMovedTo) {
+            $memDumpRowMoved = Set-ManifestDumpPath -OldPath $script:memDumpPath -NewPath $memDumpMovedTo
+        }
         # Remove empty Memory folder if only the dump was in it
         $memDir = Join-Path $OutputPath "Memory"
         $memDirContents = Get-ChildItem -LiteralPath $memDir -File -Force -ErrorAction SilentlyContinue
@@ -5904,15 +6929,36 @@ if (-not $NoCompress) {
             Remove-Item -LiteralPath $memDir -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
+    # A failed dump still in the folder (neither set aside nor deleted, also
+    # not on the second try before the summary) would be zipped under the
+    # dump's name and taken for a good one
+    if ($memDumpIncompleteInCollection) {
+        Log-Warning "The incomplete memory dump is still in the collection folder, so the folder is not compressed: $($script:memDumpIncompletePath)"
+        Log "The collection is kept at: $OutputPath (delete the incomplete dump from it before analysis)"
+        $memDumpMoveFailed = $true
+    }
+}
+
+if (-not $NoCompress -and -not $memDumpMoveFailed) {
+    # A file already at the zip path (an earlier run with the same
+    # -OutputPath) is replaced; its time tells it apart from this run's
+    # incomplete zip if compression fails
+    $oldZipTime = $null
+    if ((Get-FileLength $zipPath) -ge 0) {
+        $oldZipTime = [System.IO.File]::GetLastWriteTimeUtc($zipPath)
+        Log-Warning "A file is already at the zip path and will be replaced: $zipPath"
+    }
 
     Log "Compressing to: $zipPath"
     try {
-        # ZipFile instead of Compress-Archive: Compress-Archive in Windows
-        # PowerShell 5.1 fails on files over 2 GB (a large raw $MFT) and skips
-        # hidden files; ZipFile writes Zip64 and includes everything
-        Add-Type -AssemblyName System.IO.Compression.FileSystem
-        if ([System.IO.File]::Exists($zipPath)) { [System.IO.File]::Delete($zipPath) }
-        [System.IO.Compression.ZipFile]::CreateFromDirectory($OutputPath, $zipPath, [System.IO.Compression.CompressionLevel]::Optimal, $true)
+        # New-CollectionZip instead of Compress-Archive: Compress-Archive in
+        # Windows PowerShell 5.1 fails on files over 2 GB (a large raw $MFT)
+        # and skips hidden files. New-CollectionZip writes Zip64 when needed,
+        # includes everything and names entries with '/' in both editions; a
+        # zip it does not finish is deleted, so no incomplete zip is left for
+        # the timeline builder to pick up
+        New-CollectionZip -SourceDir $OutputPath -ZipPath $zipPath
+        $zipCompleted = $true
         $zipSize = [math]::Round((Get-FileLength $zipPath) / 1MB, 2)
         Log-Success "Compressed to $zipPath ($zipSize MB)"
 
@@ -5929,13 +6975,32 @@ if (-not $NoCompress) {
             Log "  (Not included in zip due to size. Transfer separately.)"
         }
     } catch {
-        Log-Warning "Compression or cleanup issue: $($_.Exception.Message)"
-        Log "Output may remain at: $OutputPath"
-        # Move dump back if compression failed
-        if ($memDumpMovedTo -and (Test-Path -LiteralPath $memDumpMovedTo)) {
+        if ($zipCompleted) {
+            Log-Warning "Zip complete, but the uncompressed folder was not fully removed: $($_.Exception.Message)"
+            Log "Delete the rest of it by hand: $OutputPath"
+        } else {
+            Log-Warning "Compression failed, no zip created: $($_.Exception.Message)"
+            Log "The collection is kept at: $OutputPath"
+            if ((Get-FileLength $zipPath) -ge 0) {
+                if ($null -ne $oldZipTime -and [System.IO.File]::GetLastWriteTimeUtc($zipPath) -eq $oldZipTime) {
+                    Log-Warning "The file already at the zip path could not be replaced; it is not from this run, check it before deleting it: $zipPath"
+                } else {
+                    Log-Warning "Could not delete the incomplete zip, delete it by hand: $zipPath"
+                }
+            }
+        }
+        # Move dump back if compression failed. Not after a complete zip: the
+        # folder is then to be deleted, and the dump stays next to the zip
+        if (-not $zipCompleted -and $memDumpMovedTo -and (Test-Path -LiteralPath $memDumpMovedTo)) {
             $memDir = Join-Path $OutputPath "Memory"
             Ensure-Directory $memDir
-            Move-Item -LiteralPath $memDumpMovedTo -Destination $memDumpFile -Force
+            Move-Item -LiteralPath $memDumpMovedTo -Destination $script:memDumpPath -Force
+            # Back in Memory\: so are its manifest row and summary line
+            if ((Get-FileLength $script:memDumpPath) -ge 0) {
+                if ($memDumpRowMoved) { [void](Set-ManifestDumpPath -OldPath $memDumpMovedTo -NewPath $script:memDumpPath) }
+                $summaryLines[$memDumpSummaryIndex] = "  Memory dump:    $($script:memDumpPath) (moved back, no zip was created)"
+                Log $summaryLines[$memDumpSummaryIndex]
+            }
         }
     }
 }
@@ -5946,7 +7011,7 @@ if (-not $NoCompress) {
 Write-Host ""
 foreach ($summaryLine in $summaryLines) { Write-Host $summaryLine }
 if (-not $NoCompress) {
-    if ((Get-FileLength $zipPath) -gt 0) {
+    if ($zipCompleted) {
         Write-Host "  Zip created:    $zipPath ($([math]::Round((Get-FileLength $zipPath) / 1MB, 2)) MB)" -ForegroundColor Green
     } else {
         Write-Host "  Zip NOT created -- collection left at: $OutputPath" -ForegroundColor Yellow
@@ -5955,7 +7020,15 @@ if (-not $NoCompress) {
 if ($memDumpMovedTo -and (Test-Path -LiteralPath $memDumpMovedTo)) {
     $dumpGB = [math]::Round((Get-FileLength $memDumpMovedTo) / 1GB, 2)
     Write-Host "  Memory dump:    $memDumpMovedTo ($dumpGB GB)"
+} elseif ($script:memDumpPath -and (Test-Path -LiteralPath $script:memDumpPath)) {
+    # -NoCompress, -MemoryOutputPath, or moved back after a failed zip
+    $dumpGB = [math]::Round((Get-FileLength $script:memDumpPath) / 1GB, 2)
+    Write-Host "  Memory dump:    $($script:memDumpPath) ($dumpGB GB)"
 }
+
+# The run is done: the console's mode back as it was before it (QuickEdit),
+# so the summary can be selected with the mouse again
+Restore-ConsoleMode
 
 if (-not $Unattended) {
     Write-Host ""

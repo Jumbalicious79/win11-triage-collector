@@ -224,6 +224,14 @@ write a raw image (memory_dump.raw).
 
 Use -NoCompress to keep the uncompressed folder instead.
 
+Entry names in the zip use "/" as the ZIP format requires, so tools on Linux
+and macOS (unzip, Python zipfile) extract the folders too. Zips from earlier
+versions run by the .bat launcher (Windows PowerShell 5.1) use "\"; Windows
+tools and the timeline builder read both. A file already at the zip path
+(an earlier run with the same -OutputPath) is replaced, and the log says so.
+If compression fails, the incomplete zip is deleted, the uncompressed folder
+is kept and the log says why.
+
 Inside the zip:
 
   TriageCollection_2026-04-08_08-04\
@@ -948,9 +956,14 @@ The fastest path from collection to analysis:
     letter to get them.
     Warning: "Raw $MFT, $LogFile and $UsnJrnl:$J not collected: cannot open \\.\C: (...)"
 
-  - Very large volumes (millions of files) can have a $MFT over 2 GB. If the
-    zip step fails on it, the uncompressed collection folder is kept (see the
-    log); run with -NoCompress and compress with another tool in that case.
+  - Very large volumes (millions of files) can have a $MFT of several GB,
+    and the SRUM database (copied up to 16 GB) can also pass 4 GB.
+    The zip handles files that large (Zip64), but a FAT32 output drive
+    (common on USB sticks) cannot hold any file over 4 GB, so on FAT32 such
+    a copy, or a zip that would grow past 4 GB, fails: use an NTFS or exFAT
+    output drive. When the zip step fails, the incomplete zip is deleted and
+    the uncompressed collection folder is kept (see the log), so it can be
+    compressed with another tool; -NoCompress skips the zip step.
 
   - Per-user live registry data (Run/RunOnce keys, RecentApps) covers every
     user whose hive is loaded, i.e. users logged in at collection time, not
@@ -1371,6 +1384,17 @@ capture before collection begins.
     snapshots, extension manifests) count such a file and its size toward
     the cap.
       powershell -ExecutionPolicy Bypass -File tests\Test-CollectionLogging.ps1
+
+  tests\Test-CollectionZip.ps1 (no admin needed; also runs in CI)
+    Zips a small folder the way the collector zips the collection and
+    checks the zip: every entry name uses "/" and starts with the folder
+    name; an empty folder has its own entry; a hidden system file, a
+    non-ASCII name and a name with [ ] are included; contents (SHA256) and
+    file times (within 2 seconds) match. A zip path inside the folder is
+    refused, and a zip that fails (a locked file) is deleted. In Windows
+    PowerShell 5.1 it also checks that ZipFile.CreateFromDirectory, used by
+    earlier versions, writes "\" there.
+      powershell -ExecutionPolicy Bypass -File tests\Test-CollectionZip.ps1
 
   Planted-activity test (both tools, end to end, on a live machine)
     1. In a normal (not elevated) PowerShell window, as the user to test:

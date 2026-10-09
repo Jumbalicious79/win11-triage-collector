@@ -365,7 +365,12 @@ function Format-SpaceGB {
 #   Collection: counted only when the collection folder is on this volume
 #     too (-WithCollection): 4 GB with the raw NTFS copies (FileSystem
 #     without -SkipLargeFiles), else 1 GB; x 1.25 when it is zipped (the
-#     folder and the zip exist at the same time).
+#     folder and the zip exist at the same time). A typical size, not an
+#     upper limit: the parts with size caps of their own (e-mail
+#     attachments, SRUM, browser history snapshots, the larger event logs,
+#     -IncludeThunderbirdIndex) are not counted at those caps: that would
+#     rate many captures that fit as NoFit and skip them. The reserve on
+#     the system drive is the margin for them.
 #   Reserve: on the system drive (the one being examined; Windows keeps
 #     writing to it, and Storage Sense deletes files when it runs low),
 #     10% of the volume, at least 4 and at most 20 GB, or -MinFreeSpaceGB.

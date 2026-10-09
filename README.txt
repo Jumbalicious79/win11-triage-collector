@@ -1381,10 +1381,16 @@ capture before collection begins.
            dump goes, for the dump (RAM + 1 MB for DumpIt, RAM x 1.05 for
            a raw image) and, on the collection's drive, ~5 GB for the
            collection and its zip (4 GB with the raw NTFS copies, else
-           1 GB; x 1.25 unless -NoCompress). On the system drive it keeps
-           a reserve free, since Windows keeps writing there: 10% of the
-           volume, at least 4 and at most 20 GB, or -MinFreeSpaceGB. On
-           other drives 1 GB. The prompt shows these numbers, for example
+           1 GB; x 1.25 unless -NoCompress). That is a typical size, not
+           an upper limit: the parts with size caps of their own are not
+           counted at those caps (e-mail attachments, up to 2 GB; SRUM;
+           the browser history snapshots; the larger event logs;
+           -IncludeThunderbirdIndex) and can add several GB. On the system
+           drive it keeps a reserve free, since Windows keeps writing
+           there: 10% of the volume, at least 4 and at most 20 GB, or
+           -MinFreeSpaceGB (raise it when those parts are expected to be
+           large). On other drives 1 GB. The prompt shows these numbers,
+           for example
              Free space on C:\: 40.8 GB; memory dump ~31.9 GB + collection
              ~5 GB would leave ~3.9 GB (to keep free on the system drive:
              20 GB)

@@ -135,6 +135,10 @@ jobs:
         if: ${{ !cancelled() }}
         run: ./tests/Test-MountedDevices.ps1
 
+      - name: Run memory acquisition log test
+        if: ${{ !cancelled() }}
+        run: ./tests/Test-MemoryAcquisitionLog.ps1
+
   analyze:
     name: PSScriptAnalyzer
     runs-on: windows-latest

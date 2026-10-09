@@ -707,6 +707,29 @@ function Save-CommandOutput {
 }
 
 # ----------------------------------------------------------
+# Helper: Save the memory capture tool's output as the acquisition log
+# (the only record of DumpIt's SHA-256 and NtStatus) and record it in the
+# manifest. It stays in the collection folder, so it is in the zip. A
+# write error is left to the caller's catch.
+# ----------------------------------------------------------
+function Save-MemoryAcquisitionLog {
+    [OutputType([void])]
+    param(
+        [object[]]$Output,
+        [string]$LogPath,
+        [string]$ToolName
+    )
+    # A tool that printed nothing would leave a 0-byte file (pwsh), which
+    # Record-Manifest deletes, or only a BOM (5.1): write a note instead
+    if ($null -eq $Output -or $Output.Count -eq 0) {
+        $Output = @("(no output from $ToolName)")
+    }
+    Ensure-Directory (Split-Path $LogPath -Parent)
+    $Output | Out-File -LiteralPath $LogPath -Encoding utf8
+    Record-Manifest -SourcePath "(memory capture tool output: $ToolName)" -DestPath $LogPath
+}
+
+# ----------------------------------------------------------
 # Helper: Volume Shadow Copy for locked files
 # ----------------------------------------------------------
 $script:shadowId = $null
@@ -1268,8 +1291,8 @@ if ($Categories -contains "Memory") {
                     }
                 }
 
-                # Save tool output as acquisition log
-                $result | Out-File $memLogFile -Encoding utf8
+                # Save tool output as acquisition log, listed in the manifest
+                Save-MemoryAcquisitionLog -Output $result -LogPath $memLogFile -ToolName $memToolName
 
                 if ((Get-FileLength $dumpFile) -gt 0) {
                     $dumpSizeGB = [math]::Round((Get-FileLength $dumpFile) / 1GB, 2)

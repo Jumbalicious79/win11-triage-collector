@@ -396,6 +396,10 @@ Inside the zip:
                      pristine memory state before other collection.
                      Requires a capture tool in tools\ -- see Optional Tools.
                      Saved separately from the zip due to size.
+  Acquisition log    memory_acquisition_log.txt: the capture tool's output,
+                     for DumpIt the only record of its SHA-256 of the dump
+                     and its NtStatus. Kept in the zip and listed in the
+                     manifest.
 
 ### FileSystem
 
@@ -797,7 +801,9 @@ when the analysis machine uses a different time zone or locale.
   SourcePath           Original path; "HKLM\..." / "HKU\..." for reg save,
                        "(shadow)..." for shadow copies, "(command: ...)" for
                        command output, "(raw NTFS \\.\C: $MFT)" etc. for the
-                       raw NTFS copies
+                       raw NTFS copies, "(memory dump via <tool>)" and
+                       "(memory capture tool output: <tool>)" for the memory
+                       dump and Memory\memory_acquisition_log.txt
   DestPath             Full path of the copy at collection time
   SizeBytes            Size of the copy
   CollectedAt          Collector's local time when the file was recorded
@@ -1451,6 +1457,19 @@ capture before collection begins.
     the .txt files are not cut after 4 items, also when it is run from an
     open PowerShell window, and restores it afterwards.
       powershell -ExecutionPolicy Bypass -File tests\Test-MountedDevices.ps1
+
+  tests\Test-MemoryAcquisitionLog.ps1 (no admin needed; also runs in CI)
+    Runs a stand-in capture tool (a .cmd file that prints DumpIt-like
+    lines, one of them on stderr) and saves its output the way the
+    collector does: every line is in Memory\memory_acquisition_log.txt,
+    which is listed in the manifest with its hash and size, with no log
+    line and no error; a tool that prints nothing gives a log with a note,
+    also listed. The collection folders have [ ] in their names. Also
+    checks that the collector saves the log only this way, right after
+    the tool runs and before it checks the dump (so a failed capture also
+    has its log), and writes nothing to it afterwards, so the hash in the
+    manifest matches the file.
+      powershell -ExecutionPolicy Bypass -File tests\Test-MemoryAcquisitionLog.ps1
 
   Planted-activity test (both tools, end to end, on a live machine)
     1. In a normal (not elevated) PowerShell window, as the user to test:

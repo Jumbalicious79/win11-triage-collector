@@ -1025,10 +1025,15 @@ The fastest path from collection to analysis:
   - SRUM: on a live system SRUDB.dat is open, so its copy is normally in
     "dirty shutdown" state; its logs are collected with it from the same
     shadow copy and the timeline builder replays them into a temp copy.
-    When SRUDB.dat cannot be read from the shadow copy, the files come from
-    the volume and may be from slightly different moments; the builder may
-    then have to repair its copy, which can lose the newest records. A
-    system without the sru folder gets an info line, not a warning.
+    When SRUDB.dat cannot be read from the shadow copy (the line gives the
+    reason when the copy failed), the files come from the volume and may be
+    from slightly different moments; the builder may then have to repair
+    its copy, which can lose the newest records. A file that is 0 bytes in
+    the shadow copy is skipped with an info line and is not counted as an
+    error (it is not taken from the volume instead, so all files stay from
+    one moment); a failed copy from the shadow copy gives a warning with
+    the reason. A system without the sru folder gets an info line, not a
+    warning.
     Message: "SRUDB.dat could not be read from the shadow copy -- the SRUM files are copied from the volume ..."
     Warning: "Skipped SRUM file ... larger than the 16384 MB size cap"
 
@@ -1329,7 +1334,11 @@ capture before collection begins.
     manifest with its hash and original time; an empty one is logged as
     skipped and is not an error; a missing one is "Not present"; a locked
     one gives a warning with the reason and counts one error; with -Quiet
-    nothing is logged or counted.
+    nothing is logged or counted. Also checks the SRUM collection, which
+    reports these outcomes itself: an empty SRUM file in the snapshot is an
+    info line, not an error; a locked one is a warning with the reason;
+    with SRUDB.dat locked in the snapshot, the files come from the volume
+    and the info line gives the reason.
       powershell -ExecutionPolicy Bypass -File tests\Test-ShadowCopy.ps1
 
   Planted-activity test (both tools, end to end, on a live machine)

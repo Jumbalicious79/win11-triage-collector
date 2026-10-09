@@ -2814,7 +2814,9 @@ function Copy-TriageSrumFiles {
         if ($dbSize -le $MaxBytes) {
             $useShadow = Copy-FromShadow -RelativePath "$relDir\SRUDB.dat" -DestDir $DestDir -DestName "SRUDB.dat" -Quiet
             if (-not $useShadow) {
-                Log "SRUDB.dat could not be read from the shadow copy -- the SRUM files are copied from the volume (the database and its logs may be from slightly different moments)."
+                $why = ""
+                if ($script:lastShadowCopyReason) { $why = " ($($script:lastShadowCopyReason))" }
+                Log "SRUDB.dat could not be read from the shadow copy$why -- the SRUM files are copied from the volume (the database and its logs may be from slightly different moments)."
             }
         }
     }
@@ -2834,12 +2836,18 @@ function Copy-TriageSrumFiles {
             }
             if (Copy-FromShadow -RelativePath "$relDir\$name" -DestDir $DestDir -DestName $name -Quiet) {
                 $count++
-            } elseif ($null -ne $shadowNames) {
-                Log-Warning "Could not copy SRUM file $name from the shadow copy"
-                $script:errorCount++
-            } else {
+            } elseif ($script:lastShadowCopyResult -eq "Empty") {
+                # 0 bytes in the snapshot: nothing to collect, not an error.
+                # Not taken from the volume instead: all files are from one moment
+                Log "Skipped empty file (0 bytes in the shadow copy): $relDir\$name"
+            } elseif ($script:lastShadowCopyResult -eq "NotFound" -and $null -eq $shadowNames) {
                 # Listed on the volume only: newer than the shadow copy
                 Log "SRUM file not in the shadow copy (newer than the database copy) -- skipped: $name"
+            } else {
+                $reason = $script:lastShadowCopyReason
+                if (-not $reason) { $reason = "not found in the shadow copy" }
+                Log-Warning "Could not copy SRUM file $name from the shadow copy -- $reason"
+                $script:errorCount++
             }
         }
     } else {

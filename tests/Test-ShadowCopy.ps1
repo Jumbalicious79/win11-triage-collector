@@ -6,9 +6,11 @@
 # hive .LOG2) is logged as skipped and is not an error; a file missing from
 # the snapshot is "Not present"; a failed copy is a warning that gives the
 # reason and counts one error; -Quiet leaves all reporting to the caller.
-# Also checks $script:lastShadowCopyResult for every case. A folder stands
-# in for the shadow copy, so no snapshot is made and no admin rights are
-# needed. Exit code 0 = pass, 1 = fail.
+# Also checks $script:lastShadowCopyResult for every case, and the SRUM
+# collection (Copy-TriageSrumFiles), which reports each outcome itself: an
+# empty snapshot file is an info line, not an error, and a failed copy
+# gives the reason. A folder stands in for the shadow copy, so no snapshot
+# is made and no admin rights are needed. Exit code 0 = pass, 1 = fail.
 #
 #   powershell -ExecutionPolicy Bypass -File tests\Test-ShadowCopy.ps1
 # =============================================================
@@ -246,6 +248,99 @@ try {
             Note   = ($problems -join "; ")
         })
     }
+
+    # --- A caller that reports the outcome itself: the SRUM collection ---
+    # When SRUDB.dat can be read from the shadow copy, Copy-TriageSrumFiles
+    # takes every SRUM file from there with -Quiet and logs each outcome: a
+    # file that is 0 bytes in the snapshot is an info line, not an error; a
+    # failed copy is a warning with the reason. When SRUDB.dat itself cannot
+    # be read there, the info line gives the reason and the files come from
+    # the volume (where an empty file is skipped silently)
+    function Add-SrumResult {
+        param([string]$What, [string]$Expect, [System.Collections.Generic.List[string]]$Problems)
+        if ($Problems.Count -gt 0) { $script:failures++ }
+        $results.Add([PSCustomObject]@{
+            Result = $(if ($Problems.Count -gt 0) { "FAIL" } else { "PASS" })
+            Case   = $What
+            Expect = $Expect
+            Note   = ($Problems -join "; ")
+        })
+    }
+    # Runs Copy-TriageSrumFiles on the volume's sru folder; returns the log
+    # lines it added, how much the error count went up and the files copied
+    function Invoke-SrumCopy {
+        param([string]$DestDir)
+        $logBefore = Get-LogLines
+        $errorsBefore = $script:errorCount
+        # As above: the collector's own error preference
+        $ErrorActionPreference = "Continue"
+        Copy-TriageSrumFiles -SourceDir $volumeSru -DestDir $DestDir -MaxBytes 16GB
+        $names = [string[]]@(Get-ChildItem -LiteralPath $DestDir -Force -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
+        [System.Array]::Sort($names, [System.StringComparer]::Ordinal)
+        return [PSCustomObject]@{
+            Log    = @(Get-LogLines | Select-Object -Skip $logBefore.Count)
+            Errors = $script:errorCount - $errorsBefore
+            Files  = ($names -join ", ")
+        }
+    }
+
+    # The same SRUM file names in the snapshot and on the volume;
+    # SRUtmp.log is empty in both, SRU.log is locked in the snapshot
+    $sruRel = "Windows\System32\sru"
+    $volumeSru = Join-Path $targetDir $sruRel
+    New-Item -ItemType Directory -Path $volumeSru -Force | Out-Null
+    $sruSizes = [ordered]@{ "SRUDB.dat" = 65536; "SRU.chk" = 8192; "SRU.log" = 16384; "SRUtmp.log" = 0 }
+    foreach ($name in $sruSizes.Keys) {
+        $null = New-SnapshotFile "$sruRel\$name" $sruSizes[$name]
+        $bytes = New-Object byte[] $sruSizes[$name]
+        $random.NextBytes($bytes)
+        [System.IO.File]::WriteAllBytes((Join-Path $volumeSru $name), $bytes)
+    }
+    $locks.Add([System.IO.File]::Open((Join-Path $snapshotDir "$sruRel\SRU.log"), "Open", "Read", "None"))
+
+    Write-Host "Case: SRUM collection from the snapshot ($sruRel)"
+    $srum = Invoke-SrumCopy (Join-Path $OutputPath "Execution\SRUM")
+
+    $problems = New-Object System.Collections.Generic.List[string]
+    $emptyPattern = '\] Skipped empty file \(0 bytes in the shadow copy\): ' + [regex]::Escape("$sruRel\SRUtmp.log") + '$'
+    if (@($srum.Log | Where-Object { $_ -match $emptyPattern }).Count -ne 1) { $problems.Add("no info line for the empty SRUtmp.log") }
+    $emptyWarnings = @($srum.Log | Where-Object { $_ -match 'WARNING' -and $_ -match 'SRUtmp\.log' })
+    if ($emptyWarnings.Count -gt 0) { $problems.Add("warning: $($emptyWarnings -join ' | ')") }
+    Add-SrumResult -What "SRUM: empty file in the snapshot" -Expect "info, no error" -Problems $problems
+
+    $problems = New-Object System.Collections.Generic.List[string]
+    $lockedPattern = '\] WARNING: Could not copy SRUM file SRU\.log from the shadow copy -- (.+)$'
+    $lockedLines = @($srum.Log | Where-Object { $_ -match $lockedPattern })
+    if ($lockedLines.Count -ne 1) {
+        $problems.Add("log: expected one line matching '$lockedPattern', got: $($srum.Log -join ' | ')")
+    } elseif ($lockedLines[0] -match $lockedPattern -and $Matches[1].IndexOf("SRU.log", [System.StringComparison]::OrdinalIgnoreCase) -lt 0) {
+        $problems.Add("warning reason is not the copy error: $($Matches[1])")
+    }
+    if ($srum.Errors -ne 1) { $problems.Add("error count went up by $($srum.Errors), expected 1 (the locked file only)") }
+    Add-SrumResult -What "SRUM: locked file in the snapshot" -Expect "warning with reason" -Problems $problems
+
+    $problems = New-Object System.Collections.Generic.List[string]
+    if ($srum.Files -ne "SRU.chk, SRUDB.dat") { $problems.Add("collected: $($srum.Files)") }
+    if (@($srum.Log | Where-Object { $_ -match 'OK: Collected 2 SRUM file\(s\) \(from the shadow copy\)\.$' }).Count -ne 1) { $problems.Add("no 'Collected 2 SRUM file(s) (from the shadow copy)' line") }
+    Add-SrumResult -What "SRUM: non-empty files copied" -Expect "Copied" -Problems $problems
+
+    # SRUDB.dat locked in the snapshot too: everything from the volume
+    $locks.Add([System.IO.File]::Open((Join-Path $snapshotDir "$sruRel\SRUDB.dat"), "Open", "Read", "None"))
+    Write-Host "Case: SRUM collection, SRUDB.dat locked in the snapshot"
+    $srum = Invoke-SrumCopy (Join-Path $OutputPath "Execution2\SRUM")
+    $problems = New-Object System.Collections.Generic.List[string]
+    $dbPattern = '\] SRUDB\.dat could not be read from the shadow copy \((.+)\) -- the SRUM files are copied from the volume '
+    $dbLines = @($srum.Log | Where-Object { $_ -match $dbPattern })
+    if ($dbLines.Count -ne 1) {
+        $problems.Add("log: expected one line matching '$dbPattern', got: $($srum.Log -join ' | ')")
+    } elseif ($dbLines[0] -match $dbPattern -and $Matches[1].IndexOf("SRUDB.dat", [System.StringComparison]::OrdinalIgnoreCase) -lt 0) {
+        $problems.Add("reason is not the copy error: $($Matches[1])")
+    }
+    $warnings = @($srum.Log | Where-Object { $_ -match 'WARNING' })
+    if ($warnings.Count -gt 0 -or $srum.Errors -ne 0) { $problems.Add("$($srum.Errors) error(s), warnings: $($warnings -join ' | ')") }
+    if ($srum.Files -ne "SRU.chk, SRU.log, SRUDB.dat") { $problems.Add("collected: $($srum.Files)") }
+    if (@($srum.Log | Where-Object { $_ -match 'OK: Collected 3 SRUM file\(s\) \(from the volume\)\.$' }).Count -ne 1) { $problems.Add("no 'Collected 3 SRUM file(s) (from the volume)' line") }
+    Add-SrumResult -What "SRUM: SRUDB.dat locked" -Expect "reason, from the volume" -Problems $problems
 }
 catch {
     $failures++

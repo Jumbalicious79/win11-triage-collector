@@ -10,8 +10,25 @@ param(
     [switch]$NoCompress,
     [ValidatePattern('^[A-Za-z]$')]
     [string]$TargetDrive = "",
-    [ValidateSet("Memory","FileSystem","Registry","EventLogs","Execution","Network","UserActivity","Browser","USB","Persistence","AntiVirus")]
-    [string[]]$Categories = @("FileSystem","Registry","EventLogs","Execution","Network","UserActivity","Browser","USB","Persistence","AntiVirus")
+    [ValidateSet("Memory","FileSystem","Registry","EventLogs","Execution","Network","UserActivity","Browser","USB","Persistence","AntiVirus","Email")]
+    [string[]]$Categories = @("FileSystem","Registry","EventLogs","Execution","Network","UserActivity","Browser","USB","Persistence","AntiVirus","Email"),
+    # No prompts (scripts and tests): the target is the live system drive unless
+    # -TargetDrive is given, memory is captured only when -Categories includes
+    # Memory, and there is no "Press any key" at the end
+    [switch]$Unattended,
+    # Email category: also copy Thunderbird's global-messages-db.sqlite search
+    # index. Off by default: besides the headers it holds the text of the
+    # indexed messages
+    [switch]$IncludeThunderbirdIndex,
+    # Authorized examinations only: copy the browser settings and session files
+    # UNREDACTED (no private/secret value is blanked) and collect the DPAPI
+    # credential material (per-user master keys, CREDHIST, Credentials and
+    # Vault, plus the system master keys) into a top-level Secrets folder. Off
+    # by default. The collection then holds secrets equivalent to saved
+    # passwords and session cookies and must be handled like a password store.
+    # Chrome/Edge App-Bound Encryption can only be undone on the live machine;
+    # that is not attempted here (see README).
+    [switch]$IncludeSecrets
 )
 
 # --- Require Administrator ---
@@ -23,13 +40,19 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
     Write-Host "  Option 1: Double-click Run-TriageCollector.bat (recommended)" -ForegroundColor Yellow
     Write-Host "  Option 2: powershell -ExecutionPolicy Bypass -NoProfile -File `"$PSCommandPath`"" -ForegroundColor Yellow
     Write-Host ""
-    pause
+    if (-not $Unattended) { pause }
     exit 1
 }
 
 $ErrorActionPreference = "Continue"
 $script:startTime = Get-Date
 $timestamp = Get-Date -Format "yyyy-MM-dd_HH-mm"
+
+# -IncludeSecrets (see the param comment): read in the Browser section (every
+# privacy redaction is skipped so the copies hash-equal the originals) and the
+# Secrets section (credential material). Set here so it is available before
+# both run.
+$script:triageIncludeSecrets = [bool]$IncludeSecrets
 
 # --- Helper: detect Windows installation root on a drive ---
 # Handles both direct (G:\Windows\System32) and nested triage formats
@@ -54,6 +77,10 @@ function Find-WindowsRoot {
 }
 
 # --- Resolve target drive: interactive menu if not specified ---
+if (-not $TargetDrive -and $Unattended) {
+    $TargetDrive = ($env:SystemDrive)[0]
+    $script:TargetRootOverride = $null
+}
 if (-not $TargetDrive) {
     # Detect available drives that look like Windows volumes
     $systemDriveLetter = ($env:SystemDrive)[0]
@@ -157,7 +184,7 @@ $script:IsLive = ("${TargetDrive}:" -eq $env:SystemDrive)
 # Validate target drive
 if (-not (Test-Path $script:TargetRoot)) {
     Write-Host "ERROR: Drive ${TargetDrive}: does not exist or is not accessible." -ForegroundColor Red
-    pause
+    if (-not $Unattended) { pause }
     exit 1
 }
 if (-not (Test-Path "${script:TargetRoot}Windows\System32")) {
@@ -229,8 +256,9 @@ function Find-MemoryCaptureTool {
 }
 
 # --- Interactive memory capture prompt ---
-# Only show if: live system, Memory not already in Categories, and a tool exists
-if ($script:IsLive -and ($Categories -notcontains "Memory")) {
+# Only show if: live system, Memory not already in Categories, a tool exists,
+# and not -Unattended
+if ($script:IsLive -and ($Categories -notcontains "Memory") -and -not $Unattended) {
     $memCaptureTool = Find-MemoryCaptureTool
     foreach ($skipped in $script:skippedMemTools) {
         Write-Host "Memory capture: $skipped -- skipped (this is an ARM64 machine)." -ForegroundColor DarkGray
@@ -437,8 +465,9 @@ $script:errorCount = 0
 $script:totalBytes = 0
 # How the last Copy-ForensicFile call made its copy, for callers that report
 # the outcome themselves (Copy-HiveFile): "direct copy", or for a locked file
-# "shadow copy" / "raw NTFS read"; "" when it made none. Whether the copy was
-# kept (recorded in the manifest) shows in $script:fileCount
+# (with -FallbackOnAccessDenied also an access-denied one) "shadow copy" /
+# "raw NTFS read"; "" when it made none. Whether the copy was kept (recorded
+# in the manifest) shows in $script:fileCount
 $script:lastForensicCopyMethod = ""
 
 function Copy-ForensicFile {
@@ -446,7 +475,12 @@ function Copy-ForensicFile {
     param(
         [string]$SourcePath,
         [string]$DestDir,
-        [string]$DestName = ""
+        [string]$DestName = "",
+        # Access-denied files (the ACL-protected system DPAPI master keys) are
+        # read from the shadow copy / by raw NTFS read, like locked files.
+        # Only the Secrets section sets this, so default collection is
+        # unchanged (an access-denied file is otherwise just logged).
+        [switch]$FallbackOnAccessDenied
     )
 
     $script:lastForensicCopyMethod = ""
@@ -524,21 +558,26 @@ function Copy-ForensicFile {
     } catch { Write-Verbose "Copy-Item fallback for ${SourcePath}: $($_.Exception.Message)" }
 
     # File is in use (sharing/lock violation) on a live system, e.g. a browser
-    # database: read it from the Volume Shadow Copy instead
+    # database: read it from the Volume Shadow Copy instead. With
+    # -FallbackOnAccessDenied the same fallback runs for an access-denied file
+    # (0x80070005): the shadow copy / raw NTFS read reach the ACL-protected
+    # system DPAPI master keys. The raw NTFS read bypasses the ACL entirely.
     $inUse = $copyError -and (($copyError.HResult -eq -2147024864) -or ($copyError.HResult -eq -2147024863))
-    if ($script:IsLive -and $inUse) {
+    $accessDenied = $FallbackOnAccessDenied -and $copyError -and ($copyError.HResult -eq -2147024891)
+    $cause = if ($inUse) { "file in use" } else { "access denied" }
+    if ($script:IsLive -and ($inUse -or $accessDenied)) {
         $relPath = Get-TargetRelativePath $SourcePath
         if ($relPath) {
             if (Copy-FromShadow -RelativePath $relPath -DestDir $DestDir -DestName $DestName -Quiet) {
                 $script:lastForensicCopyMethod = "shadow copy"
-                Log "Collected from shadow copy (file in use): $SourcePath"
+                Log "Collected from shadow copy ($cause): $SourcePath"
                 return
             }
             # Not in the shadow copy (created after it was taken) or no shadow
             # copy possible: read the file straight from the volume
             if (Copy-TriageRawFile -SourcePath $SourcePath -DestPath $destPath -SourceTimes $srcTimes) {
                 $script:lastForensicCopyMethod = "raw NTFS read"
-                Log "Collected by raw NTFS read (file in use, not available from a shadow copy): $SourcePath"
+                Log "Collected by raw NTFS read ($cause, not available from a shadow copy): $SourcePath"
                 return
             }
             # SQLite journal/WAL companions (History-journal, Cookies-journal,
@@ -548,7 +587,10 @@ function Copy-ForensicFile {
                 Log "Skipped (in use, not in the shadow copy; temporary database journal): $SourcePath"
                 return
             }
-            Log-Warning "Could not copy (locked; shadow copy and raw NTFS read also failed): $SourcePath"
+            # Default-path wording for the in-use case is unchanged ("locked");
+            # "access denied" is reached only with -FallbackOnAccessDenied.
+            $failCause = if ($inUse) { "locked" } else { "access denied" }
+            Log-Warning "Could not copy ($failCause; shadow copy and raw NTFS read also failed): $SourcePath"
             $script:errorCount++
             return
         }
@@ -558,6 +600,8 @@ function Copy-ForensicFile {
     if ($copyError) { $reason = $copyError.Message }
     if ($inUse) {
         Log-Warning "Could not copy (locked): $SourcePath"
+    } elseif ($accessDenied) {
+        Log-Warning "Could not copy (access denied): $SourcePath"
     } else {
         Log-Warning "Could not copy: $SourcePath -- $reason"
     }
@@ -633,6 +677,9 @@ function Record-Manifest {
         [System.IO.File]::AppendAllText($manifestFile, $line + "`r`n", (New-Object System.Text.UTF8Encoding($false)))
         $script:fileCount++
         $script:totalBytes += $fileSize
+        # Final path of the last recorded copy (Copy-ForensicFile may have
+        # shortened its name; the Email section lists where each copy went)
+        $script:lastRecordedDestPath = $DestPath
     } catch {
         Log-Warning "Could not hash/record: $DestPath -- $($_.Exception.Message)"
     }
@@ -885,6 +932,23 @@ function Copy-HiveFile {
     if ($script:errorCount -eq $errorsBefore) { $script:errorCount++ }
 }
 
+# Names of the files (not folders) in a folder of the shadow copy (path
+# relative to TargetRoot), or $null if there is no shadow copy or the folder
+# cannot be listed. .NET first; Windows PowerShell 5.1 (.NET Framework) may
+# refuse \\?\GLOBALROOT paths, so cmd's dir is the fallback, as cmd copy is
+# in Copy-FromShadow.
+function Get-ShadowFileNames {
+    param([string]$RelativePath)
+    if (-not $script:shadowPath) { return $null }
+    $shadowDir = "$($script:shadowPath)\$RelativePath"
+    try {
+        return , @([System.IO.Directory]::GetFiles($shadowDir) | ForEach-Object { [System.IO.Path]::GetFileName($_) })
+    } catch { Write-Verbose "Listing $shadowDir with .NET: $($_.Exception.Message)" }
+    $listing = @(cmd /c "dir /b /a:-d `"$shadowDir`" 2>nul")
+    if ($LASTEXITCODE -ne 0) { return $null }
+    return , @($listing | ForEach-Object { "$_".Trim() } | Where-Object { $_ })
+}
+
 function Remove-ShadowCopy {
     if ($script:shadowId) {
         Log "Removing shadow copy..."
@@ -1020,16 +1084,23 @@ function Write-CollectionInfo {
             $targetTz = Get-ImageTimeZoneId
         }
         $info = [PSCustomObject][ordered]@{
-            SchemaVersion       = 1
-            ComputerName        = $env:COMPUTERNAME
-            CollectorUser       = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-            Mode                = $mode
-            TargetDrive         = $TargetDrive
-            TargetRoot          = $script:TargetRoot
-            CollectionStartUtc  = $script:startTime.ToUniversalTime().ToString("o")
-            CollectorTimeZoneId = $collectorTz
-            CollectorCulture    = (Get-Culture).Name
-            TargetTimeZoneId    = $targetTz
+            SchemaVersion            = 1
+            ComputerName             = $env:COMPUTERNAME
+            CollectorUser            = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+            Mode                     = $mode
+            TargetDrive              = $TargetDrive
+            TargetRoot               = $script:TargetRoot
+            CollectionStartUtc       = $script:startTime.ToUniversalTime().ToString("o")
+            CollectorTimeZoneId      = $collectorTz
+            CollectorCulture         = (Get-Culture).Name
+            TargetTimeZoneId         = $targetTz
+            # Additive fields (SchemaVersion stays 1): whether this collection
+            # holds unredacted browser files + DPAPI credential material
+            # (-IncludeSecrets) and Thunderbird's search index
+            # (-IncludeThunderbirdIndex). The timeline builder logs when
+            # SecretsIncluded is true; no parser reads the Secrets folder.
+            SecretsIncluded          = [bool]$IncludeSecrets
+            ThunderbirdIndexIncluded = [bool]$IncludeThunderbirdIndex
         }
         $json = $info | ConvertTo-Json
         # UTF-8 with BOM so Get-Content in Windows PowerShell 5.1 reads it as UTF-8
@@ -1103,6 +1174,16 @@ if ($script:IsLive) {
 }
 Log "Categories: $($Categories -join ', ')"
 Log "SkipLargeFiles: $SkipLargeFiles"
+if ($script:triageIncludeSecrets) {
+    Log-Warning "============================================================="
+    Log-Warning "-IncludeSecrets is set: browser settings and session files are collected UNREDACTED"
+    Log-Warning "(no private/secret value is blanked) and DPAPI credential material (per-user and system"
+    Log-Warning "master keys, CREDHIST, Credentials, Vault) is collected into the Secrets folder. This"
+    Log-Warning "collection holds secrets equivalent to saved passwords and session cookies -- handle it"
+    Log-Warning "like a password store: keep and transfer it encrypted, and use it only for an authorized"
+    Log-Warning "examination."
+    Log-Warning "============================================================="
+}
 if ($script:IsLive) {
     if ($script:defenderExclusionAdded) {
         Log-Success "Temporary Defender exclusion added for output path (will be removed at end)."
@@ -2425,6 +2506,38 @@ if ($Categories -contains "Registry") {
     Log ""
 }
 
+# ----------------------------------------------------------
+# Helper for the Event Logs section: the newest events of a large log
+# ----------------------------------------------------------
+# Exports only the newest events of an event log whose .evtx is larger than
+# -MaxBytes into -DestPath: from the record that leaves about -MaxBytes of
+# the log (its record-ID range cut in proportion to the size) to the newest.
+# Live: wevtutil reads the channel; mounted image: the .evtx file itself
+# (/lf). Returns "records <first>-<newest> of <oldest>-<newest>", or "" if
+# the log's record IDs could not be read or the export failed.
+function Export-NewestEventLogRecords {
+    param([string]$LogName, [string]$SourcePath, [string]$DestPath, [long]$SourceBytes, [long]$MaxBytes)
+    $source = $SourcePath
+    $fileOption = @("/lf:true")
+    if ($script:IsLive) {
+        $source = $LogName -replace '%4', '/'
+        $fileOption = @()
+    }
+    # Oldest and newest record IDs: the first event in each reading direction
+    $ids = @()
+    foreach ($direction in @("/rd:false", "/rd:true")) {
+        $xml = (& wevtutil.exe qe $source @fileOption $direction "/c:1" "/f:xml" 2>$null) -join ""
+        if ($xml -match '<EventRecordID>(\d+)</EventRecordID>') { $ids += [long]$Matches[1] }
+    }
+    if ($ids.Count -ne 2 -or $ids[1] -lt $ids[0]) { return "" }
+    $keep = [long][math]::Floor(($ids[1] - $ids[0] + 1) * ([double]$MaxBytes / $SourceBytes))
+    if ($keep -lt 1) { $keep = 1 }
+    $first = $ids[1] - $keep + 1
+    & wevtutil.exe epl $source $DestPath @fileOption "/q:*[System[EventRecordID>=$first]]" "/ow:true" 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $DestPath)) { return "" }
+    return "records $first-$($ids[1]) of $($ids[0])-$($ids[1])"
+}
+
 # =============================================================
 # 3. Event Logs
 # =============================================================
@@ -2445,8 +2558,38 @@ if ($Categories -contains "EventLogs") {
         "Microsoft-Windows-TerminalServices-LocalSessionManager%4Operational",
         "Microsoft-Windows-TerminalServices-RemoteConnectionManager%4Operational",
         "Microsoft-Windows-Windows Defender%4Operational",
-        "Microsoft-Windows-Bits-Client%4Operational"
+        "Microsoft-Windows-Bits-Client%4Operational",
+        # Windows PowerShell (classic log): engine starts with the command
+        # line, PowerShell 2.0 downgrades
+        "Windows PowerShell",
+        # WMI event subscriptions (permanent and temporary)
+        "Microsoft-Windows-WMI-Activity%4Operational",
+        # Outbound RDP connections made with the Remote Desktop client
+        "Microsoft-Windows-TerminalServices-RDPClient%4Operational",
+        # NTLM authentication (written only when NTLM auditing is enabled)
+        "Microsoft-Windows-NTLM%4Operational",
+        # Firewall rule and setting changes
+        "Microsoft-Windows-Windows Firewall With Advanced Security%4Firewall",
+        # Run / RunOnce commands started at logon
+        "Microsoft-Windows-Shell-Core%4Operational",
+        # Office alert dialogs (exists only where Office is installed)
+        "OAlerts"
     )
+    # Size limit for the logs above that are added context rather than core
+    # evidence. Their default maximum sizes are 1 MB (15 MB for Windows
+    # PowerShell); of one an administrator made much larger only the newest
+    # events, about the limit's worth, are exported (Export-NewestEventLogRecords),
+    # with a warning, instead of slowing the collection down.
+    $limitedEventLogs = @(
+        "Windows PowerShell",
+        "Microsoft-Windows-WMI-Activity%4Operational",
+        "Microsoft-Windows-TerminalServices-RDPClient%4Operational",
+        "Microsoft-Windows-NTLM%4Operational",
+        "Microsoft-Windows-Windows Firewall With Advanced Security%4Firewall",
+        "Microsoft-Windows-Shell-Core%4Operational",
+        "OAlerts"
+    )
+    $maxLimitedEventLogBytes = 256MB
 
     $evtxRoot = "${script:TargetRoot}Windows\System32\winevt\Logs"
 
@@ -2456,6 +2599,19 @@ if ($Categories -contains "EventLogs") {
         if (Test-Path $sourcePath) {
             Log "Collecting $fileName..."
             $destFile = Join-Path $evtDir $fileName
+            $logBytes = Get-FileLength $sourcePath
+            if ($limitedEventLogs -contains $logName -and $logBytes -gt $maxLimitedEventLogBytes) {
+                $sizeText = "$([math]::Round($logBytes / 1MB)) MB, over the $([math]::Round($maxLimitedEventLogBytes / 1MB)) MB limit for this log"
+                $range = Export-NewestEventLogRecords -LogName $logName -SourcePath $sourcePath -DestPath $destFile -SourceBytes $logBytes -MaxBytes $maxLimitedEventLogBytes
+                if ($range) {
+                    Record-Manifest -SourcePath $sourcePath -DestPath $destFile
+                    Log-Warning "Collected only the newest events of $fileName ($sizeText): $range"
+                } else {
+                    Remove-Item -LiteralPath $destFile -Force -ErrorAction SilentlyContinue
+                    Log-Warning "Skipping $fileName ($sizeText; its newest events could not be exported)"
+                }
+                continue
+            }
             if ($script:IsLive) {
                 # Live system: use wevtutil to export (handles locked logs properly)
                 try {
@@ -2702,6 +2858,117 @@ function Get-TriageBamRows {
         Log-Warning "Could not read BAM entries of $failedSidKeys user key(s) -- last error: $lastError"
     }
     return $rows
+}
+
+# SRUM (System Resource Usage Monitor): copies every file of the sru folder
+# (SourceDir) to DestDir -- the ESE database SRUDB.dat with its checkpoint
+# (SRU.chk), transaction logs (SRU*.log, SRUtmp.log), reserve logs
+# (SRUres*.jrs) and flush map (SRUDB.jfm) -- so the timeline builder can
+# bring a copy taken while the database was open to a clean state.
+# Subfolders are not copied; files over MaxBytes are skipped and logged.
+# On a live system the Diagnostic Policy Service keeps these files open and
+# ESE keeps rolling its logs: when SRUDB.dat can be read from the shadow
+# copy, every file is taken from the shadow copy, listed there too, so the
+# database, checkpoint and logs are from one moment (a log deleted since is
+# still collected, a newer one is not mixed in). Otherwise (no shadow copy,
+# mounted image) the files are copied from the volume, through the raw NTFS
+# read for locked files.
+function Copy-TriageSrumFiles {
+    [OutputType([void])]
+    param(
+        [string]$SourceDir,
+        [string]$DestDir,
+        [long]$MaxBytes
+    )
+    $listError = $null
+    $volumeFiles = @(Get-ChildItem -LiteralPath $SourceDir -File -Force -ErrorAction SilentlyContinue -ErrorVariable listError)
+    if ($listError) {
+        Log-Warning "Could not list the SRUM folder ${SourceDir}: $($listError[0].Exception.Message)"
+        $script:errorCount++
+    }
+    $volumeSizes = @{}
+    foreach ($vf in $volumeFiles) { $volumeSizes[$vf.Name] = $vf.Length }
+    $relDir = Get-TargetRelativePath $SourceDir
+    $capText = "$([math]::Round($MaxBytes / 1MB)) MB size cap"
+    $count = 0
+
+    # Live system: the database decides where all files come from. Its size
+    # from the shadow copy, else from the volume; over the cap it is
+    # reported with the other files below.
+    $useShadow = $false
+    if ($script:IsLive -and $relDir -and (Initialize-ShadowCopy)) {
+        $dbSize = Get-FileLength "$($script:shadowPath)\$relDir\SRUDB.dat"
+        if ($dbSize -lt 0 -and $volumeSizes.ContainsKey("SRUDB.dat")) { $dbSize = $volumeSizes["SRUDB.dat"] }
+        if ($dbSize -le $MaxBytes) {
+            $useShadow = Copy-FromShadow -RelativePath "$relDir\SRUDB.dat" -DestDir $DestDir -DestName "SRUDB.dat" -Quiet
+            if (-not $useShadow) {
+                $why = ""
+                if ($script:lastShadowCopyReason) { $why = " ($($script:lastShadowCopyReason))" }
+                Log "SRUDB.dat could not be read from the shadow copy$why -- the SRUM files are copied from the volume (the database and its logs may be from slightly different moments)."
+            }
+        }
+    }
+
+    $dbCollected = $useShadow
+    if ($useShadow) {
+        $count++
+        $shadowNames = Get-ShadowFileNames -RelativePath $relDir
+        $names = $shadowNames
+        if ($null -eq $names) { $names = @($volumeFiles | ForEach-Object { $_.Name }) }
+        foreach ($name in $names) {
+            if ($name -eq "SRUDB.dat") { continue }
+            $size = Get-FileLength "$($script:shadowPath)\$relDir\$name"
+            if ($size -lt 0 -and $volumeSizes.ContainsKey($name)) { $size = $volumeSizes[$name] }
+            if ($size -gt $MaxBytes) {
+                Log-Warning "Skipped SRUM file $SourceDir\$name ($([math]::Round($size / 1MB, 1)) MB): larger than the $capText"
+                continue
+            }
+            if (Copy-FromShadow -RelativePath "$relDir\$name" -DestDir $DestDir -DestName $name -Quiet) {
+                $count++
+            } elseif ($script:lastShadowCopyResult -eq "Empty") {
+                # 0 bytes in the snapshot: nothing to collect, not an error.
+                # Not taken from the volume instead: all files are from one moment
+                Log "Skipped empty file (0 bytes in the shadow copy): $relDir\$name"
+            } elseif ($script:lastShadowCopyResult -eq "NotFound" -and $null -eq $shadowNames) {
+                # Listed on the volume only: newer than the shadow copy
+                Log "SRUM file not in the shadow copy (newer than the database copy) -- skipped: $name"
+            } else {
+                $reason = $script:lastShadowCopyReason
+                if (-not $reason) { $reason = "not found in the shadow copy" }
+                Log-Warning "Could not copy SRUM file $name from the shadow copy -- $reason"
+                $script:errorCount++
+            }
+        }
+    } else {
+        foreach ($vf in $volumeFiles) {
+            if ($vf.Length -gt $MaxBytes) {
+                Log-Warning "Skipped SRUM file $($vf.FullName) ($([math]::Round($vf.Length / 1MB, 1)) MB): larger than the $capText"
+                continue
+            }
+            # Counted from $script:fileCount, not by the original name: a
+            # copy under a deep output folder is saved with a shortened name
+            $filesBefore = $script:fileCount
+            Copy-ForensicFile -SourcePath $vf.FullName -DestDir $DestDir
+            if ($script:fileCount -gt $filesBefore) {
+                $count++
+                if ($vf.Name -eq "SRUDB.dat") { $dbCollected = $true }
+            }
+        }
+    }
+
+    if ($dbCollected) {
+        $note = ""
+        if ($useShadow) {
+            $note = " (from the shadow copy)"
+        } elseif ($script:IsLive) {
+            $note = " (from the volume)"
+        }
+        Log-Success "Collected $count SRUM file(s)$note."
+    } elseif ($count -gt 0 -or $volumeFiles.Count -gt 0) {
+        Log-Warning "SRUM database (SRUDB.dat) not collected; $count other SRUM file(s) collected."
+    } elseif (-not $listError) {
+        Log "SRUM folder is empty: $SourceDir"
+    }
 }
 
 # USB storage disks known to PnP (including devices not currently connected)
@@ -3145,6 +3412,19 @@ if ($Categories -contains "Execution") {
         Log-Warning "Prefetch directory not found (may be disabled)."
     }
 
+    # SRUM (System Resource Usage Monitor): the sru folder's database,
+    # checkpoint and logs (see Copy-TriageSrumFiles). SRUDB.dat is usually
+    # tens of MB but can grow to several GB; -SkipLargeFiles lowers the cap.
+    $srumSource = "${script:TargetRoot}Windows\System32\sru"
+    if (Test-Path -LiteralPath $srumSource) {
+        Log "Collecting SRUM database and logs..."
+        $srumMaxBytes = 16GB
+        if ($SkipLargeFiles) { $srumMaxBytes = 2GB }
+        Copy-TriageSrumFiles -SourceDir $srumSource -DestDir (Join-Path $execDir "SRUM") -MaxBytes $srumMaxBytes
+    } else {
+        Log "SRUM folder not found ($srumSource) -- SRUM not collected."
+    }
+
     if ($script:IsLive) {
         # Recent Apps (per loaded user hive -- export the key where it exists)
         Log "Collecting RecentApps registry data..."
@@ -3371,6 +3651,620 @@ function Copy-TriageChromiumNetworkCookies {
     }
 }
 
+# ----------------------------------------------------------
+# Helpers for the Browser section: extension, session, settings and
+# snapshot files (read by the timeline builder for installed extensions,
+# open and recently closed tabs, settings, and history that only a
+# pre-update snapshot or the Favicons database still holds). Every copy has
+# a size cap; what is skipped is logged.
+# ----------------------------------------------------------
+# Chromium profile folders collected (with the main browser files too)
+$script:triageChromiumProfilePattern = '^(Default|Profile \d+|Guest Profile)$'
+
+# Members blanked in the copies of Local State, Preferences and Secure
+# Preferences (names matched whole, case-insensitive, at any depth): the
+# encrypted keys that protect saved passwords and cookies (os_crypt),
+# password hashes (password_hash_data_list), tokens, salts and the sync
+# encryption keys (sync.encryption_bootstrap_token_per_account,
+# sync.keystore_encryption_key_state). The timeline uses none of them. A
+# text value becomes "", a list [] and an object {}; numbers and true/false
+# are kept.
+$script:triageChromiumSecretNames = '[A-Za-z0-9_]*(?:encrypted_key|_encrypted_data|token|_salt)[A-Za-z0-9_]*|password_hash_data_list|keystore_encryption_key_state'
+# Firefox prefs.js: text values of prefs whose name has one of these words
+$script:triageFirefoxSecretPattern = '(?im)^(\s*user_pref\(\s*"[^"]*(?:token|secret|password|useragentid)[^"]*"\s*,\s*)"(?:[^"\\]|\\.)*"'
+# Firefox session files: members blanked in the copies -- the values of
+# session cookies (including HttpOnly ones, which cookies.sqlite does not
+# hold), form data, session storage, POST data, page state (history.state)
+# and text typed in the address bar
+$script:triageFirefoxSessionPrivateNames = 'formdata|cookies|storage|postdata_b64|structuredCloneState|userTypedValue'
+
+# Blanking code for the browser files above, compiled on first use (C# 5
+# only, see the NTFS reader):
+#   BlankJsonMembers     JSON text: the values of the members whose names
+#                        match emptied, scanning string by string (a name
+#                        inside a string value is never taken for a
+#                        member). A value cut off by the end of a damaged
+#                        file is dropped with the rest of the file.
+#   RedactMozLz4Json     Firefox session file ("mozLz40\0", uint32 data
+#                        size, one LZ4 block): decompressed, blanked as
+#                        above, and written back as a valid mozLz4 file
+#                        whose block holds the data uncompressed (literals
+#                        only)
+#   BlankSnssPageState   Chromium Session_* / Tabs_* file (SNSS: "SNSS",
+#                        int32 version, then uint16 size + uint8 id +
+#                        payload per command): in each navigation entry
+#                        (UpdateTabNavigation, a base::Pickle: tab id,
+#                        index, URL, title, page state, ...) the page state
+#                        -- form contents and POST data of the page -- is
+#                        overwritten with zeros, in place, so the file keeps
+#                        its layout. Bytes after a damaged command are
+#                        zeroed too. Encrypted files (versions 2 and 4) are
+#                        refused.
+$script:triageRedactorSource = @'
+using System;
+using System.IO;
+using System.Text;
+using System.Text.RegularExpressions;
+
+namespace TriageBrowser
+{
+    public static class Redactor
+    {
+        const int MaxDecompressedSize = 256 * 1024 * 1024;
+
+        public static string BlankJsonMembers(string json, string namePattern, out int blanked, out bool damaged)
+        {
+            Regex names = new Regex("^(?:" + namePattern + ")$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+            StringBuilder sb = new StringBuilder(json.Length);
+            blanked = 0;
+            damaged = false;
+            int n = json.Length;
+            int i = 0;
+            while (i < n)
+            {
+                char c = json[i];
+                if (c != '"') { sb.Append(c); i++; continue; }
+                int keyStart = i;
+                bool open = false;
+                int end = SkipString(json, keyStart, ref open);
+                sb.Append(json, keyStart, end - keyStart);
+                i = end;
+                if (open) { break; }
+                int j = end;
+                while (j < n && char.IsWhiteSpace(json[j])) { j++; }
+                if (j >= n || json[j] != ':' || !names.IsMatch(json.Substring(keyStart + 1, end - keyStart - 2)))
+                {
+                    continue;
+                }
+                int v = j + 1;
+                while (v < n && char.IsWhiteSpace(json[v])) { v++; }
+                sb.Append(json, end, v - end);
+                i = v;
+                if (v >= n) { break; }
+                char first = json[v];
+                if (first != '"' && first != '[' && first != '{') { continue; }
+                bool valueOpen = false;
+                int valueEnd = SkipValue(json, v, ref valueOpen);
+                sb.Append(first == '"' ? "\"\"" : (first == '[' ? "[]" : "{}"));
+                blanked++;
+                if (valueOpen) { damaged = true; }
+                i = valueEnd;
+            }
+            return sb.ToString();
+        }
+
+        // Index after the string that starts at s[i] (a quote); open is set
+        // when the text ends inside it
+        static int SkipString(string s, int i, ref bool open)
+        {
+            i++;
+            while (i < s.Length)
+            {
+                char c = s[i];
+                if (c == '\\') { i += 2; continue; }
+                if (c == '"') { return i + 1; }
+                i++;
+            }
+            open = true;
+            return s.Length;
+        }
+
+        // Index after the string, list or object that starts at s[i]
+        static int SkipValue(string s, int i, ref bool open)
+        {
+            if (s[i] == '"') { return SkipString(s, i, ref open); }
+            int depth = 0;
+            while (i < s.Length)
+            {
+                char d = s[i];
+                if (d == '"')
+                {
+                    i = SkipString(s, i, ref open);
+                    if (open) { return s.Length; }
+                    continue;
+                }
+                if (d == '{' || d == '[') { depth++; }
+                else if (d == '}' || d == ']')
+                {
+                    depth--;
+                    if (depth == 0) { return i + 1; }
+                }
+                i++;
+            }
+            open = true;
+            return s.Length;
+        }
+
+        public static byte[] RedactMozLz4Json(byte[] data, string namePattern, out int blanked, out bool damaged)
+        {
+            string json = Encoding.UTF8.GetString(DecompressMozLz4(data));
+            byte[] text = Encoding.UTF8.GetBytes(BlankJsonMembers(json, namePattern, out blanked, out damaged));
+            MemoryStream o = new MemoryStream(text.Length + text.Length / 255 + 16);
+            o.Write(Encoding.ASCII.GetBytes("mozLz40\0"), 0, 8);
+            o.Write(BitConverter.GetBytes(text.Length), 0, 4);
+            // One sequence of literals: a token, the extra length bytes, the data
+            o.WriteByte((byte)(Math.Min(text.Length, 15) << 4));
+            if (text.Length >= 15)
+            {
+                int rest = text.Length - 15;
+                while (rest >= 255) { o.WriteByte(255); rest -= 255; }
+                o.WriteByte((byte)rest);
+            }
+            o.Write(text, 0, text.Length);
+            return o.ToArray();
+        }
+
+        static byte[] DecompressMozLz4(byte[] data)
+        {
+            byte[] magic = Encoding.ASCII.GetBytes("mozLz40\0");
+            if (data == null || data.Length < 12) { throw new InvalidDataException("file too small"); }
+            for (int i = 0; i < magic.Length; i++)
+            {
+                if (data[i] != magic[i]) { throw new InvalidDataException("no mozLz40 header"); }
+            }
+            int size = BitConverter.ToInt32(data, 8);
+            // LZ4 cannot expand data more than about 255 times
+            if (size < 0 || size > MaxDecompressedSize || (long)size > (long)(data.Length - 12) * 255 + 64)
+            {
+                throw new InvalidDataException("implausible data size " + size);
+            }
+            byte[] output = new byte[size];
+            int ip = 12;
+            int op = 0;
+            while (ip < data.Length)
+            {
+                int token = data[ip++];
+                int literals = token >> 4;
+                if (literals == 15) { literals += ReadLength(data, ref ip); }
+                if (literals > data.Length - ip || literals > size - op) { throw new InvalidDataException("LZ4 literals out of range"); }
+                Buffer.BlockCopy(data, ip, output, op, literals);
+                ip += literals;
+                op += literals;
+                if (ip >= data.Length) { break; }
+                if (data.Length - ip < 2) { throw new InvalidDataException("LZ4 data ends inside a match offset"); }
+                int offset = data[ip] | (data[ip + 1] << 8);
+                ip += 2;
+                if (offset == 0 || offset > op) { throw new InvalidDataException("LZ4 match offset out of range"); }
+                int matchLength = token & 15;
+                if (matchLength == 15) { matchLength += ReadLength(data, ref ip); }
+                matchLength += 4;
+                if (matchLength > size - op) { throw new InvalidDataException("LZ4 match runs past the data size"); }
+                int from = op - offset;
+                for (int k = 0; k < matchLength; k++) { output[op++] = output[from++]; }
+            }
+            if (op != size) { throw new InvalidDataException("LZ4 data shorter than its stated size"); }
+            return output;
+        }
+
+        static int ReadLength(byte[] data, ref int ip)
+        {
+            int total = 0;
+            int b;
+            do
+            {
+                if (ip >= data.Length) { throw new InvalidDataException("LZ4 data ends inside a length"); }
+                b = data[ip++];
+                total += b;
+                if (total > MaxDecompressedSize) { throw new InvalidDataException("implausible LZ4 length"); }
+            } while (b == 255);
+            return total;
+        }
+
+        // Returns the number of page states overwritten
+        public static int BlankSnssPageState(byte[] data, bool tabRestore)
+        {
+            if (data == null || data.Length < 8 || data[0] != 0x53 || data[1] != 0x4E || data[2] != 0x53 || data[3] != 0x53)
+            {
+                throw new InvalidDataException("no SNSS header");
+            }
+            int version = BitConverter.ToInt32(data, 4);
+            if (version == 2 || version == 4) { throw new InvalidDataException("encrypted session file (SNSS version " + version + ")"); }
+            int navigationCommand = tabRestore ? 1 : 6;
+            int blanked = 0;
+            int pos = 8;
+            while (pos < data.Length)
+            {
+                int size = data.Length - pos >= 2 ? BitConverter.ToUInt16(data, pos) : 0;
+                if (size == 0 || size > data.Length - pos - 2)
+                {
+                    // Damaged or cut off: nothing after this can be read
+                    Array.Clear(data, pos, data.Length - pos);
+                    break;
+                }
+                int id = data[pos + 2];
+                int start = pos + 3;
+                int length = size - 1;
+                pos += 2 + size;
+                if (id == navigationCommand && BlankNavigationPageState(data, start, length)) { blanked++; }
+            }
+            return blanked;
+        }
+
+        // Pickle: uint32 payload size, then 4-byte aligned fields: int tab
+        // id, int index, string URL (int32 byte count + bytes), string16
+        // title (int32 character count + UTF-16), string page state. When
+        // the entry cannot be read that far, the rest of it is zeroed.
+        static bool BlankNavigationPageState(byte[] data, int start, int length)
+        {
+            int end = start + length;
+            int pos = start + 12;
+            for (int field = 0; field < 3; field++)
+            {
+                if (end - pos < 4) { break; }
+                int count = BitConverter.ToInt32(data, pos);
+                long bytes = field == 1 ? (long)count * 2 : count;
+                if (count < 0 || bytes > end - pos - 4) { break; }
+                pos += 4;
+                if (field == 2)
+                {
+                    Array.Clear(data, pos, (int)bytes);
+                    return bytes > 0;
+                }
+                pos += (int)((bytes + 3) & ~3L);
+            }
+            if (pos >= end) { return false; }
+            Array.Clear(data, pos, end - pos);
+            return true;
+        }
+    }
+}
+'@
+
+$script:triageRedactorReady = $null
+function Initialize-TriageRedactor {
+    if ($null -ne $script:triageRedactorReady) { return $script:triageRedactorReady }
+    if ('TriageBrowser.Redactor' -as [type]) {
+        $script:triageRedactorReady = $true
+        return $true
+    }
+    try {
+        Add-Type -TypeDefinition $script:triageRedactorSource -ErrorAction Stop
+        $script:triageRedactorReady = $true
+    } catch {
+        Log-Warning "Browser file redaction code could not be compiled (settings and session files not collected): $($_.Exception.Message)"
+        $script:errorCount++
+        $script:triageRedactorReady = $false
+    }
+    return $script:triageRedactorReady
+}
+
+# Copy a file unless it is larger than -MaxBytes (logged with its size).
+# Returns $true when the copy is in the collection (recorded in the
+# manifest; it may be saved under a shortened name, see Copy-ForensicFile).
+function Copy-TriageCappedFile {
+    [OutputType([bool])]
+    param(
+        [string]$SourcePath,
+        [string]$DestDir,
+        [string]$DestName,
+        [long]$MaxBytes
+    )
+    $size = Get-FileLength $SourcePath
+    if ($size -le 0) { return $false }
+    if ($size -gt $MaxBytes) {
+        Log "Skipped (larger than the $([math]::Round($MaxBytes / 1MB)) MB cap: $([math]::Round($size / 1MB, 1)) MB): $SourcePath"
+        return $false
+    }
+    $filesBefore = $script:fileCount
+    Copy-ForensicFile -SourcePath $SourcePath -DestDir $DestDir -DestName $DestName
+    return ($script:fileCount -gt $filesBefore)
+}
+
+# Copy files (already in the order of preference, e.g. newest first) to the
+# same paths relative to -SourceRoot under -DestRoot, while the total size of
+# the copies stays within -MaxTotalBytes; files that do not fit are skipped
+# and listed in the log. -Format: copy with private values blanked (see
+# Copy-TriageRedactedFile). Returns the number of files collected.
+function Copy-TriageFilesWithinCap {
+    [OutputType([int])]
+    param(
+        [System.IO.FileInfo[]]$Files,
+        [string]$SourceRoot,
+        [string]$DestRoot,
+        [long]$MaxTotalBytes,
+        [string]$Label,
+        [string]$Format = ""
+    )
+    $total = 0L
+    $copied = 0
+    $skipped = New-Object System.Collections.Generic.List[string]
+    $root = $SourceRoot.TrimEnd('\')
+    foreach ($file in $Files) {
+        if (-not $file -or $file.Length -le 0) { continue }
+        if ($total + $file.Length -gt $MaxTotalBytes) {
+            $skipped.Add("$($file.Name) ($([math]::Round($file.Length / 1MB, 1)) MB)")
+            continue
+        }
+        $relDir = Split-Path ($file.FullName.Substring($root.Length + 1)) -Parent
+        $destDir = if ($relDir) { Join-Path $DestRoot $relDir } else { $DestRoot }
+        # Counted (with the copy's size) from what the manifest recorded, not
+        # by the original name: a long name is saved shortened
+        $filesBefore = $script:fileCount
+        $bytesBefore = $script:totalBytes
+        if ($Format) {
+            # A blanked Firefox session copy is stored uncompressed: its own
+            # size counts (it must fit in what is left)
+            $null = Copy-TriageRedactedFile -SourcePath $file.FullName -DestDir $destDir -DestName $file.Name -Format $Format `
+                -MaxBytes ($MaxTotalBytes - $total) -MaxOutputBytes ($MaxTotalBytes - $total) -CapLabel "the $([math]::Round($MaxTotalBytes / 1MB)) MB total cap for $Label(s)"
+        }
+        else {
+            Copy-ForensicFile -SourcePath $file.FullName -DestDir $destDir -DestName $file.Name
+        }
+        if ($script:fileCount -gt $filesBefore) {
+            $total += $script:totalBytes - $bytesBefore
+            $copied++
+        }
+    }
+    if ($skipped.Count -gt 0) {
+        Log "Skipped $($skipped.Count) $Label(s) in $SourceRoot (over the $([math]::Round($MaxTotalBytes / 1MB)) MB total cap): $($skipped -join ', ')"
+    }
+    return $copied
+}
+
+# Copy a browser file with its secret or private values blanked:
+#   ChromiumJson     Local State, Preferences, Secure Preferences (secret
+#                    members, see above)
+#   FirefoxPrefs     prefs.js (text values of secret-named prefs)
+#   ChromiumSession  Session_* / Tabs_* (page state of each navigation entry)
+#   FirefoxSession   sessionstore.jsonlz4 and its backups (cookies, form
+#                    data, session storage, POST data, page state, typed text)
+# The copy is not byte-identical to the original when something was blanked
+# (the log says so); the manifest has the original's path and times and the
+# hash of the copy. Read with sharing, so a file the browser has open is
+# still read. A file that cannot be read well enough to blank it (damaged,
+# encrypted) is not collected. -MaxOutputBytes: the copy is not kept when it
+# is larger (a blanked Firefox session file is stored uncompressed).
+function Copy-TriageRedactedFile {
+    [OutputType([bool])]
+    param(
+        [string]$SourcePath,
+        [string]$DestDir,
+        [string]$DestName,
+        [ValidateSet("ChromiumJson", "FirefoxPrefs", "ChromiumSession", "FirefoxSession")]
+        [string]$Format,
+        [long]$MaxBytes,
+        [long]$MaxOutputBytes = 0,
+        [string]$CapLabel = ""
+    )
+    # -IncludeSecrets: skip the blanking entirely and copy the file unaltered
+    # through the normal copy path (with its lock fallbacks), so the manifest
+    # hash equals the original's. The size cap still applies. Without the
+    # switch the copy is byte-for-byte what it was before.
+    if ($script:triageIncludeSecrets) {
+        return (Copy-TriageCappedFile -SourcePath $SourcePath -DestDir $DestDir -DestName $DestName -MaxBytes $MaxBytes)
+    }
+    $size = Get-FileLength $SourcePath
+    if ($size -le 0) { return $false }
+    if ($size -gt $MaxBytes) {
+        Log "Skipped (larger than the $([math]::Round($MaxBytes / 1MB)) MB cap: $([math]::Round($size / 1MB, 1)) MB): $SourcePath"
+        return $false
+    }
+    if ($Format -ne "FirefoxPrefs" -and -not (Initialize-TriageRedactor)) {
+        Log "Not collected (its private values could not be blanked): $SourcePath"
+        return $false
+    }
+    $srcTimes = Get-SourceFileTimesUtc $SourcePath
+    try {
+        $stream = New-Object System.IO.FileStream($SourcePath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete))
+        try {
+            $buffer = New-Object System.IO.MemoryStream
+            $stream.CopyTo($buffer)
+            $bytes = $buffer.ToArray()
+        } finally { $stream.Dispose() }
+    } catch {
+        Log-Warning "Could not read: $SourcePath -- $(Get-TriageErrorMessage $_)"
+        $script:errorCount++
+        return $false
+    }
+
+    $blanked = 0
+    $damaged = $false
+    try {
+        if ($Format -eq "ChromiumSession") {
+            $blanked = [TriageBrowser.Redactor]::BlankSnssPageState($bytes, ($DestName -match '^(Tabs_|Current Tabs$|Last Tabs$)'))
+        }
+        elseif ($Format -eq "FirefoxSession") {
+            $bytes = [TriageBrowser.Redactor]::RedactMozLz4Json($bytes, $script:triageFirefoxSessionPrivateNames, [ref]$blanked, [ref]$damaged)
+        }
+        else {
+            # Text (UTF-8, or the encoding its byte order mark names)
+            $reader = New-Object System.IO.StreamReader((New-Object System.IO.MemoryStream(, $bytes)), (New-Object System.Text.UTF8Encoding($false)), $true)
+            $text = $reader.ReadToEnd()
+            if ($Format -eq "FirefoxPrefs") {
+                $blanked = ([regex]::Matches($text, $script:triageFirefoxSecretPattern)).Count
+                if ($blanked -gt 0) { $text = [regex]::Replace($text, $script:triageFirefoxSecretPattern, '$1""') }
+            }
+            else {
+                $text = [TriageBrowser.Redactor]::BlankJsonMembers($text, $script:triageChromiumSecretNames, [ref]$blanked, [ref]$damaged)
+            }
+            $bytes = (New-Object System.Text.UTF8Encoding($false)).GetBytes($text)
+        }
+    } catch {
+        Log "Not collected (could not be read to blank its private values -- $(Get-TriageErrorMessage $_)): $SourcePath"
+        return $false
+    }
+    if ($MaxOutputBytes -gt 0 -and $bytes.Length -gt $MaxOutputBytes) {
+        Log "Skipped (its blanked copy, $([math]::Round($bytes.Length / 1MB, 1)) MB, is over what is left of $CapLabel): $SourcePath"
+        return $false
+    }
+
+    try {
+        Ensure-Directory $DestDir
+        $destPath = Join-Path $DestDir $DestName
+        [System.IO.File]::WriteAllBytes($destPath, $bytes)
+    } catch {
+        Log-Warning "Could not copy: $SourcePath -- $($_.Exception.Message)"
+        $script:errorCount++
+        return $false
+    }
+    Record-Manifest -SourcePath $SourcePath -DestPath $destPath -SourceTimes $srcTimes
+    if ($damaged) { Log "Damaged file (cut off inside a private value; everything from there on was dropped): $SourcePath" }
+    if ($blanked -gt 0) {
+        $what = switch ($Format) {
+            "ChromiumSession" { "page state(s) (form contents) blanked" }
+            "FirefoxSession"  { "private value(s) (cookies, form data, session storage) blanked" }
+            default           { "secret value(s) blanked (keys, tokens, password hashes)" }
+        }
+        Log "Collected with $blanked $($what): $SourcePath"
+    }
+    return $true
+}
+
+# Extension, session, settings and favicon files of one Chromium profile
+# folder (for Opera: its own folder), copied to the same relative paths
+# under -DestDir:
+#   Preferences, Secure Preferences   settings and installed extensions
+#                                     (secret values blanked, see above)
+#   Favicons (+ -journal)             icons of visited pages; can outlive a
+#                                     history clear (256 MB cap)
+#   Sessions\Session_*, Tabs_*        open and recently closed tabs (also the
+#                                     older Current/Last Session and Tabs
+#                                     files; newest first, 64 MB in all), with
+#                                     the page state (form contents) of every
+#                                     entry blanked
+#   Extensions\<id>\<version>\manifest.json, plus the
+#   _locales\<default_locale>\messages.json that resolves __MSG_ names
+#   (1 MB cap each; no extension code is collected)
+function Copy-TriageChromiumProfileExtras {
+    [OutputType([void])]
+    param(
+        [string]$ProfileDir,
+        [string]$DestDir,
+        [string]$Label
+    )
+    foreach ($prefsFile in @("Preferences", "Secure Preferences")) {
+        $null = Copy-TriageRedactedFile -SourcePath (Join-Path $ProfileDir $prefsFile) -DestDir $DestDir -DestName $prefsFile -Format ChromiumJson -MaxBytes 32MB
+    }
+    foreach ($iconFile in @("Favicons", "Favicons-journal")) {
+        $null = Copy-TriageCappedFile -SourcePath (Join-Path $ProfileDir $iconFile) -DestDir $DestDir -DestName $iconFile -MaxBytes 256MB
+    }
+
+    $sessionFiles = New-Object System.Collections.Generic.List[System.IO.FileInfo]
+    $sessionsDir = Join-Path $ProfileDir "Sessions"
+    if (Test-Path -LiteralPath $sessionsDir) {
+        foreach ($f in @(Get-ChildItem -LiteralPath $sessionsDir -File -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^(Session|Tabs)_\d+$' })) { $sessionFiles.Add($f) }
+    }
+    foreach ($legacyName in @("Current Session", "Current Tabs", "Last Session", "Last Tabs")) {
+        $legacyFile = Get-Item -LiteralPath (Join-Path $ProfileDir $legacyName) -Force -ErrorAction SilentlyContinue
+        if ($legacyFile -and -not $legacyFile.PSIsContainer) { $sessionFiles.Add($legacyFile) }
+    }
+    $sessionCount = 0
+    if ($sessionFiles.Count -gt 0) {
+        $sessionCount = Copy-TriageFilesWithinCap -Files @($sessionFiles | Sort-Object LastWriteTimeUtc -Descending) -SourceRoot $ProfileDir -DestRoot $DestDir -MaxTotalBytes 64MB -Label "session file" -Format ChromiumSession
+    }
+
+    # Extensions\<32-letter id>\<version>\: the manifest only
+    $manifestCount = 0
+    $extensionsDir = Join-Path $ProfileDir "Extensions"
+    if (Test-Path -LiteralPath $extensionsDir) {
+        $extensionDirs = @(Get-ChildItem -LiteralPath $extensionsDir -Directory -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^[a-p]{32}$' })
+        foreach ($extensionDir in $extensionDirs) {
+            foreach ($versionDir in @(Get-ChildItem -LiteralPath $extensionDir.FullName -Directory -Force -ErrorAction SilentlyContinue)) {
+                $versionDest = Join-Path $DestDir "Extensions\$($extensionDir.Name)\$($versionDir.Name)"
+                if (-not (Copy-TriageCappedFile -SourcePath (Join-Path $versionDir.FullName "manifest.json") -DestDir $versionDest -DestName "manifest.json" -MaxBytes 1MB)) { continue }
+                $manifestCount++
+                # A name such as "__MSG_appName__" is looked up in the default
+                # locale's messages.json (read from the copy just made, which
+                # may have a shortened name)
+                $manifestText = ""
+                try { $manifestText = [System.IO.File]::ReadAllText($script:lastRecordedDestPath) }
+                catch { Write-Verbose "Reading the copied manifest of $($extensionDir.Name): $($_.Exception.Message)" }
+                if ($manifestText -match '__MSG_' -and $manifestText -match '"default_locale"\s*:\s*"([A-Za-z0-9_-]+)"') {
+                    $locale = $Matches[1]
+                    $null = Copy-TriageCappedFile -SourcePath (Join-Path $versionDir.FullName "_locales\$locale\messages.json") `
+                        -DestDir (Join-Path $versionDest "_locales\$locale") -DestName "messages.json" -MaxBytes 1MB
+                }
+            }
+        }
+    }
+    if ($manifestCount -gt 0 -or $sessionCount -gt 0) {
+        Log "Collected $manifestCount extension manifest(s) and $sessionCount session file(s) for $Label"
+    }
+}
+
+# Once per Chromium browser (its User Data folder; for Opera, its own
+# folder): Local State (secret values blanked) and the snapshots the browser
+# keeps from before an update, Snapshots\<version>\<profile>\History and
+# Favicons with their journals -- they can hold history cleared since.
+# Newest versions first, 1 GB in all.
+function Copy-TriageChromiumUserDataExtras {
+    [OutputType([void])]
+    param(
+        [string]$UserDataDir,
+        [string]$DestDir
+    )
+    $null = Copy-TriageRedactedFile -SourcePath (Join-Path $UserDataDir "Local State") -DestDir $DestDir -DestName "Local State" -Format ChromiumJson -MaxBytes 32MB
+
+    $snapshotsDir = Join-Path $UserDataDir "Snapshots"
+    if (-not (Test-Path -LiteralPath $snapshotsDir)) { return }
+    $snapshotFiles = New-Object System.Collections.Generic.List[System.IO.FileInfo]
+    $versionDirs = @(Get-ChildItem -LiteralPath $snapshotsDir -Directory -Force -ErrorAction SilentlyContinue | Sort-Object LastWriteTimeUtc -Descending)
+    foreach ($versionDir in $versionDirs) {
+        $profileDirs = @(Get-ChildItem -LiteralPath $versionDir.FullName -Directory -Force -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match $script:triageChromiumProfilePattern })
+        foreach ($snapshotProfile in $profileDirs) {
+            foreach ($name in @("History", "History-journal", "Favicons", "Favicons-journal")) {
+                $snapshotFile = Get-Item -LiteralPath (Join-Path $snapshotProfile.FullName $name) -Force -ErrorAction SilentlyContinue
+                if ($snapshotFile -and -not $snapshotFile.PSIsContainer) { $snapshotFiles.Add($snapshotFile) }
+            }
+        }
+    }
+    if ($snapshotFiles.Count -eq 0) { return }
+    $copied = Copy-TriageFilesWithinCap -Files $snapshotFiles.ToArray() -SourceRoot $UserDataDir -DestRoot $DestDir -MaxTotalBytes 1GB -Label "history snapshot file"
+    Log "Collected $copied history snapshot file(s) from $snapshotsDir ($($versionDirs.Count) version(s))"
+}
+
+# Extensions, settings and sessions of one Firefox profile: extensions.json
+# and addons.json (installed add-ons), prefs.js (secret values blanked),
+# sessionstore.jsonlz4 and sessionstore-backups\ (recovery, previous and
+# upgrade session files, with session cookies, form data, session storage,
+# POST data, page state and typed text blanked; stored uncompressed as
+# mozLz4; newest first, 64 MB in all)
+function Copy-TriageFirefoxProfileExtras {
+    [OutputType([void])]
+    param(
+        [string]$ProfileDir,
+        [string]$DestDir,
+        [string]$Label
+    )
+    foreach ($jsonFile in @("extensions.json", "addons.json")) {
+        $null = Copy-TriageCappedFile -SourcePath (Join-Path $ProfileDir $jsonFile) -DestDir $DestDir -DestName $jsonFile -MaxBytes 32MB
+    }
+    $null = Copy-TriageRedactedFile -SourcePath (Join-Path $ProfileDir "prefs.js") -DestDir $DestDir -DestName "prefs.js" -Format FirefoxPrefs -MaxBytes 16MB
+
+    $sessionFiles = New-Object System.Collections.Generic.List[System.IO.FileInfo]
+    $sessionStore = Get-Item -LiteralPath (Join-Path $ProfileDir "sessionstore.jsonlz4") -Force -ErrorAction SilentlyContinue
+    if ($sessionStore -and -not $sessionStore.PSIsContainer) { $sessionFiles.Add($sessionStore) }
+    $backupsDir = Join-Path $ProfileDir "sessionstore-backups"
+    if (Test-Path -LiteralPath $backupsDir) {
+        foreach ($f in @(Get-ChildItem -LiteralPath $backupsDir -File -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '\.(jsonlz4|baklz4)' })) { $sessionFiles.Add($f) }
+    }
+    if ($sessionFiles.Count -gt 0) {
+        $sessionCount = Copy-TriageFilesWithinCap -Files @($sessionFiles | Sort-Object LastWriteTimeUtc -Descending) -SourceRoot $ProfileDir -DestRoot $DestDir -MaxTotalBytes 64MB -Label "session file" -Format FirefoxSession
+        Log "Collected $sessionCount session file(s) for $Label"
+    }
+}
+
 # =============================================================
 # 7. Browser Artifacts
 # =============================================================
@@ -3390,9 +4284,9 @@ if ($Categories -contains "Browser") {
         $chromeBase = Join-Path $userDir.FullName "AppData\Local\Google\Chrome\User Data"
         if (Test-Path -LiteralPath $chromeBase) {
             Log "Collecting Chrome data for $userName..."
-            # Collect from Default and any numbered profiles
+            # Collect from Default, any numbered profiles and the Guest profile
             $chromeProfiles = Get-ChildItem -Path $chromeBase -Directory -Force -ErrorAction SilentlyContinue |
-                Where-Object { $_.Name -eq "Default" -or $_.Name -match "^Profile \d+$" }
+                Where-Object { $_.Name -match $script:triageChromiumProfilePattern }
 
             foreach ($browserProfile in $chromeProfiles) {
                 $destDir = Join-Path $browserDir "$userName\Chrome\$($browserProfile.Name)"
@@ -3407,7 +4301,9 @@ if ($Categories -contains "Browser") {
                     }
                 }
                 Copy-TriageChromiumNetworkCookies -ProfileDir $browserProfile.FullName -DestDir $destDir
+                Copy-TriageChromiumProfileExtras -ProfileDir $browserProfile.FullName -DestDir $destDir -Label "$userName Chrome\$($browserProfile.Name)"
             }
+            Copy-TriageChromiumUserDataExtras -UserDataDir $chromeBase -DestDir (Join-Path $browserDir "$userName\Chrome")
             Log-Success "Collected Chrome artifacts for $userName"
         }
 
@@ -3416,7 +4312,7 @@ if ($Categories -contains "Browser") {
         if (Test-Path -LiteralPath $edgeBase) {
             Log "Collecting Edge data for $userName..."
             $edgeProfiles = Get-ChildItem -Path $edgeBase -Directory -Force -ErrorAction SilentlyContinue |
-                Where-Object { $_.Name -eq "Default" -or $_.Name -match "^Profile \d+$" }
+                Where-Object { $_.Name -match $script:triageChromiumProfilePattern }
 
             foreach ($browserProfile in $edgeProfiles) {
                 $destDir = Join-Path $browserDir "$userName\Edge\$($browserProfile.Name)"
@@ -3428,7 +4324,9 @@ if ($Categories -contains "Browser") {
                     }
                 }
                 Copy-TriageChromiumNetworkCookies -ProfileDir $browserProfile.FullName -DestDir $destDir
+                Copy-TriageChromiumProfileExtras -ProfileDir $browserProfile.FullName -DestDir $destDir -Label "$userName Edge\$($browserProfile.Name)"
             }
+            Copy-TriageChromiumUserDataExtras -UserDataDir $edgeBase -DestDir (Join-Path $browserDir "$userName\Edge")
             Log-Success "Collected Edge artifacts for $userName"
         }
 
@@ -3437,7 +4335,7 @@ if ($Categories -contains "Browser") {
         if (Test-Path -LiteralPath $braveBase) {
             Log "Collecting Brave data for $userName..."
             $braveProfiles = Get-ChildItem -Path $braveBase -Directory -Force -ErrorAction SilentlyContinue |
-                Where-Object { $_.Name -eq "Default" -or $_.Name -match "^Profile \d+$" }
+                Where-Object { $_.Name -match $script:triageChromiumProfilePattern }
 
             foreach ($browserProfile in $braveProfiles) {
                 $destDir = Join-Path $browserDir "$userName\Brave\$($browserProfile.Name)"
@@ -3449,7 +4347,9 @@ if ($Categories -contains "Browser") {
                     }
                 }
                 Copy-TriageChromiumNetworkCookies -ProfileDir $browserProfile.FullName -DestDir $destDir
+                Copy-TriageChromiumProfileExtras -ProfileDir $browserProfile.FullName -DestDir $destDir -Label "$userName Brave\$($browserProfile.Name)"
             }
+            Copy-TriageChromiumUserDataExtras -UserDataDir $braveBase -DestDir (Join-Path $browserDir "$userName\Brave")
             Log-Success "Collected Brave artifacts for $userName"
         }
 
@@ -3471,6 +4371,9 @@ if ($Categories -contains "Browser") {
                     }
                 }
                 Copy-TriageChromiumNetworkCookies -ProfileDir $operaBase -DestDir $destDir
+                # Opera's folder is both its User Data folder and its profile
+                Copy-TriageChromiumProfileExtras -ProfileDir $operaBase -DestDir $destDir -Label "$userName $operaName"
+                Copy-TriageChromiumUserDataExtras -UserDataDir $operaBase -DestDir $destDir
                 Log-Success "Collected $operaName artifacts for $userName"
             }
         }
@@ -3480,7 +4383,7 @@ if ($Categories -contains "Browser") {
         if (Test-Path -LiteralPath $vivaldiBase) {
             Log "Collecting Vivaldi data for $userName..."
             $vivaldiProfiles = Get-ChildItem -Path $vivaldiBase -Directory -Force -ErrorAction SilentlyContinue |
-                Where-Object { $_.Name -eq "Default" -or $_.Name -match "^Profile \d+$" }
+                Where-Object { $_.Name -match $script:triageChromiumProfilePattern }
 
             foreach ($browserProfile in $vivaldiProfiles) {
                 $destDir = Join-Path $browserDir "$userName\Vivaldi\$($browserProfile.Name)"
@@ -3492,7 +4395,9 @@ if ($Categories -contains "Browser") {
                     }
                 }
                 Copy-TriageChromiumNetworkCookies -ProfileDir $browserProfile.FullName -DestDir $destDir
+                Copy-TriageChromiumProfileExtras -ProfileDir $browserProfile.FullName -DestDir $destDir -Label "$userName Vivaldi\$($browserProfile.Name)"
             }
+            Copy-TriageChromiumUserDataExtras -UserDataDir $vivaldiBase -DestDir (Join-Path $browserDir "$userName\Vivaldi")
             Log-Success "Collected Vivaldi artifacts for $userName"
         }
 
@@ -3513,6 +4418,7 @@ if ($Categories -contains "Browser") {
                         Copy-ForensicFile -SourcePath $sourcePath -DestDir $destDir -DestName $ff
                     }
                 }
+                Copy-TriageFirefoxProfileExtras -ProfileDir $browserProfile.FullName -DestDir $destDir -Label "$userName Firefox\$($browserProfile.Name)"
             }
             Log-Success "Collected Firefox artifacts for $userName"
         }
@@ -3755,6 +4661,65 @@ if ($Categories -contains "Persistence") {
     Log ""
 }
 
+# ----------------------------------------------------------
+# Helpers for the AntiVirus section: Defender data folders
+# (DetectionHistory, Quarantine\Entries)
+# ----------------------------------------------------------
+# "Present", "Missing", or "Denied" (the folder exists but this account may
+# not open it; Test-Path reports $false for both of the last two)
+function Get-TriageFolderAccess {
+    [OutputType([string])]
+    param([string]$Path)
+    try {
+        $null = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+        return "Present"
+    } catch [System.UnauthorizedAccessException] {
+        return "Denied"
+    } catch {
+        Write-Verbose "Folder $Path not found: $($_.Exception.Message)"
+        return "Missing"
+    }
+}
+
+# Copy the files of one Defender data folder to the collection, keeping its
+# subfolders. Files over -MaxFileBytes, and the files past the newest
+# -MaxFiles, are skipped and logged. Returns the number of files collected.
+function Copy-TriageDefenderFolder {
+    [OutputType([int])]
+    param(
+        [string]$SourceDir,
+        [string]$DestDir,
+        [string]$Label,
+        [switch]$Recurse,
+        [int]$MaxFiles = 2000,
+        [long]$MaxFileBytes = 1MB
+    )
+    $maxBytes = $MaxFileBytes
+    $listErrors = $null
+    $allFiles = @(Get-ChildItem -LiteralPath $SourceDir -File -Recurse:$Recurse -Force -ErrorAction SilentlyContinue -ErrorVariable listErrors)
+    if ($listErrors) {
+        Log-Warning "Could not list all of ${SourceDir}: $($listErrors[0].Exception.Message)"
+    }
+    foreach ($bigFile in @($allFiles | Where-Object { $_.Length -gt $maxBytes })) {
+        Log "Skipped $Label file over $([math]::Round($maxBytes / 1MB, 2)) MB ($($bigFile.Length) bytes): $($bigFile.FullName)"
+    }
+    $toCopy = @($allFiles | Where-Object { $_.Length -gt 0 -and $_.Length -le $maxBytes } | Sort-Object LastWriteTimeUtc -Descending)
+    if ($toCopy.Count -gt $MaxFiles) {
+        Log "Skipped the $($toCopy.Count - $MaxFiles) oldest $Label file(s): only the newest $MaxFiles are collected."
+        $toCopy = @($toCopy | Select-Object -First $MaxFiles)
+    }
+    $sourceRoot = $SourceDir.TrimEnd('\')
+    $collectedBefore = $script:fileCount
+    foreach ($file in $toCopy) {
+        $fileDestDir = $DestDir
+        if ($file.DirectoryName.Length -gt $sourceRoot.Length) {
+            $fileDestDir = Join-Path $DestDir $file.DirectoryName.Substring($sourceRoot.Length + 1)
+        }
+        Copy-ForensicFile -SourcePath $file.FullName -DestDir $fileDestDir
+    }
+    return ($script:fileCount - $collectedBefore)
+}
+
 # =============================================================
 # 10. AntiVirus / Endpoint Security Logs
 # =============================================================
@@ -3864,6 +4829,36 @@ if ($Categories -contains "AntiVirus") {
             Copy-ForensicFile -SourcePath $dl.FullName -DestDir $defenderDestDir
         }
         Log-Success "Collected $($defenderLogs.Count) Defender support log(s)."
+    }
+
+    # Defender detection history (Scans\History\Service\DetectionHistory\
+    # <nn>\<DetectionID>: one small binary file per detection) and quarantine
+    # metadata (Quarantine\Entries: original path, threat name and time of
+    # each quarantined item). Plain files: collected in live and image mode.
+    # Quarantine\ResourceData holds the quarantined files themselves (the
+    # malware) and is never collected, nor is Quarantine\Resources.
+    $defenderDataDir = "${script:TargetRoot}ProgramData\Microsoft\Windows Defender"
+    $detectionHistoryDir = Join-Path $defenderDataDir "Scans\History\Service\DetectionHistory"
+    switch (Get-TriageFolderAccess $detectionHistoryDir) {
+        "Present" {
+            Log "Collecting Defender detection history..."
+            $detectionHistoryCount = Copy-TriageDefenderFolder -SourceDir $detectionHistoryDir `
+                -DestDir (Join-Path $avDir "Defender\DetectionHistory") -Label "Defender DetectionHistory" -Recurse
+            Log-Success "Collected $detectionHistoryCount Defender DetectionHistory file(s)."
+        }
+        "Denied" { Log-Warning "Could not open the Defender DetectionHistory folder (access denied): $detectionHistoryDir" }
+        default { Log "No Defender DetectionHistory folder on the target (no detections kept)." }
+    }
+    $quarantineEntriesDir = Join-Path $defenderDataDir "Quarantine\Entries"
+    switch (Get-TriageFolderAccess $quarantineEntriesDir) {
+        "Present" {
+            Log "Collecting Defender quarantine metadata (Quarantine\Entries only; the quarantined files are not collected)..."
+            $quarantineEntryCount = Copy-TriageDefenderFolder -SourceDir $quarantineEntriesDir `
+                -DestDir (Join-Path $avDir "Defender\Quarantine\Entries") -Label "Defender quarantine entry"
+            Log-Success "Collected $quarantineEntryCount Defender quarantine entry file(s)."
+        }
+        "Denied" { Log-Warning "Could not open the Defender Quarantine\Entries folder (access denied): $quarantineEntriesDir" }
+        default { Log "No Defender Quarantine\Entries folder on the target (nothing quarantined)." }
     }
 
     # --- Symantec Endpoint Protection ---
@@ -4165,6 +5160,872 @@ if ($Categories -contains "AntiVirus") {
     Log ""
 }
 
+# ----------------------------------------------------------
+# Helpers for the Email section: file listings that never follow
+# links, listing rows, and capped copies
+# ----------------------------------------------------------
+# Attachments in the mail clients' temp folders are copied newest first, up
+# to 50 MB per file, 500 MB per user and 2 GB for all users together (with
+# -SkipLargeFiles: 10 MB, 100 MB and 500 MB). Thunderbird's
+# global-messages-db.sqlite (with its -wal) holds the text of the indexed
+# messages: it is copied only with -IncludeThunderbirdIndex, up to 1 GB. A
+# listing stops after 20,000 files per folder.
+if ($SkipLargeFiles) {
+    $script:emailMaxFileBytes = 10MB
+    $script:emailMaxUserBytes = 100MB
+    $script:emailMaxTotalBytes = 500MB
+} else {
+    $script:emailMaxFileBytes = 50MB
+    $script:emailMaxUserBytes = 500MB
+    $script:emailMaxTotalBytes = 2GB
+}
+$script:emailMaxDatabaseBytes = 1GB
+$script:emailMaxListedFiles = 20000
+$script:emailIncludeIndex = [bool]$IncludeThunderbirdIndex
+# Attachment bytes copied for all users together (Used, Limit)
+$script:emailTotalBudget = @{ Used = 0L; Limit = [long]$script:emailMaxTotalBytes }
+# Columns of every email listing CSV
+$script:emailListingColumns = @("User", "Program", "Store", "Profile", "Path", "RelativePath", "SizeBytes",
+    "CreatedUtc", "ModifiedUtc", "AccessedUtc", "Status", "CollectedAs")
+# Links and cloud placeholders (ReparsePoint, Offline, RecallOnOpen 0x40000,
+# RecallOnDataAccess 0x400000) are listed but never read: reading a OneDrive
+# placeholder would download it
+$script:emailNoReadAttributes = [int][System.IO.FileAttributes]::ReparsePoint -bor [int][System.IO.FileAttributes]::Offline -bor 0x40000 -bor 0x400000
+
+# $true for a junction or symbolic link. Other reparse points (OneDrive
+# folders, for one) are ordinary folders here. The link type is read from
+# the reparse point itself, without following it; if it cannot be read, the
+# item counts as a link.
+function Test-TriageLinkItem {
+    param([System.IO.FileSystemInfo]$Item)
+    if (([int]$Item.Attributes -band [int][System.IO.FileAttributes]::ReparsePoint) -eq 0) { return $false }
+    try {
+        $linkType = [string](Get-Item -LiteralPath $Item.FullName -Force -ErrorAction Stop).LinkType
+        return ($linkType -eq "Junction" -or $linkType -eq "SymbolicLink")
+    } catch {
+        Write-Verbose "Reading the reparse point of $($Item.FullName): $($_.Exception.Message)"
+        return $true
+    }
+}
+
+# $true if the folder, or a folder above it up to (not including) -StopAt,
+# is a junction or symbolic link. Such folders are not listed: in a mounted
+# image their targets resolve on the analysis machine, and on a live system
+# they lead to folders that are listed anyway ("Temporary Internet Files"
+# is a junction to INetCache).
+function Test-TriageLinkedFolder {
+    param(
+        [string]$Path,
+        [string]$StopAt = ""
+    )
+    try {
+        $dir = New-Object System.IO.DirectoryInfo($Path)
+        while ($null -ne $dir) {
+            if ($StopAt -and $dir.FullName.TrimEnd('\') -ieq $StopAt.TrimEnd('\')) { break }
+            if ($dir.Exists -and (Test-TriageLinkItem -Item $dir)) { return $true }
+            $dir = $dir.Parent
+        }
+    } catch { Write-Verbose "Checking $Path for links: $($_.Exception.Message)" }
+    return $false
+}
+
+# Files in a folder (and all its subfolders with -Recurse), sorted by path.
+# -Extensions keeps only those (".pst"); -SkipFolders names subfolders right
+# below -Folder that are not entered (they are listed on their own).
+# Subfolders that are junctions or symbolic links are not entered. A listing
+# stops at $script:emailMaxListedFiles files; with -NewestFirst it looks at
+# up to five times as many and keeps the newest (by modified time). A cut-off
+# listing or an unreadable subfolder is logged.
+function Get-TriageEmailFiles {
+    param(
+        [string]$Folder,
+        [switch]$Recurse,
+        [string[]]$Extensions = @(),
+        [string[]]$SkipFolders = @(),
+        [switch]$NewestFirst
+    )
+    $keep = [int]$script:emailMaxListedFiles
+    $scanLimit = $keep
+    if ($NewestFirst) { $scanLimit = 5 * $keep }
+    $files = New-Object System.Collections.Generic.List[System.IO.FileInfo]
+    $pending = New-Object System.Collections.Generic.Stack[System.IO.DirectoryInfo]
+    $pending.Push((New-Object System.IO.DirectoryInfo($Folder)))
+    $atRoot = $true
+    $truncated = $false
+    $failedFolders = 0
+    $lastError = ""
+    while ($pending.Count -gt 0 -and -not $truncated) {
+        $dir = $pending.Pop()
+        try {
+            foreach ($file in $dir.GetFiles()) {
+                if ($Extensions.Count -gt 0 -and $Extensions -notcontains $file.Extension) { continue }
+                if ($files.Count -ge $scanLimit) { $truncated = $true; break }
+                $files.Add($file)
+            }
+            if ($Recurse -and -not $truncated) {
+                foreach ($subDir in $dir.GetDirectories()) {
+                    if ($atRoot -and $SkipFolders -contains $subDir.Name) { continue }
+                    if (-not (Test-TriageLinkItem -Item $subDir)) { $pending.Push($subDir) }
+                }
+            }
+        } catch {
+            $failedFolders++
+            $lastError = $_.Exception.Message
+        }
+        $atRoot = $false
+    }
+    $result = @($files)
+    if ($files.Count -gt $keep) {
+        # Only with -NewestFirst: keep the newest
+        $result = @($files | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First $keep)
+        if ($truncated) {
+            Log-Warning "More than $scanLimit files below $Folder -- only the $keep newest of the first $scanLimit found are listed"
+        } else {
+            Log-Warning "$($files.Count) files below $Folder -- only the $keep newest are listed"
+        }
+    } elseif ($truncated) {
+        Log-Warning "More than $keep files below $Folder -- only $keep are listed"
+    }
+    if ($failedFolders -gt 0) {
+        Log-Warning "Could not list $failedFolders folder(s) below $Folder -- last error: $lastError"
+    }
+    return @($result | Sort-Object FullName)
+}
+
+# Files of the new Outlook's Olk folder. Attachments\ is listed first and on
+# its own (newest first within the listing cap), so that a large WebView
+# cache in EBWebView\ cannot push the attachments out of the listing; then
+# the rest of the folder.
+function Get-TriageOlkFiles {
+    param([string]$OlkDir)
+    $files = @()
+    $attachmentsDir = Join-Path $OlkDir "Attachments"
+    if ([System.IO.Directory]::Exists($attachmentsDir) -and -not (Test-TriageLinkedFolder -Path $attachmentsDir -StopAt $OlkDir)) {
+        $files += @(Get-TriageEmailFiles -Folder $attachmentsDir -Recurse -NewestFirst)
+    }
+    $files += @(Get-TriageEmailFiles -Folder $OlkDir -Recurse -SkipFolders @("Attachments"))
+    return @($files | Sort-Object FullName)
+}
+
+# Listing row of a file, with its times read before any copy. Status stays
+# "Listed" unless Copy-TriageEmailFile copies (or skips) the file. File and
+# DestDir are working properties; they are not written to the CSV.
+function New-TriageEmailFileRow {
+    param(
+        [string]$User,
+        [string]$Program,
+        [string]$Store,
+        [System.IO.FileInfo]$File,
+        [string]$RelativeTo,
+        [string]$ProfileName = ""
+    )
+    $relativePath = $File.FullName
+    $prefix = $RelativeTo.TrimEnd('\') + '\'
+    if ($relativePath.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+        $relativePath = $relativePath.Substring($prefix.Length)
+    }
+    return [PSCustomObject]@{
+        User         = $User
+        Program      = $Program
+        Store        = $Store
+        Profile      = $ProfileName
+        Path         = $File.FullName
+        RelativePath = $relativePath
+        SizeBytes    = $File.Length
+        CreatedUtc   = Format-UtcTime $File.CreationTimeUtc
+        ModifiedUtc  = Format-UtcTime $File.LastWriteTimeUtc
+        AccessedUtc  = Format-UtcTime $File.LastAccessTimeUtc
+        Status       = "Listed"
+        CollectedAs  = ""
+        File         = $File
+        DestDir      = ""
+    }
+}
+
+# Copy the file of a listing row into its DestDir, unless it is empty, a
+# link or cloud placeholder, larger than -MaxBytes, or would take the user's
+# attachment total (-Budget) or the total of all users (-TotalBudget) over
+# its cap (hashtables with Used and Limit in bytes). Sets the row's Status
+# and CollectedAs.
+function Copy-TriageEmailFile {
+    [OutputType([void])]
+    param(
+        [object]$Row,
+        [long]$MaxBytes,
+        [hashtable]$Budget = $null,
+        [hashtable]$TotalBudget = $null
+    )
+    $file = $Row.File
+    if ($file.Length -eq 0) {
+        $Row.Status = "Skipped: empty file"
+    } elseif (([int]$file.Attributes -band $script:emailNoReadAttributes) -ne 0) {
+        $Row.Status = "Skipped: link or cloud placeholder (not read)"
+    } elseif ($file.Length -gt $MaxBytes) {
+        $Row.Status = "Skipped: over the $($MaxBytes / 1MB) MB per-file cap"
+    } elseif ($Budget -and $Budget.Used + $file.Length -gt $Budget.Limit) {
+        $Row.Status = "Skipped: over the $($Budget.Limit / 1MB) MB per-user cap"
+    } elseif ($TotalBudget -and $TotalBudget.Used + $file.Length -gt $TotalBudget.Limit) {
+        $Row.Status = "Skipped: over the $($TotalBudget.Limit / 1MB) MB cap for all users"
+    } else {
+        $copiedBefore = $script:fileCount
+        Copy-ForensicFile -SourcePath $file.FullName -DestDir $Row.DestDir
+        if ($script:fileCount -gt $copiedBefore) {
+            $Row.Status = "Copied"
+            $Row.CollectedAs = Get-CollectionRelativePath $script:lastRecordedDestPath
+            if ($Budget) { $Budget.Used += $file.Length }
+            if ($TotalBudget) { $TotalBudget.Used += $file.Length }
+        } else {
+            $Row.Status = "Not copied: copy failed (see collection_log.txt)"
+        }
+    }
+}
+
+# Text with its %NAME% variables replaced from -Variables (a hashtable,
+# names not case-sensitive); "" if one of them is not in it
+function Expand-TriageUserPath {
+    param(
+        [string]$Text,
+        [hashtable]$Variables
+    )
+    $result = $Text
+    foreach ($match in [regex]::Matches($Text, '%([^%]+)%')) {
+        $name = $match.Groups[1].Value
+        if (-not $Variables.ContainsKey($name) -or -not $Variables[$name]) { return "" }
+        $result = $result.Replace($match.Value, [string]$Variables[$name])
+    }
+    return $result
+}
+
+# Environment variables of a logged-on user, to expand that user's registry
+# values as the user's own programs do: the system's variables (SystemRoot,
+# ProgramData, ...), the user's Volatile Environment (USERPROFILE, APPDATA,
+# LOCALAPPDATA, ...; USERPROFILE and LOCALAPPDATA from the profile list if
+# it is missing) and the user's Environment (TEMP, TMP, ...). The
+# collector's own user variables are never used.
+function Get-TriageUserEnvironment {
+    param([string]$Sid)
+    $variables = @{}
+    foreach ($name in @("SystemRoot", "windir", "SystemDrive", "ProgramData", "ALLUSERSPROFILE", "PUBLIC", "ProgramFiles",
+                        "ProgramFiles(x86)", "ProgramW6432", "CommonProgramFiles", "CommonProgramFiles(x86)")) {
+        $value = [Environment]::GetEnvironmentVariable($name)
+        if ($value) { $variables[$name] = $value }
+    }
+    $noExpand = [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames
+    $volatileKey = Open-TriageRegKey -Hive "HKU" -SubKey "$Sid\Volatile Environment"
+    if ($null -ne $volatileKey) {
+        try {
+            foreach ($name in $volatileKey.GetValueNames()) {
+                $value = Expand-TriageUserPath -Text ([string]$volatileKey.GetValue($name, "", $noExpand)) -Variables $variables
+                if ($name -and $value) { $variables[$name] = $value }
+            }
+        } catch {
+            Write-Verbose "Reading the Volatile Environment of ${Sid}: $($_.Exception.Message)"
+        } finally {
+            $volatileKey.Close()
+        }
+    }
+    if (-not $variables.ContainsKey("USERPROFILE")) {
+        $profileKey = Open-TriageRegKey -Hive "HKLM" -SubKey "SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$Sid"
+        if ($null -ne $profileKey) {
+            try {
+                $value = Expand-TriageUserPath -Text ([string]$profileKey.GetValue("ProfileImagePath", "", $noExpand)) -Variables $variables
+                if ($value) { $variables["USERPROFILE"] = $value.TrimEnd('\') }
+            } catch {
+                Write-Verbose "Reading ProfileImagePath for ${Sid}: $($_.Exception.Message)"
+            } finally {
+                $profileKey.Close()
+            }
+        }
+    }
+    if ($variables.ContainsKey("USERPROFILE") -and -not $variables.ContainsKey("LOCALAPPDATA")) {
+        $variables["LOCALAPPDATA"] = Join-Path $variables["USERPROFILE"] "AppData\Local"
+    }
+    $environmentKey = Open-TriageRegKey -Hive "HKU" -SubKey "$Sid\Environment"
+    if ($null -ne $environmentKey) {
+        try {
+            foreach ($name in $environmentKey.GetValueNames()) {
+                $value = Expand-TriageUserPath -Text ([string]$environmentKey.GetValue($name, "", $noExpand)) -Variables $variables
+                if ($name -and $value) { $variables[$name] = $value }
+            }
+        } catch {
+            Write-Verbose "Reading the Environment of ${Sid}: $($_.Exception.Message)"
+        } finally {
+            $environmentKey.Close()
+        }
+    }
+    return $variables
+}
+
+# An OutlookSecureTempFolder value as a folder path without the trailing
+# backslash; "" unless it is a full path below a drive or share root
+# ("C:\" or "C:" alone would list the whole drive or the current folder)
+function Get-TriageSecureTempFolderPath {
+    param([string]$Value)
+    $folder = $Value.Trim()
+    if ($folder -notmatch '^(?:[A-Za-z]:\\|\\\\[^\\]+\\[^\\]+\\)') { return "" }
+    try {
+        $root = [System.IO.Path]::GetPathRoot($folder).TrimEnd('\')
+    } catch {
+        Write-Verbose "Not a usable folder path: $folder -- $($_.Exception.Message)"
+        return ""
+    }
+    $folder = $folder.TrimEnd('\')
+    if ($folder.Length -le $root.Length) { return "" }
+    return $folder
+}
+
+# Live system: OutlookSecureTempFolder of each Office version in every
+# loaded user hive (HKU\<SID>\Software\Microsoft\Office\<ver>\Outlook\
+# Security): objects with User (profile folder name), Version, Value (as
+# stored) and Folder (environment variables expanded with the user's own
+# values; "" if one is unknown)
+function Get-TriageOutlookSecureTempFolders {
+    $folders = @()
+    foreach ($sid in (Get-TriageLoadedUserSids)) {
+        $officeKey = Open-TriageRegKey -Hive "HKU" -SubKey "$sid\Software\Microsoft\Office"
+        if ($null -eq $officeKey) { continue }
+        $userVariables = $null
+        try {
+            foreach ($version in $officeKey.GetSubKeyNames()) {
+                if ($version -notmatch '^\d+\.\d+$') { continue }
+                $securityKey = $officeKey.OpenSubKey("$version\Outlook\Security", $false)
+                if ($null -eq $securityKey) { continue }
+                try {
+                    $value = [string]$securityKey.GetValue("OutlookSecureTempFolder", "", [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+                } finally {
+                    $securityKey.Close()
+                }
+                if (-not $value.Trim()) { continue }
+                $folder = $value.Trim()
+                if ($folder.Contains('%')) {
+                    if ($null -eq $userVariables) { $userVariables = Get-TriageUserEnvironment -Sid $sid }
+                    $folder = Expand-TriageUserPath -Text $folder -Variables $userVariables
+                }
+                $folders += [PSCustomObject]@{ User = (Resolve-TriageSidUser $sid); Version = $version; Value = $value.Trim(); Folder = $folder }
+            }
+        } catch {
+            Log-Warning "Could not read the Outlook settings in HKU\$sid -- $($_.Exception.Message)"
+        } finally {
+            $officeKey.Close()
+        }
+    }
+    return $folders
+}
+
+# Thunderbird profile folders: those in profiles.ini (Path= relative to the
+# Thunderbird folder, or absolute -- mapped onto the image's drive in
+# mounted-image mode) and every folder under Profiles\. Links are skipped.
+function Get-TriageThunderbirdProfiles {
+    param(
+        [string]$ThunderbirdDir,
+        [string]$ProfileDir
+    )
+    $candidates = @()
+    $iniPath = Join-Path $ThunderbirdDir "profiles.ini"
+    if ([System.IO.File]::Exists($iniPath)) {
+        $isRelative = $true
+        $profilePath = ""
+        # The extra "[]" ends the last section
+        foreach ($line in (@([System.IO.File]::ReadAllLines($iniPath)) + "[]")) {
+            if ($line -match '^\s*\[') {
+                if ($profilePath) {
+                    $profilePath = $profilePath.Replace('/', '\')
+                    if ($isRelative) {
+                        $candidates += Join-Path $ThunderbirdDir $profilePath
+                    } elseif ($profilePath -match '^[A-Za-z]:\\') {
+                        if ($script:IsLive) { $candidates += $profilePath }
+                        else { $candidates += $script:TargetRoot + $profilePath.Substring(3) }
+                    }
+                }
+                $isRelative = $true
+                $profilePath = ""
+            } elseif ($line -match '^\s*IsRelative\s*=\s*(\d+)') {
+                $isRelative = $Matches[1] -ne "0"
+            } elseif ($line -match '^\s*Path\s*=\s*(.+?)\s*$') {
+                $profilePath = $Matches[1]
+            }
+        }
+    }
+    foreach ($dir in @(Get-ChildItem -LiteralPath (Join-Path $ThunderbirdDir "Profiles") -Directory -Force -ErrorAction SilentlyContinue)) {
+        $candidates += $dir.FullName
+    }
+    $profileDirs = @()
+    $seen = @{}
+    foreach ($candidate in $candidates) {
+        try {
+            $full = [System.IO.Path]::GetFullPath($candidate).TrimEnd('\')
+        } catch {
+            Write-Verbose "Thunderbird profile path not usable: $candidate -- $($_.Exception.Message)"
+            continue
+        }
+        if ($seen.ContainsKey($full)) { continue }
+        $seen[$full] = $true
+        if (-not [System.IO.Directory]::Exists($full)) { continue }
+        if (Test-TriageLinkedFolder -Path $full -StopAt $ProfileDir) { continue }
+        $profileDirs += $full
+    }
+    return $profileDirs
+}
+
+# Email artifacts of one user into Email\<user>\ (see the Email section).
+# -ProfileDir is empty for a user known only from the registry (live), of
+# whom only -RegistryTempFolders are listed.
+function Save-TriageUserEmail {
+    [OutputType([void])]
+    param(
+        [string]$UserName,
+        [string]$ProfileDir,
+        [string[]]$RegistryTempFolders,
+        [string]$EmailDir
+    )
+    $userDest = Join-Path $EmailDir $UserName
+    $found = @()
+    # Attachment copies of both Outlooks share the per-user cap
+    $budget = @{ Used = 0L; Limit = [long]$script:emailMaxUserBytes }
+    $attachmentRows = New-Object System.Collections.Generic.List[object]
+
+    # --- Classic Outlook: attachment temp folders (Content.Outlook) ---
+    $tempRoots = @()
+    if ($ProfileDir) {
+        $standardTempRoots = @(
+            @{ Label = "INetCache"; Folder = (Join-Path $ProfileDir "AppData\Local\Microsoft\Windows\INetCache\Content.Outlook") },
+            @{ Label = "TemporaryInternetFiles"; Folder = (Join-Path $ProfileDir "AppData\Local\Microsoft\Windows\Temporary Internet Files\Content.Outlook") }
+        )
+        foreach ($candidate in $standardTempRoots) {
+            if ([System.IO.Directory]::Exists($candidate.Folder) -and -not (Test-TriageLinkedFolder -Path $candidate.Folder -StopAt $ProfileDir)) {
+                $tempRoots += [PSCustomObject]@{ Label = $candidate.Label; Folder = $candidate.Folder; RelativeTo = $candidate.Folder; Recurse = $true }
+            }
+        }
+    }
+    foreach ($registryFolder in $RegistryTempFolders) {
+        # A Content.Outlook subfolder (the usual case) is listed already.
+        # Older Outlook versions name it by the "Temporary Internet Files"
+        # junction, which leads to INetCache.
+        $covered = $false
+        $resolvedFolder = $registryFolder -replace '\\Temporary Internet Files\\Content\.Outlook(?=\\|$)', '\INetCache\Content.Outlook'
+        foreach ($root in $tempRoots) {
+            foreach ($candidate in @($registryFolder, $resolvedFolder)) {
+                if (($candidate + '\').StartsWith($root.Folder + '\', [System.StringComparison]::OrdinalIgnoreCase)) { $covered = $true }
+            }
+        }
+        if ($covered) { continue }
+        if (-not [System.IO.Directory]::Exists($registryFolder)) {
+            Log "OutlookSecureTempFolder of $UserName does not exist: $registryFolder"
+            continue
+        }
+        if (Test-TriageLinkedFolder -Path $registryFolder) {
+            Log "OutlookSecureTempFolder of $UserName is (inside) a junction or symbolic link -- not listed: $registryFolder"
+            continue
+        }
+        $parentFolder = Split-Path $registryFolder -Parent
+        if (-not $parentFolder) { $parentFolder = $registryFolder }
+        $tempRoots += [PSCustomObject]@{ Label = "Custom"; Folder = $registryFolder; RelativeTo = $parentFolder; Recurse = $false }
+    }
+    $tempRows = New-Object System.Collections.Generic.List[object]
+    foreach ($root in $tempRoots) {
+        Log "Listing Outlook attachment temp folder of ${UserName}: $($root.Folder)"
+        foreach ($file in (Get-TriageEmailFiles -Folder $root.Folder -Recurse:$root.Recurse -NewestFirst)) {
+            $row = New-TriageEmailFileRow -User $UserName -Program "Classic Outlook" -Store "SecureTemp" -File $file -RelativeTo $root.RelativeTo
+            $subFolder = [System.IO.Path]::GetDirectoryName($row.RelativePath)
+            if (-not $subFolder -or [System.IO.Path]::IsPathRooted($subFolder)) { $subFolder = "" }
+            $row.DestDir = Join-Path $userDest ("Outlook\SecureTemp\" + $root.Label + "\" + $subFolder)
+            $tempRows.Add($row)
+            $attachmentRows.Add($row)
+        }
+    }
+
+    # --- New Outlook (olk): UserSettings.json, Attachments\, listing ---
+    $olkRows = New-Object System.Collections.Generic.List[object]
+    $olkSettingsRow = $null
+    $olkDir = ""
+    if ($ProfileDir) { $olkDir = Join-Path $ProfileDir "AppData\Local\Microsoft\Olk" }
+    $hasOlk = $olkDir -and [System.IO.Directory]::Exists($olkDir) -and -not (Test-TriageLinkedFolder -Path $olkDir -StopAt $ProfileDir)
+    if ($hasOlk) {
+        Log "Listing new Outlook (olk) folder of ${UserName}: $olkDir"
+        foreach ($file in (Get-TriageOlkFiles -OlkDir $olkDir)) {
+            $row = New-TriageEmailFileRow -User $UserName -Program "New Outlook" -Store "Olk" -File $file -RelativeTo $olkDir
+            if ($row.RelativePath -like "Attachments\*") {
+                $row.DestDir = Join-Path $userDest ("NewOutlook\" + [System.IO.Path]::GetDirectoryName($row.RelativePath))
+                $attachmentRows.Add($row)
+            } elseif ($row.RelativePath -eq "UserSettings.json") {
+                $row.DestDir = Join-Path $userDest "NewOutlook"
+                $olkSettingsRow = $row
+            }
+            $olkRows.Add($row)
+        }
+    }
+
+    # Attachment copies, newest first, within the caps
+    $copyRows = @($attachmentRows | Sort-Object { $_.File.LastWriteTimeUtc } -Descending)
+    foreach ($row in $copyRows) {
+        Copy-TriageEmailFile -Row $row -MaxBytes $script:emailMaxFileBytes -Budget $budget -TotalBudget $script:emailTotalBudget
+    }
+    if ($olkSettingsRow) {
+        Copy-TriageEmailFile -Row $olkSettingsRow -MaxBytes $script:emailMaxFileBytes
+        $copyRows += $olkSettingsRow
+    }
+    # Skips with their reason (all of them are in the listing CSVs; empty
+    # files hold nothing to collect)
+    $skippedRows = @($copyRows | Where-Object { $_.Status -like "Skipped: *" -and $_.Status -ne "Skipped: empty file" })
+    foreach ($row in @($skippedRows | Select-Object -First 25)) {
+        Log "Skipped ($($row.Status.Substring(9))): $($row.Path)"
+    }
+    if ($skippedRows.Count -gt 25) {
+        Log "... and $($skippedRows.Count - 25) more file(s) of $UserName skipped (reasons in the listing CSVs)"
+    }
+    if ($tempRoots.Count -gt 0) {
+        Export-TriageCsv -Description "Outlook attachment temp folder listing ($UserName)" `
+            -DestPath (Join-Path $userDest "Outlook\outlook_temp_files.csv") `
+            -Columns $script:emailListingColumns -Rows $tempRows.ToArray()
+        $copied = @($tempRows | Where-Object { $_.Status -eq "Copied" }).Count
+        $found += "Classic Outlook attachment temp folder ($($tempRows.Count) file(s), $copied copied)"
+    }
+    if ($hasOlk) {
+        Export-TriageCsv -Description "New Outlook folder listing ($UserName)" `
+            -DestPath (Join-Path $userDest "NewOutlook\olk_files.csv") `
+            -Columns $script:emailListingColumns -Rows $olkRows.ToArray()
+        $olkAttachments = @($olkRows | Where-Object { $_.RelativePath -like "Attachments\*" })
+        $copied = @($olkAttachments | Where-Object { $_.Status -eq "Copied" }).Count
+        $found += "new Outlook ($($olkRows.Count) file(s) listed, $($olkAttachments.Count) attachment(s), $copied copied)"
+    }
+    if (-not $ProfileDir) {
+        if ($found.Count -gt 0) { Log-Success "Email artifacts of ${UserName}: $($found -join '; ')" }
+        return
+    }
+
+    # --- Classic Outlook data files (OST/PST): listed, never copied ---
+    $dataFolders = @(
+        @{ Folder = (Join-Path $ProfileDir "AppData\Local\Microsoft\Outlook"); Recurse = $false; Extensions = @(".ost", ".pst") },
+        @{ Folder = (Join-Path $ProfileDir "Documents\Outlook Files"); Recurse = $true; Extensions = @(".pst") }
+    )
+    # Documents moved to OneDrive (OneDrive, "OneDrive - <organization>")
+    foreach ($oneDrive in @(Get-ChildItem -LiteralPath $ProfileDir -Directory -Filter "OneDrive*" -Force -ErrorAction SilentlyContinue)) {
+        $dataFolders += @{ Folder = (Join-Path $oneDrive.FullName "Documents\Outlook Files"); Recurse = $true; Extensions = @(".pst") }
+    }
+    $dataRows = New-Object System.Collections.Generic.List[object]
+    $hasDataFolder = $false
+    foreach ($dataFolder in $dataFolders) {
+        if (-not [System.IO.Directory]::Exists($dataFolder.Folder) -or (Test-TriageLinkedFolder -Path $dataFolder.Folder -StopAt $ProfileDir)) { continue }
+        $hasDataFolder = $true
+        foreach ($file in (Get-TriageEmailFiles -Folder $dataFolder.Folder -Recurse:$dataFolder.Recurse -Extensions $dataFolder.Extensions)) {
+            $dataRows.Add((New-TriageEmailFileRow -User $UserName -Program "Classic Outlook" -Store "DataFile" -File $file -RelativeTo $ProfileDir))
+        }
+    }
+    if ($hasDataFolder) {
+        Export-TriageCsv -Description "Outlook data file listing ($UserName)" `
+            -DestPath (Join-Path $userDest "Outlook\outlook_data_files.csv") `
+            -Columns $script:emailListingColumns -Rows $dataRows.ToArray()
+        $found += "Outlook data files ($($dataRows.Count) OST/PST listed)"
+    }
+
+    # --- Thunderbird: profiles.ini; per profile prefs.js, the gloda search
+    # index and a listing of the Mail\ and ImapMail\ folders ---
+    $thunderbirdDir = Join-Path $ProfileDir "AppData\Roaming\Thunderbird"
+    if ([System.IO.Directory]::Exists($thunderbirdDir) -and -not (Test-TriageLinkedFolder -Path $thunderbirdDir -StopAt $ProfileDir)) {
+        $thunderbirdDest = Join-Path $userDest "Thunderbird"
+        Copy-ForensicFile -SourcePath (Join-Path $thunderbirdDir "profiles.ini") -DestDir $thunderbirdDest
+        $mailRows = New-Object System.Collections.Generic.List[object]
+        $thunderbirdProfiles = @(Get-TriageThunderbirdProfiles -ThunderbirdDir $thunderbirdDir -ProfileDir $ProfileDir)
+        foreach ($thunderbirdProfile in $thunderbirdProfiles) {
+            $profileName = Split-Path $thunderbirdProfile -Leaf
+            $profileDest = Join-Path $thunderbirdDest $profileName
+            Log "Collecting Thunderbird profile of ${UserName}: $thunderbirdProfile"
+            Copy-ForensicFile -SourcePath (Join-Path $thunderbirdProfile "prefs.js") -DestDir $profileDest
+            # global-messages-db.sqlite: the search index (dates, authors,
+            # recipients, subjects, attachment names -- and the text -- of
+            # the indexed mail); only with -IncludeThunderbirdIndex
+            $glodaPath = Join-Path $thunderbirdProfile "global-messages-db.sqlite"
+            $glodaBytes = Get-FileLength $glodaPath
+            if ($glodaBytes -ge 0) {
+                $glodaBytes += [Math]::Max(0, (Get-FileLength "$glodaPath-wal"))
+                if (-not $script:emailIncludeIndex) {
+                    Log "Not copied (search index, holds the message text; -IncludeThunderbirdIndex copies it), $([math]::Round($glodaBytes / 1MB)) MB: $glodaPath"
+                } elseif ($glodaBytes -gt $script:emailMaxDatabaseBytes) {
+                    Log "Skipped (over the $($script:emailMaxDatabaseBytes / 1MB) MB database cap, $([math]::Round($glodaBytes / 1MB)) MB): $glodaPath"
+                } else {
+                    foreach ($suffix in @("", "-wal", "-journal")) {
+                        Copy-ForensicFile -SourcePath "$glodaPath$suffix" -DestDir $profileDest
+                    }
+                }
+            }
+            foreach ($mailFolder in @("Mail", "ImapMail")) {
+                $mailRoot = Join-Path $thunderbirdProfile $mailFolder
+                if (-not [System.IO.Directory]::Exists($mailRoot) -or (Test-TriageLinkedFolder -Path $mailRoot -StopAt $thunderbirdProfile)) { continue }
+                foreach ($file in (Get-TriageEmailFiles -Folder $mailRoot -Recurse)) {
+                    $mailRows.Add((New-TriageEmailFileRow -User $UserName -Program "Thunderbird" -Store "ThunderbirdMail" -File $file -RelativeTo $thunderbirdProfile -ProfileName $profileName))
+                }
+            }
+        }
+        Export-TriageCsv -Description "Thunderbird mail folder listing ($UserName)" `
+            -DestPath (Join-Path $thunderbirdDest "thunderbird_mail_files.csv") `
+            -Columns $script:emailListingColumns -Rows $mailRows.ToArray()
+        $found += "Thunderbird ($($thunderbirdProfiles.Count) profile(s), $($mailRows.Count) mail file(s) listed)"
+    }
+
+    # --- Windows Mail: the app's LocalState and the Comms\UnistoreDB store
+    # are listed, never copied ---
+    $windowsMailPackage = Join-Path $ProfileDir "AppData\Local\Packages\microsoft.windowscommunicationsapps_8wekyb3d8bbwe"
+    $windowsMailState = Join-Path $windowsMailPackage "LocalState"
+    if ([System.IO.Directory]::Exists($windowsMailState) -and -not (Test-TriageLinkedFolder -Path $windowsMailState -StopAt $ProfileDir)) {
+        $windowsMailRows = New-Object System.Collections.Generic.List[object]
+        $windowsMailRoots = @(@{ Folder = $windowsMailState; RelativeTo = $windowsMailPackage })
+        $commsDir = Join-Path $ProfileDir "AppData\Local\Comms"
+        $windowsMailRoots += @{ Folder = (Join-Path $commsDir "UnistoreDB"); RelativeTo = $commsDir }
+        foreach ($windowsMailRoot in $windowsMailRoots) {
+            if (-not [System.IO.Directory]::Exists($windowsMailRoot.Folder) -or (Test-TriageLinkedFolder -Path $windowsMailRoot.Folder -StopAt $ProfileDir)) { continue }
+            foreach ($file in (Get-TriageEmailFiles -Folder $windowsMailRoot.Folder -Recurse)) {
+                $windowsMailRows.Add((New-TriageEmailFileRow -User $UserName -Program "Windows Mail" -Store "WindowsMail" -File $file -RelativeTo $windowsMailRoot.RelativeTo))
+            }
+        }
+        Export-TriageCsv -Description "Windows Mail store listing ($UserName)" `
+            -DestPath (Join-Path $userDest "WindowsMail\windows_mail_files.csv") `
+            -Columns $script:emailListingColumns -Rows $windowsMailRows.ToArray()
+        $found += "Windows Mail ($($windowsMailRows.Count) file(s) listed)"
+    }
+
+    if ($found.Count -gt 0) {
+        Log-Success "Email artifacts of ${UserName}: $($found -join '; ')"
+    } else {
+        Log "No email artifacts for $UserName"
+    }
+}
+
+# =============================================================
+# 11. Email Artifacts
+# =============================================================
+# Per user profile, live system and mounted images, into Email\<user>\:
+#   Outlook\      classic Outlook: attachments opened from mail (the
+#                 Content.Outlook temp folder; capped copies in SecureTemp\)
+#                 with a listing of every file found there, and a listing
+#                 of the OST/PST data files (never copied)
+#   NewOutlook\   new Outlook (olk): UserSettings.json and Attachments\
+#                 (capped copies), and a listing of the whole Olk folder
+#                 (its mail data in EBWebView\ is listed, not copied)
+#   Thunderbird\  profiles.ini; per profile prefs.js (and, only with
+#                 -IncludeThunderbirdIndex, the global-messages-db.sqlite
+#                 search index, which holds the message text), and a listing
+#                 of the Mail\ and ImapMail\ folders (mailboxes are not copied)
+#   WindowsMail\  a listing of the Windows Mail store (not copied)
+if ($Categories -contains "Email") {
+    Log "============================================================="
+    Log "  COLLECTING: Email Artifacts"
+    Log "============================================================="
+    $emailDir = Join-Path $OutputPath "Email"
+    Log "Attachment copy caps: $($script:emailMaxFileBytes / 1MB) MB per file, $($script:emailMaxUserBytes / 1MB) MB per user, $($script:emailMaxTotalBytes / 1MB) MB for all users"
+    if ($script:emailIncludeIndex) {
+        Log "Thunderbird search index (global-messages-db.sqlite): copied (-IncludeThunderbirdIndex)"
+    }
+
+    # Live system: the attachment temp folder each logged-on user's Outlook
+    # uses (normally a Content.Outlook subfolder, listed anyway; a folder
+    # elsewhere is listed and copied as well)
+    $registryTempFolders = @{}
+    if ($script:IsLive) {
+        Log "Reading OutlookSecureTempFolder from the loaded user hives..."
+        foreach ($entry in (Get-TriageOutlookSecureTempFolders)) {
+            $label = "OutlookSecureTempFolder of $($entry.User) (Office $($entry.Version))"
+            if (-not $entry.Folder) {
+                Log "$label holds an environment variable the user does not have -- skipped: $($entry.Value)"
+                continue
+            }
+            $folder = Get-TriageSecureTempFolderPath $entry.Folder
+            if (-not $folder) {
+                Log "$label is not a folder below a drive or share root -- not listed: $($entry.Folder)"
+                continue
+            }
+            Log "${label}: $folder"
+            if (-not $entry.User) { continue }
+            if (-not $registryTempFolders.ContainsKey($entry.User)) { $registryTempFolders[$entry.User] = @() }
+            $registryTempFolders[$entry.User] += $folder
+        }
+    } else {
+        Log "Skipping the OutlookSecureTempFolder lookup (mounted image -- the Content.Outlook folders are listed instead; the value is in the collected NTUSER.DAT)"
+    }
+
+    $userProfiles = @(Get-ChildItem "${script:TargetRoot}Users" -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -notin @("Public", "Default", "Default User", "All Users") })
+    foreach ($userDir in $userProfiles) {
+        $userTempFolders = @()
+        if ($registryTempFolders.ContainsKey($userDir.Name)) { $userTempFolders = @($registryTempFolders[$userDir.Name]) }
+        Save-TriageUserEmail -UserName $userDir.Name -ProfileDir $userDir.FullName -RegistryTempFolders $userTempFolders -EmailDir $emailDir
+    }
+    # Logged-on users whose profile folder is not under Users\
+    $profileNames = @($userProfiles | ForEach-Object { $_.Name })
+    foreach ($otherUser in @($registryTempFolders.Keys | Where-Object { $profileNames -notcontains $_ })) {
+        Save-TriageUserEmail -UserName $otherUser -ProfileDir "" -RegistryTempFolders @($registryTempFolders[$otherUser]) -EmailDir $emailDir
+    }
+
+    Log-Success "Email artifacts collection complete."
+    Log ""
+}
+
+# =============================================================
+# 12. Secrets (opt-in: -IncludeSecrets)
+# =============================================================
+# DPAPI credential material: what an examiner needs to decrypt the unredacted
+# browser copies (and the user's other DPAPI-protected data) offline, given
+# the user's password or the domain backup key. Collected both live and from a
+# mounted image. The files are small; a shared total cap guards against
+# anything unexpected and skips are logged. Junctions and symbolic links out of
+# the profile are never followed.
+
+# Source paths of the files under $Folder and its subfolders (hidden/system
+# included), without entering junctions or symbolic links. A folder that
+# cannot be listed directly (an ACL-protected system folder on a live system)
+# is listed from the shadow copy instead when one is available. Returns
+# objects with Path and Length (Length -1 when the file could not be stat'd);
+# unreadable folders are logged.
+function Get-TriageSecretFiles {
+    [OutputType([System.Object[]])]
+    param([string]$Folder)
+    $results = New-Object System.Collections.Generic.List[object]
+    if (-not (Test-Path -LiteralPath $Folder)) { return $results.ToArray() }
+    $stack = New-Object System.Collections.Generic.Stack[string]
+    $stack.Push($Folder)
+    while ($stack.Count -gt 0) {
+        $dir = $stack.Pop()
+        $entries = $null
+        $listed = $false
+        try {
+            $entries = @(Get-ChildItem -LiteralPath $dir -Force -ErrorAction Stop)
+            $listed = $true
+        } catch {
+            Write-Verbose "Listing ${dir}: $($_.Exception.Message)"
+        }
+        if ($listed) {
+            foreach ($entry in $entries) {
+                if (Test-TriageLinkItem -Item $entry) {
+                    # A junction or symbolic link (folder or file). Never
+                    # followed: in a mounted image its target resolves on the
+                    # analysis machine, and File.Copy would follow a link file.
+                    Log "Skipped (junction/symbolic link out of the profile, not followed): $($entry.FullName)"
+                    continue
+                }
+                if ($entry.PSIsContainer) {
+                    $stack.Push($entry.FullName)
+                } else {
+                    $results.Add([PSCustomObject]@{ Path = $entry.FullName; Length = [long]$entry.Length })
+                }
+            }
+            continue
+        }
+        # Direct listing failed. On current Windows the system DPAPI folders
+        # are readable by administrators, so this is only reached on a hardened
+        # system. As a best effort, list the folder from a shadow copy (created
+        # on demand) and let Copy-ForensicFile read the content. Note: a shadow
+        # copy preserves the volume's ACLs, so a listing denied here is usually
+        # denied in the snapshot too; anything that cannot be listed is logged.
+        $relDir = Get-TargetRelativePath $dir
+        $names = $null
+        if ($script:IsLive -and $relDir) {
+            $null = Initialize-ShadowCopy
+            $names = Get-ShadowFileNames $relDir
+        }
+        if ($null -ne $names) {
+            foreach ($name in $names) { $results.Add([PSCustomObject]@{ Path = (Join-Path $dir $name); Length = [long](-1) }) }
+            Log "Listed $($names.Count) file(s) from the shadow copy (folder not directly readable): $dir"
+        } else {
+            Log-Warning "Could not list (collected credential material may be incomplete): $dir"
+            $script:errorCount++
+        }
+    }
+    return $results.ToArray()
+}
+
+# Copy the files under $SourceDir into $DestDir (same subfolder layout),
+# reading hidden/system and ACL-protected files, within the shared Secrets
+# budget. Skips (per-file cap or total cap) are logged. $Label names the group.
+function Copy-TriageSecretFolder {
+    [OutputType([void])]
+    param(
+        [string]$SourceDir,
+        [string]$DestDir,
+        [string]$Label,
+        # Stop climbing at this folder when checking for a link above the
+        # source (the user profile, or the Windows root for the system keys).
+        [string]$StopAt = ""
+    )
+    if (-not (Test-Path -LiteralPath $SourceDir)) { return }
+    # Never follow a junction or symbolic link out of the profile: if the
+    # source folder itself (or a folder above it, up to $StopAt) is a link,
+    # skip it. Otherwise, in a mounted image an absolute link target would
+    # resolve on the analysis machine and copy the examiner's own files in.
+    if (Test-TriageLinkedFolder -Path $SourceDir -StopAt $StopAt) {
+        Log "Skipped (junction/symbolic link out of the profile, not followed): $SourceDir"
+        return
+    }
+    $files = @(Get-TriageSecretFiles -Folder $SourceDir | Sort-Object Path)
+    if ($files.Count -eq 0) { return }
+    $root = $SourceDir.TrimEnd('\')
+    $collectedBefore = $script:fileCount
+    foreach ($file in $files) {
+        if ($file.Length -gt $script:secretsMaxFileBytes) {
+            Log "Skipped $Label file over $([math]::Round($script:secretsMaxFileBytes / 1MB)) MB ($($file.Length) bytes): $($file.Path)"
+            continue
+        }
+        if ($file.Length -ge 0 -and ($script:secretsBudget.Used + $file.Length) -gt $script:secretsBudget.Limit) {
+            Log "Skipped $Label file over the $([math]::Round($script:secretsBudget.Limit / 1MB)) MB Secrets total cap: $($file.Path)"
+            continue
+        }
+        $relDir = ""
+        if ($file.Path.Length -gt $root.Length + 1) { $relDir = Split-Path $file.Path.Substring($root.Length + 1) -Parent }
+        $fileDestDir = if ($relDir) { Join-Path $DestDir $relDir } else { $DestDir }
+        $before = $script:totalBytes
+        Copy-ForensicFile -SourcePath $file.Path -DestDir $fileDestDir -FallbackOnAccessDenied
+        $script:secretsBudget.Used += ($script:totalBytes - $before)
+    }
+    $count = $script:fileCount - $collectedBefore
+    if ($count -gt 0) { Log-Success "Collected $count $Label file(s)" }
+}
+
+if ($IncludeSecrets) {
+    Log "============================================================="
+    Log "  COLLECTING: Secrets (DPAPI credential material -- -IncludeSecrets)"
+    Log "============================================================="
+    $secretsDir = Join-Path $OutputPath "Secrets"
+    # Shared total cap across every secret folder; credential files are small
+    $script:secretsBudget = @{ Used = 0L; Limit = 2GB }
+    $script:secretsMaxFileBytes = 64MB
+
+    $userProfiles = @(Get-ChildItem "${script:TargetRoot}Users" -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -notin @("Public", "Default", "Default User", "All Users") })
+    foreach ($userDir in $userProfiles) {
+        $userName = $userDir.Name
+        $userDest = Join-Path $secretsDir $userName
+        # Per user: DPAPI master keys (Protect\<SID>\<GUID> plus Preferred and
+        # CREDHIST), Credentials (roaming and local) and Vault
+        $secretSources = @(
+            @{ Rel = "AppData\Roaming\Microsoft\Protect";     Label = "$userName DPAPI master key" }
+            @{ Rel = "AppData\Roaming\Microsoft\Credentials"; Label = "$userName Credentials (roaming)" }
+            @{ Rel = "AppData\Local\Microsoft\Credentials";   Label = "$userName Credentials (local)" }
+            @{ Rel = "AppData\Local\Microsoft\Vault";         Label = "$userName Vault" }
+        )
+        foreach ($s in $secretSources) {
+            Copy-TriageSecretFolder -SourceDir (Join-Path $userDir.FullName $s.Rel) -DestDir (Join-Path $userDest $s.Rel) -Label $s.Label -StopAt $userDir.FullName
+        }
+    }
+
+    # System DPAPI master keys: %SystemRoot%\System32\Microsoft\Protect
+    # (S-1-5-18 and its User subfolder). These are hidden/system files that on
+    # current Windows are readable by administrators, so they copy directly; on
+    # a hardened system where access is denied, Copy-ForensicFile's
+    # shadow-copy / raw-NTFS fallback is a safety net (the raw read bypasses the
+    # ACL) and anything that still cannot be read is logged. App-Bound
+    # Encryption (Chrome/Edge) can only be undone on the live machine and is not
+    # touched.
+    $systemProtect = "${script:TargetRoot}Windows\System32\Microsoft\Protect"
+    Copy-TriageSecretFolder -SourceDir $systemProtect -DestDir (Join-Path $secretsDir "System\System32\Microsoft\Protect") -Label "system DPAPI master key" -StopAt "${script:TargetRoot}Windows"
+
+    Log "Secrets collected: $([math]::Round($script:secretsBudget.Used / 1MB, 2)) MB"
+    if ($Categories -contains "Registry") {
+        Log-Warning "The Secrets folder holds DPAPI credential material. With the SYSTEM and SECURITY hives (boot key and the DPAPI_SYSTEM LSA secret; SAM for local password hashes), collected by the Registry category, and the user's password or the domain backup key, the saved passwords and session cookies in the unredacted browser copies can be decrypted offline. Handle this collection like a password store."
+    } else {
+        Log-Warning "The Secrets folder holds DPAPI credential material, but the Registry category was NOT selected, so the SYSTEM and SECURITY hives are not in this collection. The per-user secrets can still be decrypted offline with the user's password or the domain backup key, but the machine (S-1-5-18) DPAPI master keys cannot be decrypted without SYSTEM and SECURITY. Re-run including the Registry category if the machine keys are needed. Handle this collection like a password store."
+    }
+    Log-Success "Secrets collection complete."
+    Log ""
+}
+
 # =============================================================
 # Cleanup: Remove Shadow Copy and Defender Exclusion
 # =============================================================
@@ -4402,6 +6263,8 @@ if ($memDumpMovedTo -and (Test-Path -LiteralPath $memDumpMovedTo)) {
     Write-Host "  Memory dump:    $memDumpMovedTo ($dumpGB GB)"
 }
 
-Write-Host ""
-Write-Host "Press any key to exit..." -ForegroundColor Cyan
-$null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+if (-not $Unattended) {
+    Write-Host ""
+    Write-Host "Press any key to exit..." -ForegroundColor Cyan
+    $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+}

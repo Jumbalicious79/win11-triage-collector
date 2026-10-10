@@ -895,7 +895,12 @@ normal. Only the parent links and the start times decide what is recorded:
 not the launcher's other children (programs run earlier from the same cmd
 window), not the collector's children from before the run (a run from an
 open PowerShell window, whose console host is then not recorded either),
-and not a process whose ID was reused. Collections
+and not a process whose ID was reused. The report checks each entry against
+these same rules in the memory dump (the collector a PowerShell process
+started before the collection, the launcher its cmd.exe parent, and so on),
+so an entry added to collection_info.json afterwards is never left out: it
+is listed with its reason, and the report and the builder log say to check
+whether the file was altered. Collections
 made by earlier versions have no CollectorProcesses, and their reports can
 show the collector itself (DumpIt, Run-TriageCollector.bat,
 triage-collector.ps1) as leads.
@@ -1170,8 +1175,11 @@ The fastest path from collection to analysis:
     30 seconds), only the collector's own PowerShell is recorded (its
     parent as 0); if the second write fails (for example on a drive the
     dump has filled), the first version is kept. Either way the timeline
-    builder's report can then show the processes that are missing (the
-    .bat's cmd window, the capture tool) as leads. Neither is an error.
+    builder's report still recognizes the collector's PowerShell and the
+    processes it started during the collection, the capture tool among
+    them. When only the PowerShell is recorded, the .bat's cmd window is
+    not left out: a lead on it (the .bat run from Downloads) is marked on
+    its card as possibly the collector. Neither is an error.
     Warning: "Could not read the collector's process tree (Win32_Process): ... Only the collector's own PowerShell process is recorded in collection_info.json."
     Warning: "collection_info.json not updated (...): DumpIt.exe (PID 10232) is not recorded as the memory capture tool, so the timeline builder's report can show it as a lead. ..."
 

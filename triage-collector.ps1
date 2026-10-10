@@ -1172,6 +1172,111 @@ function Save-MemoryAcquisitionLog {
 }
 
 # ----------------------------------------------------------
+# Helpers: run the memory capture tool and keep its process ID
+# ----------------------------------------------------------
+# One argument of a program's command line, quoted so the Microsoft C
+# runtime splits it back as it was: in quotes when it is empty or holds
+# white space or a quote, a quote as \", and the backslashes before a
+# quote or the closing quote doubled
+function ConvertTo-NativeArgument {
+    [OutputType([string])]
+    param([string]$Argument)
+    if ($Argument.Length -gt 0 -and $Argument -notmatch '[\s"]') { return $Argument }
+    $quoted = New-Object System.Text.StringBuilder
+    [void]$quoted.Append([char]'"')
+    $backslashes = 0
+    foreach ($ch in $Argument.ToCharArray()) {
+        if ($ch -eq [char]'\') { $backslashes++; continue }
+        if ($ch -eq [char]'"') { [void]$quoted.Append([char]'\', 2 * $backslashes + 1) }
+        elseif ($backslashes -gt 0) { [void]$quoted.Append([char]'\', $backslashes) }
+        [void]$quoted.Append($ch)
+        $backslashes = 0
+    }
+    if ($backslashes -gt 0) { [void]$quoted.Append([char]'\', 2 * $backslashes) }
+    [void]$quoted.Append([char]'"')
+    return $quoted.ToString()
+}
+
+# Runs the memory capture tool (Path, Arguments) as a child of the
+# collector in the collector's console, as "& <tool> ... 2>&1" did, but
+# through Process.Start, so its process ID and start time are known:
+# collection_info.json records them, and the timeline builder leaves the
+# tool's own process in the memory dump unflagged. Standard output and
+# standard error are read whole, in the console's output encoding;
+# standard input stays the console's. Returns ProcessId, StartTimeUtc
+# (to 100 ns), Name (the file name), ExitCode, Output (the standard output
+# lines, then the standard error lines; empty lines left out) and Error
+# (what could not be read, "" normally). Throws only when the tool cannot
+# be started. Ctrl+C reaches the tool too; one still running 5 s later is
+# ended (as & did) and the stop goes on.
+function Invoke-MemoryCaptureTool {
+    param(
+        [string]$Path,
+        [string[]]$Arguments = @()
+    )
+    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $startInfo.FileName = $Path
+    $startInfo.Arguments = (@($Arguments | ForEach-Object { ConvertTo-NativeArgument $_ }) -join ' ')
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $false
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $startInfo.StandardOutputEncoding = [Console]::OutputEncoding
+    $startInfo.StandardErrorEncoding = [Console]::OutputEncoding
+    $startInfo.WorkingDirectory = (Get-Location -PSProvider FileSystem).ProviderPath
+    $capture = @{
+        ProcessId    = 0
+        StartTimeUtc = $null
+        Name         = [System.IO.Path]::GetFileName($Path)
+        ExitCode     = $null
+        Output       = @()
+        Error        = ""
+    }
+    $problems = New-Object System.Collections.Generic.List[string]
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $startInfo
+    try {
+        [void]$process.Start()
+        $capture.ProcessId = $process.Id
+        try { $capture.StartTimeUtc = $process.StartTime.ToUniversalTime() }
+        catch { $problems.Add("its start time could not be read: $($_.Exception.Message)") }
+        $stdout = $process.StandardOutput.ReadToEndAsync()
+        $stderr = $process.StandardError.ReadToEndAsync()
+        $finished = $false
+        try {
+            # Short waits: Ctrl+C stops the run between two of them
+            while (-not $process.WaitForExit(250)) { }
+            $finished = $true
+        } finally {
+            if (-not $finished -and -not $process.WaitForExit(5000)) {
+                try {
+                    $process.Kill()
+                    Log-Warning "Memory capture tool stopped (Ctrl+C): $($capture.Name) (PID $($capture.ProcessId)) was still running 5 seconds later and was ended"
+                } catch {
+                    Log-Warning "Memory capture tool still running after Ctrl+C and could not be ended: $($capture.Name) (PID $($capture.ProcessId)) -- $($_.Exception.Message)"
+                }
+            }
+        }
+        $lines = New-Object System.Collections.Generic.List[string]
+        try {
+            foreach ($text in @($stdout.Result, $stderr.Result)) {
+                foreach ($line in ([string]$text -split "`r?`n")) {
+                    if ($line.Length -gt 0) { $lines.Add($line) }
+                }
+            }
+            $capture.ExitCode = $process.ExitCode
+        } catch {
+            $problems.Add("its output could not be read whole: $($_.Exception.Message)")
+        }
+        $capture.Output = $lines.ToArray()
+    } finally {
+        $process.Dispose()
+    }
+    $capture.Error = $problems -join "; "
+    return $capture
+}
+
+# ----------------------------------------------------------
 # Helpers: check a finished memory capture
 # ----------------------------------------------------------
 # The memory dump of this run, set by the memory section only for a dump
@@ -1181,7 +1286,7 @@ $script:memDumpPath = $null
 $script:memDumpIncompletePath = $null
 
 # Checks a finished memory capture. Output: the capture tool's output
-# (& <tool> ... 2>&1); DumpBytes: size of the dump file, -1 if there is
+# (Invoke-MemoryCaptureTool); DumpBytes: size of the dump file, -1 if there is
 # none (Get-FileLength); RamBytes: 0 if unknown. Reads what DumpIt reports
 # ("NtStatus (troubleshooting): 0x...", "Created file size: N bytes") and
 # collects the tool's "Error:" lines. The dump is complete when it exists,
@@ -1269,70 +1374,139 @@ function Move-IncompleteMemoryDump {
     return $null
 }
 
+# Writes Text to Path through <Path>.new, which is then renamed into place
+# (a file already at Path is first renamed to <Path>.old, put back if that
+# rename fails, and deleted after), so a write that fails (a full disk)
+# leaves the file as it was. Throws when the new text is not in place:
+# <Path>.new is deleted then, and when even the old file could not be put
+# back, the message says "<Name> is left as <Path>.old"
+function Write-FileByRename {
+    [OutputType([void])]
+    param(
+        [string]$Path,
+        [string]$Text,
+        [System.Text.Encoding]$Encoding,
+        [string]$Name = "The earlier version"
+    )
+    $newFile = "$Path.new"
+    $oldFile = "$Path.old"
+    $existed = [System.IO.File]::Exists($Path)
+    try {
+        [System.IO.File]::WriteAllText($newFile, $Text, $Encoding)
+        if ($existed) {
+            [System.IO.File]::Move($Path, $oldFile)
+            try { [System.IO.File]::Move($newFile, $Path) }
+            catch { [System.IO.File]::Move($oldFile, $Path); throw }
+        } else {
+            [System.IO.File]::Move($newFile, $Path)
+        }
+    } catch {
+        $message = $_.Exception.Message
+        if ([System.IO.File]::Exists($Path) -or -not $existed) {
+            try { [System.IO.File]::Delete($newFile) } catch { Write-Verbose "Could not delete ${newFile}: $($_.Exception.Message)" }
+        } else {
+            $message += " $Name is left as $oldFile."
+        }
+        throw $message
+    }
+    if ($existed) {
+        try { [System.IO.File]::Delete($oldFile) }
+        catch { Log-Warning "Could not delete the version from before that change: $oldFile -- $($_.Exception.Message)" }
+    }
+}
+
+# Changes the manifest row whose DestPath is DestPath (and any other such
+# row): Values maps a field index (0 SHA256 ... 8 SourceAccessedUtc) to its
+# new text. Every other line stays as it is (also one that has DestPath in
+# another field). The new manifest is written through Write-FileByRename
+# (collection_manifest.csv.new), so a failure leaves the old one. Returns
+# the first changed row's old fields, or $null when no row names DestPath
+# (a file that could not be hashed has none: Record-Manifest warned then).
+# Throws when the manifest cannot be read or written.
+function Edit-ManifestRow {
+    param(
+        [string]$DestPath,
+        [hashtable]$Values
+    )
+    # UTF-8 with BOM, as the manifest is written; lines end in CRLF. Only
+    # the lines that hold DestPath (quoted, as a field) are looked at. The
+    # whole text is passed to one .NET call only, the write: PowerShell 7
+    # scans the arguments of each call (about 2 s for a 45 MB manifest)
+    $utf8 = New-Object System.Text.UTF8Encoding($true)
+    $text = [System.IO.File]::ReadAllText($manifestFile, $utf8)
+    $destField = ConvertTo-CsvField $DestPath
+    $oldFields = $null
+    $at = $text.IndexOf($destField, [System.StringComparison]::OrdinalIgnoreCase)
+    while ($at -ge 0) {
+        $start = $text.LastIndexOf([char]10, $at) + 1
+        $end = $text.IndexOf("`r`n", $at, [System.StringComparison]::Ordinal)
+        if ($end -lt 0) { $end = $text.Length }
+        # Every field is quoted, quotes in it doubled (ConvertTo-CsvField)
+        $fields = @([regex]::Matches($text.Substring($start, $end - $start), '"((?:[^"]|"")*)"(?:,|$)') | ForEach-Object { $_.Groups[1].Value.Replace('""', '"') })
+        if ($start -gt 0 -and $fields.Count -eq 9 -and $fields[2].Equals($DestPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+            if ($null -eq $oldFields) { $oldFields = $fields.Clone() }
+            foreach ($index in $Values.Keys) { $fields[$index] = [string]$Values[$index] }
+            $row = ($fields | ForEach-Object { ConvertTo-CsvField $_ }) -join ','
+            $text = $text.Substring(0, $start) + $row + $text.Substring($end)
+            $end = $start + $row.Length
+        }
+        $at = $text.IndexOf($destField, $end, [System.StringComparison]::OrdinalIgnoreCase)
+    }
+    if ($null -eq $oldFields) { return $null }
+    Write-FileByRename -Path $manifestFile -Text $text -Encoding $utf8 -Name "The manifest"
+    return , $oldFields
+}
+
 # The timeline builder finds the memory dump through its row in
 # collection_manifest.csv (DestPath, SizeBytes). The compression step moves
 # a dump in Memory\ next to the zip, and back if the zip fails, after that
 # row was written: this changes the DestPath of the row whose DestPath is
 # OldPath to NewPath, and its RelativePath to match (blank outside the
 # collection). Its hash, size and times stay, and so does every other line
-# (also one that has OldPath in another field). The new manifest is written
-# as collection_manifest.csv.new and renamed into place, so a failure
-# leaves the old one (a warning). Returns $true when the row was changed;
-# $false when that failed or there is no such row (a dump that could not
-# be hashed has none: Record-Manifest warned then).
+# (Edit-ManifestRow). A failure leaves the old manifest (a warning).
+# Returns $true when the row was changed; $false when that failed or there
+# is no such row (a dump that could not be hashed has none).
 function Set-ManifestDumpPath {
     [OutputType([bool])]
     param(
         [string]$OldPath,
         [string]$NewPath
     )
-    $newFile = "$manifestFile.new"
-    $oldFile = "$manifestFile.old"
     try {
-        # UTF-8 with BOM, as the manifest is written; lines end in CRLF. Only
-        # the lines that hold OldPath (quoted, as a field) are looked at. The
-        # whole text is passed to one .NET call only, the write: PowerShell 7
-        # scans the arguments of each call (about 2 s for a 45 MB manifest)
-        $utf8 = New-Object System.Text.UTF8Encoding($true)
-        $text = [System.IO.File]::ReadAllText($manifestFile, $utf8)
-        $oldField = ConvertTo-CsvField $OldPath
-        $changed = $false
-        $at = $text.IndexOf($oldField, [System.StringComparison]::OrdinalIgnoreCase)
-        while ($at -ge 0) {
-            $start = $text.LastIndexOf([char]10, $at) + 1
-            $end = $text.IndexOf("`r`n", $at, [System.StringComparison]::Ordinal)
-            if ($end -lt 0) { $end = $text.Length }
-            # Every field is quoted, quotes in it doubled (ConvertTo-CsvField)
-            $fields = @([regex]::Matches($text.Substring($start, $end - $start), '"((?:[^"]|"")*)"(?:,|$)') | ForEach-Object { $_.Groups[1].Value.Replace('""', '"') })
-            if ($start -gt 0 -and $fields.Count -eq 9 -and $fields[2].Equals($OldPath, [System.StringComparison]::OrdinalIgnoreCase)) {
-                $fields[2] = $NewPath
-                $fields[5] = Get-CollectionRelativePath $NewPath
-                $row = ($fields | ForEach-Object { ConvertTo-CsvField $_ }) -join ','
-                $text = $text.Substring(0, $start) + $row + $text.Substring($end)
-                $end = $start + $row.Length
-                $changed = $true
-            }
-            $at = $text.IndexOf($oldField, $end, [System.StringComparison]::OrdinalIgnoreCase)
-        }
-        if (-not $changed) { return $false }
-        [System.IO.File]::WriteAllText($newFile, $text, $utf8)
-        [System.IO.File]::Move($manifestFile, $oldFile)
-        try { [System.IO.File]::Move($newFile, $manifestFile) }
-        catch { [System.IO.File]::Move($oldFile, $manifestFile); throw }
+        $oldFields = Edit-ManifestRow -DestPath $OldPath -Values @{ 2 = $NewPath; 5 = (Get-CollectionRelativePath $NewPath) }
     } catch {
-        $left = ""
-        if ([System.IO.File]::Exists($manifestFile)) {
-            try { [System.IO.File]::Delete($newFile) } catch { Write-Verbose "Could not delete ${newFile}: $($_.Exception.Message)" }
-        } else {
-            $left = " The manifest is left as $oldFile."
-        }
-        Log-Warning "Could not update the memory dump's row in collection_manifest.csv, it still names ${OldPath}: $($_.Exception.Message)$left"
+        Log-Warning "Could not update the memory dump's row in collection_manifest.csv, it still names ${OldPath}: $($_.Exception.Message)"
         return $false
     }
+    if ($null -eq $oldFields) { return $false }
     Log "collection_manifest.csv: the memory dump's row now names $NewPath"
-    try { [System.IO.File]::Delete($oldFile) }
-    catch { Log-Warning "Could not delete the manifest from before that change: $oldFile -- $($_.Exception.Message)" }
     return $true
+}
+
+# After a file in the manifest was written again (collection_info.json,
+# after a memory capture): its row gets the file's new SHA-256 and size
+# and CollectedAt now; every other line stays (Edit-ManifestRow). Returns
+# $true when the row was changed; otherwise a warning (the row keeps the
+# earlier hash and size) and $false.
+function Update-ManifestFileRow {
+    [OutputType([bool])]
+    param([string]$DestPath)
+    $reason = "it has no row there"
+    try {
+        $size = Get-FileLength $DestPath
+        if ($size -le 0) { throw "the file is missing or empty" }
+        $hash = (Get-FileHash -LiteralPath $DestPath -Algorithm SHA256 -ErrorAction Stop).Hash
+        $oldFields = Edit-ManifestRow -DestPath $DestPath -Values @{ 0 = $hash; 3 = $size; 4 = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') }
+        if ($null -ne $oldFields) {
+            $oldSize = [long]0
+            if ([long]::TryParse([string]$oldFields[3], [ref]$oldSize)) { $script:totalBytes += $size - $oldSize }
+            return $true
+        }
+    } catch {
+        $reason = $_.Exception.Message
+    }
+    Log-Warning "Could not update the row of $DestPath in collection_manifest.csv (its hash and size are those of the earlier version): $reason"
+    return $false
 }
 
 # ----------------------------------------------------------
@@ -1700,14 +1874,229 @@ function Get-ImageTimeZoneId {
     return $tzId
 }
 
-# Write collection_info.json at the collection root and record it in the manifest
+# ----------------------------------------------------------
+# Helpers: the collector's own processes (collection_info.json,
+# CollectorProcesses; live runs only)
+# ----------------------------------------------------------
+# The timeline builder leaves the collector's own processes in the memory
+# dump unflagged. It recognizes them by process ID, name and start time,
+# never by name alone (a script named triage-collector.ps1 is not the
+# collector), so the collector records exactly those: its PowerShell, the
+# .bat's cmd window and its console, and the memory capture tool.
+$script:collectorProcesses = New-Object System.Collections.Generic.List[object]
+$script:collectorProcessesRead = $false   # the first process list was read (Write-CollectionInfo)
+$script:collectionInfoRecorded = $false   # collection_info.json is in the manifest
+
+# One record (Role, Pid, Name, StartUtc, ParentPid) for a process of a
+# process list (ProcessId, ParentProcessId, Name, CreationDateUtc)
+function New-CollectorProcessRecord {
+    param([object]$Process, [string]$Role)
+    return [ordered]@{
+        Role      = $Role
+        Pid       = [int]$Process.ProcessId
+        Name      = [string]$Process.Name
+        StartUtc  = $Process.CreationDateUtc
+        ParentPid = [int]$Process.ParentProcessId
+    }
+}
+
+# The collector's own processes in a process list. Pure: it works only on
+# what is passed in. Processes: objects with ProcessId, ParentProcessId,
+# Name and CreationDateUtc ([datetime] UTC, $null when unknown); SelfPid:
+# the collector's PowerShell; CollectionStartUtc: the start of the run.
+# Writes one record per process (New-CollectorProcessRecord), by role:
+#   Collector  SelfPid
+#   Launcher   its parent, when that is cmd.exe started no later than it
+#              (the .bat's cmd window). A parent started after it (its
+#              PID was reused) is not, nor is any other program (a
+#              PowerShell window the collector was started from)
+#   Console    conhost.exe (the console window's host) that is a child of
+#              the launcher started between the launcher and the collector
+#   Child      a child of the collector started after it and after the
+#              start of the run
+# Nothing else: not the launcher's other children (an open cmd window can
+# have run other programs before), nor the collector's children from
+# before the run (a run from an open PowerShell window, its console host
+# included), nor a process that names a parent started after it (that PID
+# was reused).
+function Select-CollectorProcesses {
+    param(
+        [object[]]$Processes,
+        [int]$SelfPid,
+        [datetime]$CollectionStartUtc
+    )
+    $live = @($Processes | Where-Object { $null -ne $_ -and $null -ne $_.CreationDateUtc })
+    $self = @($live | Where-Object { [int]$_.ProcessId -eq $SelfPid }) | Select-Object -First 1
+    if (-not $self) { return }
+    New-CollectorProcessRecord $self "Collector"
+    $selfStart = $self.CreationDateUtc
+    $launcherPid = [int]$self.ParentProcessId
+    $launcher = $null
+    if ($launcherPid -ne $SelfPid) {
+        $launcher = @($live | Where-Object { [int]$_.ProcessId -eq $launcherPid -and [string]$_.Name -eq "cmd.exe" -and $_.CreationDateUtc -le $selfStart }) | Select-Object -First 1
+    }
+    if ($launcher) { New-CollectorProcessRecord $launcher "Launcher" }
+    $consoles = New-Object System.Collections.Generic.List[object]
+    $children = New-Object System.Collections.Generic.List[object]
+    foreach ($process in $live) {
+        $processId = [int]$process.ProcessId
+        $parentId = [int]$process.ParentProcessId
+        if ($processId -eq $SelfPid -or ($launcher -and $processId -eq $launcherPid)) { continue }
+        $created = $process.CreationDateUtc
+        if ($launcher -and $parentId -eq $launcherPid) {
+            if ([string]$process.Name -eq "conhost.exe" -and $created -ge $launcher.CreationDateUtc -and $created -le $selfStart) { $consoles.Add($process) }
+        } elseif ($parentId -eq $SelfPid -and $created -ge $selfStart -and $created -ge $CollectionStartUtc) {
+            $children.Add($process)
+        }
+    }
+    foreach ($process in @($consoles | Sort-Object CreationDateUtc)) { New-CollectorProcessRecord $process "Console" }
+    foreach ($process in @($children | Sort-Object CreationDateUtc)) { New-CollectorProcessRecord $process "Child" }
+}
+
+# Whether two start times read for one process ID are the same start:
+# within a second, or an hour apart within a second (a local time read in
+# the hour a clock goes back can be an hour off)
+function Test-SameProcessStart {
+    [OutputType([bool])]
+    param([datetime]$First, [datetime]$Second)
+    $seconds = [math]::Abs(($First - $Second).TotalSeconds)
+    return ($seconds -le 1 -or [math]::Abs($seconds - 3600) -le 1)
+}
+
+# The collector's own processes now: Select-CollectorProcesses on one
+# Win32_Process list (30 s timeout). StartUtc is Process.StartTime (to 100
+# ns) when it can be read and is the start in that list
+# (Test-SameProcessStart: the PID was not reused since), else the list's
+# CreationDate (to the microsecond). When the list cannot be read: a
+# warning, and the first time only the collector's own process (its
+# parent unknown: ParentPid 0). The error count does not change.
+function Get-CollectorProcessRecords {
+    $current = [System.Diagnostics.Process]::GetCurrentProcess()
+    try {
+        $selfPid = $current.Id
+        $selfStartUtc = $current.StartTime.ToUniversalTime()
+        $startUtc = $selfStartUtc
+        if ($script:startTime -is [datetime]) { $startUtc = $script:startTime.ToUniversalTime() }
+        $again = ($null -ne $script:collectorProcesses -and $script:collectorProcesses.Count -gt 0)
+        $records = @()
+        $reason = ""
+        try {
+            $list = @(Get-CimInstance -ClassName Win32_Process -Property ProcessId, ParentProcessId, Name, CreationDate -OperationTimeoutSec 30 -ErrorAction Stop |
+                ForEach-Object {
+                    $created = $null
+                    if ($_.CreationDate -is [datetime]) { $created = $_.CreationDate.ToUniversalTime() }
+                    [PSCustomObject]@{ ProcessId = [int]$_.ProcessId; ParentProcessId = [int]$_.ParentProcessId; Name = [string]$_.Name; CreationDateUtc = $created }
+                })
+            $records = @(Select-CollectorProcesses -Processes $list -SelfPid $selfPid -CollectionStartUtc $startUtc)
+            if ($records.Count -eq 0) { $reason = "this process (PID $selfPid) is not in it" }
+        } catch {
+            $reason = $_.Exception.Message
+        }
+        if ($reason) {
+            if ($again) {
+                Log-Warning "Could not read the collector's process tree again (Win32_Process): $reason. collection_info.json keeps the processes recorded at the start of the run."
+                return
+            }
+            Log-Warning "Could not read the collector's process tree (Win32_Process): $reason. Only the collector's own PowerShell process is recorded in collection_info.json."
+            $selfName = ""
+            try { $selfName = [System.IO.Path]::GetFileName($current.MainModule.FileName) }
+            catch { Write-Verbose "Reading the collector's program file: $($_.Exception.Message)" }
+            if (-not $selfName) { $selfName = $current.ProcessName + ".exe" }
+            return [ordered]@{ Role = "Collector"; Pid = $selfPid; Name = $selfName; StartUtc = $selfStartUtc; ParentPid = 0 }
+        }
+        foreach ($record in $records) {
+            if ($record.Pid -eq $selfPid) {
+                $record.StartUtc = $selfStartUtc
+            } else {
+                $process = $null
+                try {
+                    $process = [System.Diagnostics.Process]::GetProcessById($record.Pid)
+                    $processStartUtc = $process.StartTime.ToUniversalTime()
+                    if (Test-SameProcessStart $processStartUtc $record.StartUtc) { $record.StartUtc = $processStartUtc }
+                } catch {
+                    Write-Verbose "Start time of PID $($record.Pid) from Win32_Process only: $($_.Exception.Message)"
+                } finally {
+                    if ($process) { $process.Dispose() }
+                }
+            }
+            $record
+        }
+    } finally {
+        $current.Dispose()
+    }
+}
+
+# Adds records to $script:collectorProcesses; one already there (the same
+# PID and start, Test-SameProcessStart) is not added again, nor one
+# without a PID or start time
+function Add-CollectorProcessRecord {
+    param([object[]]$Records)
+    if ($null -eq $script:collectorProcesses) { $script:collectorProcesses = New-Object System.Collections.Generic.List[object] }
+    foreach ($record in $Records) {
+        if ($null -eq $record -or [int]$record.Pid -le 0 -or $record.StartUtc -isnot [datetime]) { continue }
+        $known = $false
+        foreach ($existing in $script:collectorProcesses) {
+            if ([int]$existing.Pid -eq [int]$record.Pid -and (Test-SameProcessStart $existing.StartUtc $record.StartUtc)) { $known = $true; break }
+        }
+        if (-not $known) { $script:collectorProcesses.Add($record) }
+    }
+}
+
+# The CollectorProcesses field of collection_info.json: one object per
+# record, in the order Collector, Launcher, Console, Child, MemoryCapture
+# (by start time within a role), with Role, Pid, Name, StartUtc (ISO 8601
+# UTC, to 100 ns) and ParentPid
+function ConvertTo-CollectorProcessField {
+    param([object[]]$Records)
+    $rank = @{ Collector = 0; Launcher = 1; Console = 2; Child = 3; MemoryCapture = 4 }
+    $sorted = @($Records | Where-Object { $null -ne $_ } |
+        Sort-Object @{ Expression = { $roleRank = $rank[[string]$_.Role]; if ($null -eq $roleRank) { 5 } else { $roleRank } } }, @{ Expression = { $_.StartUtc } })
+    $field = @(foreach ($record in $sorted) {
+        $startUtc = [datetime]$record.StartUtc
+        if ($startUtc.Kind -ne [System.DateTimeKind]::Utc) { $startUtc = $startUtc.ToUniversalTime() }
+        [PSCustomObject][ordered]@{
+            Role      = [string]$record.Role
+            Pid       = [int]$record.Pid
+            Name      = [string]$record.Name
+            StartUtc  = $startUtc.ToString("o")
+            ParentPid = [int]$record.ParentPid
+        }
+    })
+    return , [object[]]$field
+}
+
+# The field's processes for the log: "powershell.exe (PID 9120, collector),
+# cmd.exe (PID 8840, launcher), conhost.exe (PID 8848, console)"
+function Format-CollectorProcessList {
+    [OutputType([string])]
+    param([object[]]$Field)
+    $labels = @{ Collector = "collector"; Launcher = "launcher"; Console = "console"; Child = "started by the collector"; MemoryCapture = "memory capture tool" }
+    return (@($Field | ForEach-Object { "$($_.Name) (PID $($_.Pid), $($labels[[string]$_.Role]))" }) -join ", ")
+}
+
+# Write collection_info.json at the collection root and record it in the
+# manifest. Live runs also record the collector's own processes
+# (CollectorProcesses; the first call reads them). Called at the start of
+# the run, and after a memory capture again with -Added (e.g. "DumpIt.exe
+# (PID 10232)") and -AddedAs ("the memory capture tool") once the tool's
+# process is recorded: the file is then replaced through
+# collection_info.json.new (a failed write, say on a disk the dump has
+# filled, keeps the first version: a warning) and its manifest row updated
 function Write-CollectionInfo {
+    param(
+        [string]$Added = "",
+        [string]$AddedAs = ""
+    )
     $infoPath = Join-Path $OutputPath "collection_info.json"
     try {
         $collectorTz = [System.TimeZoneInfo]::Local.Id
         if ($script:IsLive) {
             $mode = "Live"
             $targetTz = $collectorTz
+            if (-not $script:collectorProcessesRead) {
+                $script:collectorProcessesRead = $true
+                Add-CollectorProcessRecord @(Get-CollectorProcessRecords)
+            }
         } else {
             $mode = "MountedImage"
             $targetTz = Get-ImageTimeZoneId
@@ -1731,17 +2120,43 @@ function Write-CollectionInfo {
             SecretsIncluded          = [bool]$IncludeSecrets
             ThunderbirdIndexIncluded = [bool]$IncludeThunderbirdIndex
         }
-        $json = $info | ConvertTo-Json
+        # Additive field, live runs only (process IDs of a mounted image's
+        # collector mean nothing for that image): the collector's own
+        # processes, which the timeline builder leaves unflagged in the
+        # memory dump
+        $processField = $null
+        if ($script:IsLive) {
+            $processField = ConvertTo-CollectorProcessField -Records ($script:collectorProcesses.ToArray())
+            $info | Add-Member -NotePropertyName CollectorProcesses -NotePropertyValue $processField
+        }
+        $json = $info | ConvertTo-Json -Depth 4
         # UTF-8 with BOM so Get-Content in Windows PowerShell 5.1 reads it as UTF-8
-        [System.IO.File]::WriteAllText($infoPath, $json, (New-Object System.Text.UTF8Encoding($true)))
-        Record-Manifest -SourcePath "(collection metadata)" -DestPath $infoPath
-        if ($targetTz) {
-            Log "Collection info written (target time zone: $targetTz)"
+        Write-FileByRename -Path $infoPath -Text $json -Encoding (New-Object System.Text.UTF8Encoding($true))
+        if ($script:collectionInfoRecorded) {
+            $null = Update-ManifestFileRow -DestPath $infoPath
         } else {
-            Log-Warning "Collection info written, but the target time zone could not be read from the image."
+            $filesBefore = $script:fileCount
+            Record-Manifest -SourcePath "(collection metadata)" -DestPath $infoPath
+            $script:collectionInfoRecorded = ($script:fileCount -gt $filesBefore)
+        }
+        if ($Added) {
+            Log "collection_info.json updated: $Added recorded as $AddedAs"
+        } else {
+            if ($targetTz) {
+                Log "Collection info written (target time zone: $targetTz)"
+            } else {
+                Log-Warning "Collection info written, but the target time zone could not be read from the image."
+            }
+            if ($processField) {
+                Log "Collector's own processes recorded in collection_info.json: $(Format-CollectorProcessList $processField)"
+            }
         }
     } catch {
-        Log-Warning "Could not write collection_info.json -- $($_.Exception.Message)"
+        if ($Added) {
+            Log-Warning "collection_info.json not updated ($($_.Exception.Message)): $Added is not recorded as $AddedAs, so the timeline builder's report can show it as a lead. The version written at the start of the run is kept."
+        } else {
+            Log-Warning "Could not write collection_info.json -- $($_.Exception.Message)"
+        }
     }
 }
 
@@ -1920,21 +2335,32 @@ if ($Categories -contains "Memory") {
 
             if ($memCaptureAllowed) {
                 Log "Capturing memory -- this may take several minutes..."
+                # The collector's own processes running now, as the dump
+                # sees them (collection_info.json); the capture tool's own
+                # process is added once it has started
+                Add-CollectorProcessRecord @(Get-CollectorProcessRecords)
+                $capture = $null
                 try {
                     Ensure-Directory (Split-Path $dumpFile -Parent)
+                    # The tool runs in this console; Invoke-MemoryCaptureTool
+                    # returns its output (standard output, then standard
+                    # error) and its process ID and start time
                     switch ($memToolName) {
                         "WinPmem" {
-                            $result = & $memTool acquire $dumpFile 2>&1
+                            $capture = Invoke-MemoryCaptureTool -Path $memTool -Arguments @("acquire", $dumpFile)
                         }
                         "DumpIt" {
                             # Uncompressed crash dump, no prompts (DumpIt may
                             # otherwise compress automatically)
-                            $result = & $memTool /TYPE DMP /NOCOMPRESS /QUIET /OUTPUT $dumpFile 2>&1
+                            $capture = Invoke-MemoryCaptureTool -Path $memTool -Arguments @("/TYPE", "DMP", "/NOCOMPRESS", "/QUIET", "/OUTPUT", $dumpFile)
                         }
                         "MagnetRAM" {
-                            $result = & $memTool /accepteula /go /output $dumpFile 2>&1
+                            $capture = Invoke-MemoryCaptureTool -Path $memTool -Arguments @("/accepteula", "/go", "/output", $dumpFile)
                         }
                     }
+                    Add-CollectorProcessRecord @(@{ Role = "MemoryCapture"; Pid = $capture.ProcessId; Name = $capture.Name; StartUtc = $capture.StartTimeUtc; ParentPid = $PID })
+                    if ($capture.Error) { Log-Warning "${memToolName}: $($capture.Error)" }
+                    $result = $capture.Output
 
                     # Save tool output as acquisition log, listed in the manifest
                     Save-MemoryAcquisitionLog -Output $result -LogPath $memLogFile -ToolName $memToolName
@@ -1965,6 +2391,11 @@ if ($Categories -contains "Memory") {
                 # is set aside or deleted, never zipped
                 if (-not $script:memDumpPath) {
                     $script:memDumpIncompletePath = Move-IncompleteMemoryDump -DumpPath $dumpFile
+                }
+                # The capture tool's process in collection_info.json,
+                # whenever it started (whatever the dump's result)
+                if ($capture -and $capture.ProcessId -gt 0 -and $capture.StartTimeUtc) {
+                    Write-CollectionInfo -Added "$($capture.Name) (PID $($capture.ProcessId))" -AddedAs "the memory capture tool"
                 }
             }
         } else {

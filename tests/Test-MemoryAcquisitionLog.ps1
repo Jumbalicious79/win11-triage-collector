@@ -3,16 +3,18 @@
 # Checks how the collector (triage-collector.ps1) keeps the output of the
 # memory capture tool, the only record of DumpIt's SHA-256 and NtStatus.
 # A stand-in tool (a .cmd file in the test folder) prints DumpIt-like
-# lines, one of them on stderr, and Save-MemoryAcquisitionLog must write
-# all of them to Memory\memory_acquisition_log.txt and list that file in
-# the manifest with its hash and size, without logging or counting an
-# error; a tool that prints nothing gives a log with a note, also in the
-# manifest. The collection folders have [ ] in their names. Last, the
-# collector's memory capture section must save the log through this
-# helper, right after the tool runs and before the dump file is checked
-# (so a failed capture also has its log), and write nothing else to it
-# (the manifest hash would no longer match). No admin rights needed.
-# Exit code 0 = pass, 1 = fail.
+# lines, one of them on stderr; it runs through Invoke-MemoryCaptureTool,
+# as in the collector, which gives the stdout lines and then the stderr
+# line as plain text. Save-MemoryAcquisitionLog must write all of them to
+# Memory\memory_acquisition_log.txt and list that file in the manifest
+# with its hash and size, without logging or counting an error; a tool
+# that prints nothing gives a log with a note, also in the manifest. The
+# collection folders have [ ] in their names. Last, the collector's memory
+# capture section must save the log through this helper, right after the
+# tool runs (Invoke-MemoryCaptureTool -Path $memTool) and before the dump
+# file is checked (so a failed capture also has its log), and write
+# nothing else to it (the manifest hash would no longer match). No admin
+# rights needed. Exit code 0 = pass, 1 = fail.
 #
 #   powershell -ExecutionPolicy Bypass -File tests\Test-MemoryAcquisitionLog.ps1
 # =============================================================
@@ -49,9 +51,11 @@ foreach ($node in $nodes) {
     if (-not (Test-InsideFunction $node)) { $definitions.Add($node.Extent.Text) }
 }
 . ([scriptblock]::Create($definitions -join "`r`n"))
-if (-not (Get-Command Save-MemoryAcquisitionLog -ErrorAction SilentlyContinue)) {
-    Write-Host "FAIL: Save-MemoryAcquisitionLog not found in $collector" -ForegroundColor Red
-    exit 1
+foreach ($name in @("Save-MemoryAcquisitionLog", "Invoke-MemoryCaptureTool")) {
+    if (-not (Get-Command $name -ErrorAction SilentlyContinue)) {
+        Write-Host "FAIL: $name not found in $collector" -ForegroundColor Red
+        exit 1
+    }
 }
 
 # --- Collector state: log, manifest and counters ---
@@ -80,14 +84,15 @@ function Get-ManifestRows {
 }
 
 # The collector's error preference: the tool runs and the log is saved
-# as in the memory capture section (& <tool> ... 2>&1, then the helper).
-# Under Stop, stderr output of the tool would end the call. Returns the
-# tool output and the message of an error the helper threw (the
-# collector's catch would log it as "Memory capture failed")
+# as in the memory capture section (Invoke-MemoryCaptureTool, then the
+# helper with its Output). Returns the tool output and the message of an
+# error the helper threw (the collector's catch would log it as "Memory
+# capture failed")
 function Invoke-CaptureTool {
     param([string]$ToolPath, [string]$LogPath, [string]$ToolName)
     $ErrorActionPreference = "Continue"
-    $result = & $ToolPath 2>&1
+    $capture = Invoke-MemoryCaptureTool -Path $ToolPath
+    $result = $capture.Output
     $thrown = ""
     try { Save-MemoryAcquisitionLog -Output $result -LogPath $LogPath -ToolName $ToolName }
     catch { $thrown = $_.Exception.Message }
@@ -167,14 +172,13 @@ try {
 
     $problems = New-Object System.Collections.Generic.List[string]
     if ($run.Thrown) { $problems.Add("Save-MemoryAcquisitionLog threw: $($run.Thrown)") }
-    $errorRecords = @($run.Output | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] })
-    if ($errorRecords.Count -ne 1) { $problems.Add("the stand-in tool gave $($errorRecords.Count) stderr record(s), expected 1") }
+    $nonText = @($run.Output | Where-Object { $_ -isnot [string] })
+    if ($nonText.Count -ne 0) { $problems.Add("the output has $($nonText.Count) item(s) that are not text (error records?)") }
     $savedLines = @()
     if (Test-Path -LiteralPath $logPath) {
         $savedLines = @(Get-Content -LiteralPath $logPath -Encoding UTF8)
-        # The stdout lines whole and in order; the stderr line where the
-        # edition puts it (5.1 writes the whole error record, which repeats
-        # the text in its CategoryInfo line)
+        # The stdout lines whole and in order, then the stderr line (plain
+        # text: standard error is read after standard output)
         $next = 0
         foreach ($line in $stdoutLines) {
             $found = -1
@@ -184,7 +188,9 @@ try {
             if ($found -lt 0) { $problems.Add("line '$($line.Trim())' missing or out of order"); continue }
             $next = $found + 1
         }
-        if (@($savedLines | Where-Object { $_.Contains($stderrText) }).Count -eq 0) { $problems.Add("stderr line '$stderrText' not in the log") }
+        $stderrSaved = @($savedLines | Where-Object { $_.Contains($stderrText) })
+        if ($stderrSaved.Count -ne 1) { $problems.Add("stderr line '$stderrText' in the log $($stderrSaved.Count) time(s), expected 1") }
+        elseif ($savedLines[-1].Trim() -cne $stderrText) { $problems.Add("the stderr line is not after the stdout lines: $($savedLines -join ' | ')") }
     } else {
         $problems.Add("no memory_acquisition_log.txt")
     }
@@ -258,14 +264,14 @@ try {
             $toolIndex = -1
             $dumpCheckIndex = -1
             for ($k = 0; $k -lt $statements.Count; $k++) {
-                if ($statements[$k].Find({ param($node) $node -is [System.Management.Automation.Language.CommandAst] -and $node.InvocationOperator -eq "Ampersand" -and $node.CommandElements[0].Extent.Text -eq '$memTool' }, $true)) { $toolIndex = $k }
+                if ($statements[$k].Find({ param($node) $node -is [System.Management.Automation.Language.CommandAst] -and $node.GetCommandName() -eq "Invoke-MemoryCaptureTool" -and $node.Extent.Text -match '^Invoke-MemoryCaptureTool -Path \$memTool\b' }, $true)) { $toolIndex = $k }
             }
             if ($toolIndex -ge 0) {
                 for ($k = $toolIndex + 1; $k -lt $statements.Count; $k++) {
                     if ($statements[$k].Find({ param($node) $node -is [System.Management.Automation.Language.VariableExpressionAst] -and $node.VariablePath.UserPath -eq "dumpFile" }, $true)) { $dumpCheckIndex = $k; break }
                 }
             }
-            if ($toolIndex -lt 0) { $problems.Add("no statement of the try block around Save-MemoryAcquisitionLog runs the tool (& `$memTool)") }
+            if ($toolIndex -lt 0) { $problems.Add("no statement of the try block around Save-MemoryAcquisitionLog runs the tool (Invoke-MemoryCaptureTool -Path `$memTool)") }
             elseif ($callIndex -lt $toolIndex) { $problems.Add("Save-MemoryAcquisitionLog (line $callLine) runs before the tool (line $($statements[$toolIndex].Extent.StartLineNumber))") }
             if ($toolIndex -ge 0 -and $dumpCheckIndex -lt 0) { $problems.Add("no statement after the tool run reads `$dumpFile (the dump check) in the try block around Save-MemoryAcquisitionLog") }
             elseif ($dumpCheckIndex -ge 0 -and $callIndex -gt $dumpCheckIndex) { $problems.Add("Save-MemoryAcquisitionLog (line $callLine) runs after the dump check (line $($statements[$dumpCheckIndex].Extent.StartLineNumber))") }

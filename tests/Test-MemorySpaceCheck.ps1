@@ -19,7 +19,9 @@
 #     (recorded), a failed, empty or missing one (an error; set aside out of
 #     the collection or deleted; left and named when it is locked),
 #     -MemoryOutputPath, WinPmem and Magnet RAM Capture; the dump's
-#     manifest row has its full path, size and hash;
+#     manifest row has its full path, size and hash; a capture reads the
+#     collector's process list first, then records the tool's process and
+#     writes collection_info.json again (not when the tool did not start);
 #   - the summary and compression step with a dump: moved next to the zip
 #     (its manifest row then names that path), kept with the folder (no
 #     zip, the summary corrected) when it cannot be moved, moved back with
@@ -344,12 +346,12 @@ try {
     function Get-MemoryDumpDriveRoots { return $script:testDriveRoots }
     $script:testRamBytes = [long]0
     function Get-PhysicalMemoryBytes { return $script:testRamBytes }
-    # The capture tool: a function run as "& $memTool /TYPE DMP ... /OUTPUT
-    # <file>" (DumpIt), "acquire <file>" (WinPmem) or "... /output <file>"
-    # (Magnet RAM Capture) that writes a dump of DumpBytes (-1: none) and
-    # prints Lines. With $script:lockDump it leaves the dump open for
-    # reading only (no rename, no delete) in $script:testLock, as a scanner
-    # could. $script:testToolName: the tool found in tools\
+    # The capture tool: a function given the tool's arguments "/TYPE DMP
+    # ... /OUTPUT <file>" (DumpIt), "acquire <file>" (WinPmem) or "...
+    # /output <file>" (Magnet RAM Capture) that writes a dump of DumpBytes
+    # (-1: none) and prints Lines. With $script:lockDump it leaves the dump
+    # open for reading only (no rename, no delete) in $script:testLock, as
+    # a scanner could. $script:testToolName: the tool found in tools\
     $script:standIn = $null
     $script:toolCalls = 0
     $script:lockDump = $false
@@ -370,6 +372,24 @@ try {
     function Find-MemoryCaptureTool {
         $script:skippedMemTools = @()
         return [PSCustomObject]@{ Name = $script:testToolName; Path = "Invoke-TestCaptureTool"; RelPath = "tools\$($script:testToolName.ToLowerInvariant())\stand-in.exe" }
+    }
+    # The collector runs the tool through Invoke-MemoryCaptureTool: here it
+    # calls the stand-in function (Path) with the arguments and returns
+    # what the helper returns (PID 4242). The stand-in's throw comes
+    # through, as the helper's does when the tool cannot start
+    function Invoke-MemoryCaptureTool {
+        param([string]$Path, [string[]]$Arguments)
+        $lines = @(& $Path @Arguments)
+        return @{ ProcessId = 4242; StartTimeUtc = [datetime]::UtcNow; Name = "stand-in.exe"; ExitCode = 0; Output = $lines; Error = "" }
+    }
+    # The collector's own processes (collection_info.json): the process
+    # list read before the capture and the rewrite after it, counted
+    $script:processListReads = 0
+    $script:infoWrites = New-Object System.Collections.Generic.List[string]
+    function Get-CollectorProcessRecords { $script:processListReads++ }
+    function Write-CollectionInfo {
+        param([string]$Added = "", [string]$AddedAs = "")
+        $script:infoWrites.Add("$Added as $AddedAs")
     }
     # Read-Host answers from a queue (a function comes before the cmdlet);
     # a question more than the test expects ends the prompt with an error
@@ -613,6 +633,9 @@ try {
         $script:MemoryOutputPath = $DumpDir
         $script:standIn = $StandIn
         $script:toolCalls = 0
+        $script:processListReads = 0
+        $script:infoWrites.Clear()
+        $script:collectorProcesses = $null
         $script:testToolName = $Tool
         if ($Volume -is [string]) { $Volume = New-TestVolume -Root $tempRoot -FreeGB 500 -TotalGB 1000 }
         $script:testVolumes = @{}
@@ -650,6 +673,9 @@ try {
             Log          = @(Get-Content -LiteralPath $logFile)
             Errors       = $script:errorCount
             ToolCalls    = $script:toolCalls
+            ListReads    = $script:processListReads
+            InfoWrites   = @($script:infoWrites)
+            Recorded     = @(if ($script:collectorProcesses) { $script:collectorProcesses.ToArray() })
             DumpPath     = $dumpPath
             AcqLog       = Join-Path $OutputPath "Memory\memory_acquisition_log.txt"
             Rows         = $rows
@@ -657,8 +683,12 @@ try {
             Incomplete   = $script:memDumpIncompletePath
         }
     }
+    # Also checks collection_info.json's part: a capture reads the process
+    # list once before the tool runs, records the tool's process (PID 4242)
+    # and writes collection_info.json again; with no capture, or a tool
+    # that failed to start (-ToolFailed), neither happens
     function Test-SectionRun {
-        param([object]$Run, [string[]]$Lines, [int]$Errors, [int]$ToolCalls, [System.Collections.Generic.List[string]]$Problems, [string[]]$Absent = @())
+        param([object]$Run, [string[]]$Lines, [int]$Errors, [int]$ToolCalls, [System.Collections.Generic.List[string]]$Problems, [string[]]$Absent = @(), [switch]$ToolFailed)
         if ($Run.Thrown) { $Problems.Add("section threw: $($Run.Thrown)") }
         Test-LinesInOrder -Lines $Run.Log -Expected $Lines -Problems $Problems -Where "log"
         foreach ($pattern in $Absent) {
@@ -667,6 +697,14 @@ try {
         }
         if ($Run.Errors -ne $Errors) { $Problems.Add("error count $($Run.Errors), expected $Errors") }
         if ($Run.ToolCalls -ne $ToolCalls) { $Problems.Add("tool ran $($Run.ToolCalls) time(s), expected $ToolCalls") }
+        if ($Run.ListReads -ne $ToolCalls) { $Problems.Add("process list read $($Run.ListReads) time(s), expected $ToolCalls") }
+        $expectedWrites = @()
+        if ($ToolCalls -gt 0 -and -not $ToolFailed) { $expectedWrites = @("stand-in.exe (PID 4242) as the memory capture tool") }
+        if (($Run.InfoWrites -join "|") -cne ($expectedWrites -join "|")) { $Problems.Add("collection_info.json rewrites: '$($Run.InfoWrites -join "', '")'") }
+        $recorded = @($Run.Recorded | ForEach-Object { "$($_.Role) $($_.Pid) $($_.Name) $($_.ParentPid)" })
+        $expectedRecords = @()
+        if ($expectedWrites.Count -gt 0) { $expectedRecords = @("MemoryCapture 4242 stand-in.exe $PID") }
+        if (($recorded -join "|") -cne ($expectedRecords -join "|")) { $Problems.Add("processes recorded: '$($recorded -join "', '")'") }
         if ($Problems.Count -gt 0) { foreach ($line in $Run.Log) { Write-Verbose "  | $line" } }
     }
     # The manifest has one dump row, and it names the dump's full path, its
@@ -786,7 +824,7 @@ try {
     # The tool fails after writing part of the dump: the catch, then set aside
     $run = Invoke-MemorySection -Name "throws" -StandIn (New-StandIn -DumpBytes 4096 -Throw "synthetic tool failure")
     $problems = New-Problems
-    Test-SectionRun -Run $run -Lines @('ERROR: Memory capture failed: synthetic tool failure$', 'WARNING: Incomplete memory dump kept outside the collection') -Errors 1 -ToolCalls 1 -Problems $problems
+    Test-SectionRun -Run $run -Lines @('ERROR: Memory capture failed: synthetic tool failure$', 'WARNING: Incomplete memory dump kept outside the collection') -Errors 1 -ToolCalls 1 -Problems $problems -ToolFailed
     if ((Get-FileLength $run.DumpPath) -ge 0 -or -not $run.Incomplete -or $run.MemDumpPath) { $problems.Add("dump not set aside") }
     Add-Result "section: tool error -> error, set aside" $problems
 

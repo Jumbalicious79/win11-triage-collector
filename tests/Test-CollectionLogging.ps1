@@ -17,6 +17,11 @@
 #    files, history snapshots, extension manifests), which count the same
 #    way: a copy saved under a shortened name counts, and its size counts
 #    toward the total cap.
+#  - Record-Manifest when Get-FileHash is not there (Windows PowerShell
+#    started from PowerShell 7 through cmd.exe): the file is still recorded
+#    and counted, with its SHA-256.
+#  - Find-WindowsRoot on a drive letter that does not exist
+#    (Run-TriageCollector.bat E without an E: drive): nothing, no error.
 # Folders stand in for the shadow copy and the target volume, and a
 # stand-in replaces the raw NTFS read, so no snapshot is made and no admin
 # rights are needed (Test-RawCopy.ps1 covers the raw NTFS read itself).
@@ -404,6 +409,51 @@ try {
         Result = $(if ($problems.Count -gt 0) { "FAIL" } else { "PASS" })
         Case   = "Browser copies within a cap"
         Expect = "2 counted, 1 skipped"
+        Note   = ($problems -join "; ")
+    })
+
+    # --- Record-Manifest without Get-FileHash: Windows PowerShell started
+    # from PowerShell 7 through cmd.exe can load PowerShell 7's Utility
+    # module, which has no Get-FileHash for it. The file is still recorded,
+    # with its SHA-256 ---
+    $problems = New-Object System.Collections.Generic.List[string]
+    $filesBefore = $script:fileCount
+    $noHashDest = Join-Path $OutputPath "NoHash\file.bin"
+    $noHashExpected = New-TestFile -Root $OutputPath -RelativePath "NoHash\file.bin" -Size 4096
+    # A stand-in that fails as the missing command would, found before the
+    # cmdlet (functions come first in command lookup)
+    Set-Item -Path Function:\Get-FileHash -Value { throw "The term 'Get-FileHash' is not recognized (test stand-in)" }
+    try { Record-Manifest -SourcePath "C:\NoHash\file.bin" -DestPath $noHashDest }
+    finally { Remove-Item -Path Function:\Get-FileHash }
+    $noHashRows = @(Get-ManifestRows -SourcePath "C:\NoHash\file.bin")
+    if ($noHashRows.Count -ne 1) { $problems.Add("$($noHashRows.Count) manifest row(s), expected 1") }
+    elseif ($noHashRows[0].SHA256 -cne $noHashExpected) { $problems.Add("SHA256 '$($noHashRows[0].SHA256)', expected '$noHashExpected'") }
+    if (($script:fileCount - $filesBefore) -ne 1) { $problems.Add("file count went up by $($script:fileCount - $filesBefore), expected 1") }
+    if ($problems.Count -gt 0) { $failures++ }
+    $results.Add([PSCustomObject]@{
+        Result = $(if ($problems.Count -gt 0) { "FAIL" } else { "PASS" })
+        Case   = "Record-Manifest without Get-FileHash"
+        Expect = "recorded, SHA-256 as Get-FileHash"
+        Note   = ($problems -join "; ")
+    })
+
+    # --- Find-WindowsRoot on a drive that does not exist (Run-TriageCollector.bat
+    # E with no E:): no parameter-binding error from Get-ChildItem -Directory ---
+    $problems = New-Object System.Collections.Generic.List[string]
+    $usedLetters = @([System.IO.DriveInfo]::GetDrives() | ForEach-Object { $_.Name.Substring(0, 1).ToUpperInvariant() })
+    $freeLetter = @("QRSTUVWXYZ".ToCharArray() | ForEach-Object { "$_" } | Where-Object { $usedLetters -notcontains $_ }) | Select-Object -First 1
+    if ($freeLetter) {
+        # $ErrorActionPreference is Stop here: any error inside throws
+        $foundRoot = "not run"
+        try { $foundRoot = Find-WindowsRoot -DrivePath "${freeLetter}:\" }
+        catch { $problems.Add("error: $($_.Exception.Message)") }
+        if ($null -ne $foundRoot) { $problems.Add("returned '$foundRoot' instead of nothing") }
+    }
+    if ($problems.Count -gt 0) { $failures++ }
+    $results.Add([PSCustomObject]@{
+        Result = $(if ($problems.Count -gt 0) { "FAIL" } else { "PASS" })
+        Case   = "Find-WindowsRoot on a missing drive"
+        Expect = "nothing, no error$(if (-not $freeLetter) { ' (skipped: no free drive letter)' })"
         Note   = ($problems -join "; ")
     })
 }

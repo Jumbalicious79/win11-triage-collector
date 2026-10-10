@@ -5,8 +5,9 @@ artifacts from a live Windows system. Pure PowerShell -- no KAPE, no external
 tools required.
 
 Designed to be used with win11-timeline-builder, which parses this script's
-output into a unified chronological timeline and auto-opens it in Timeline
-Explorer. Both tools are available as separate repos for independent use.
+output into a unified chronological timeline and a findings report, then
+lets you choose a viewer (Excel, Timeline Explorer, the report). Both tools
+are available as separate repos for independent use.
 
   Companion project: https://github.com/Jumbalicious79/win11-timeline-builder
 
@@ -37,11 +38,15 @@ Required directory structure:
       timeline-builder.ps1
       Run-TimelineBuilder.bat
       README.txt
+      report\                     <-- findings report rules and renderer
+                                      (needed for report.pdf)
       tools\                      <-- auto-downloaded tools (each in own subfolder)
         sqlite3\                  <-- auto-downloaded: browser history parser
         TimelineExplorer\         <-- auto-downloaded: forensic CSV viewer
         volatility3\              <-- optional: vol.exe for memory analysis
       reports\                    <-- timelines save here
+
+  (Copy each repository folder whole; the lists show the main parts.)
 
 To set up:
 
@@ -50,6 +55,10 @@ To set up:
 
 Or download both repos and extract them into the same parent folder. The parent
 folder can be anywhere -- your desktop, a USB drive, a network share, etc.
+GitHub's "Download ZIP" names the folders win11-triage-collector-master and
+win11-timeline-builder-master: rename them to win11-triage-collector and
+win11-timeline-builder, the names the timeline builder's browse mode looks
+for.
 
 If you only need the collector without timeline analysis, it works standalone.
 But for the full collect-and-analyze workflow, both directories must be siblings.
@@ -62,7 +71,9 @@ pipeline:
 
   1. COLLECT: Run triage-collector on the target system (this tool)
   2. ANALYZE: Run timeline-builder on the collection (companion tool)
-  3. REVIEW: Timeline Explorer auto-opens with the timeline loaded
+  3. REVIEW: choose a viewer from the menu: the color-coded Excel workbook,
+     Timeline Explorer (downloaded on first use), both, or Open report (the
+     findings report PDF)
 
 ### Live System (Dirty Forensics)
 
@@ -79,7 +90,8 @@ more than forensic purity:
   4. Unplug the USB and take it to your analysis workstation
   5. Place win11-timeline-builder alongside the collector (or anywhere)
   6. Double-click Run-TimelineBuilder.bat -- it auto-finds the triage zips
-  7. Pick a collection, timeline builds, Timeline Explorer opens
+  7. Pick a collection; the timeline and the findings report are built, then
+     choose a viewer: Excel, Timeline Explorer, Both, Open report or None
 
 This is a "dirty" collection -- the act of running the script modifies the
 system (writes files, creates a shadow copy, touches the registry). This is
@@ -93,14 +105,19 @@ For legal cases, litigation hold, or any situation requiring chain of custody:
   1. Create a forensic image of the target system FIRST
      Use FTK Imager, dd, or your preferred imaging tool
   2. Mount the image as read-only on your analysis workstation (e.g., E:)
-  3. Run triage-collector against the mounted drive letter:
+  3. Run triage-collector against the mounted drive: double-click
+     Run-TriageCollector.bat and pick the image from its "Select Target
+     Drive" menu (shown whenever another drive holds Windows\System32), or
+     give the letter:
      Run-TriageCollector.bat E
      (or: powershell ... -File triage-collector.ps1 -TargetDrive E)
   4. Run timeline-builder against the collection
   5. The collection manifest (SHA256 hashes) provides integrity verification
 
 When collecting from a mounted image, the script auto-detects that the target
-is not the live system drive and switches to MOUNTED IMAGE mode:
+is not the live system drive and switches to MOUNTED IMAGE mode. Its summary
+then names this computer as "Collector host" (the computer the collector ran
+on), not as the examined computer:
 
   Collected (file-copy):
     - Raw $MFT, $LogFile and $UsnJrnl:$J, read from the volume itself, when
@@ -149,8 +166,11 @@ To prepare a USB drive as a portable forensic triage kit:
       timeline-builder.ps1
       Run-TimelineBuilder.bat
       README.txt
+      report\                     <-- findings report rules and renderer
       tools\                      <-- sqlite3\, TimelineExplorer\, volatility3\
       reports\                    <-- timelines save here
+
+  Copy both repository folders whole (the list shows the main parts).
 
 Both tools output to their own reports\ directories. The timeline builder
 auto-discovers triage collections from the sibling directory. No configuration
@@ -161,13 +181,32 @@ needed -- plug in, double-click, collect, analyze.
 
 ### Double-click (recommended)
 
-  Run-TriageCollector.bat              -- collect from C: (live system)
+  Run-TriageCollector.bat              -- collect from C: (live system); when
+                                          a mounted Windows image is attached,
+                                          a menu lets you pick it (or Cancel)
   Run-TriageCollector.bat fast         -- skip the raw NTFS copies and the
                                           USN journal export
-  Run-TriageCollector.bat nozip        -- don't compress output
-  Run-TriageCollector.bat E            -- collect from E: (mounted image)
+  Run-TriageCollector.bat nozip        -- don't compress output: the
+                                          collection stays a folder; the
+                                          timeline builder's browse mode
+                                          lists it, or drop the folder on
+                                          Run-TimelineBuilder.bat
+  Run-TriageCollector.bat E            -- collect from E: (mounted image);
+                                          E: or E:\ work too
   Run-TriageCollector.bat E fast       -- collect from E:, skip the raw NTFS
                                           copies and the USN journal export
+
+  The words can come in any order and together (E fast nozip). Anything
+  else (a typo such as "fats", a second drive letter, "-TargetDrive E")
+  stops with the list above and exit code 1, before Administrator rights
+  are asked for. A drive letter that does not exist gives "ERROR: Drive E:
+  does not exist or is not accessible."
+
+  The collector waits for a key at its end ("Press any key to exit...").
+  The .bat waits only when the collector stopped with an error (exit code
+  1), and then says so. Started from a window that is already elevated
+  (Administrator), the .bat returns the collector's exit code; otherwise it
+  hands the run to a new elevated window and ends at once.
 
   Note: "fast" skips the raw NTFS copies ($MFT, $LogFile, $UsnJrnl:$J) and
   the fsutil USN journal export -- the timeline builder's largest sources of
@@ -176,7 +215,10 @@ needed -- plug in, double-click, collect, analyze.
 
   For memory capture: extract Magnet DumpIt into tools\dumpit\ (see
   tools\dumpit\README.txt). The script prompts on live system runs when a
-  capture tool is detected. See the "Optional Tools" section below.
+  capture tool is detected. See the "Optional Tools" section below. On a
+  Windows ARM64 machine the prompt notes that the timeline builder cannot
+  analyze ARM64 memory (Volatility 3 does not support it): the dump is for
+  WinDbg.
 
   While it runs, QuickEdit is off in its console window, so a click in the
   window cannot pause the run. (With QuickEdit on, a click starts a text
@@ -232,7 +274,7 @@ folder automatically. Only the .zip remains:
 
   win11-triage-collector\
     reports\
-      TriageCollection_2026-04-08_08-04.zip    (~60 MB)
+      TriageCollection_2026-04-08_08-04.zip    (~100 MB with the raw $MFT)
 
 If memory capture was included, the memory dump is saved next to the zip,
 not inside it (it is as large as the machine's RAM):
@@ -1005,18 +1047,26 @@ thunderbird_mail_files.csv and windows_mail_files.csv, one row per file:
 The fastest path from collection to analysis:
 
   1. Double-click Run-TimelineBuilder.bat (no arguments needed)
-  2. It auto-finds triage zips in the sibling reports\ directory
+  2. It auto-finds triage zips in the sibling reports\ directory (and
+     collection folders made with "nozip"; one kept elsewhere is dropped
+     on Run-TimelineBuilder.bat)
   3. Pick a collection number
   4. If the collection's memory dump is found (next to the zip, or where
      collection_manifest.csv says it was written, e.g. D:\TriageMemory)
      and Volatility 3 is installed, the script prompts to include memory
-     analysis
-  5. Timeline builds (~2 minutes for ~56,000 events, longer with memory)
+     analysis. A Windows ARM64 dump is not offered (Volatility 3 cannot
+     analyze ARM64 memory; open it in WinDbg), and the findings report
+     notes that the dump was not analyzed
+  5. Timeline builds (about 5 minutes for a 100 MB collection, ~300,000
+     events with the $MFT and the USN journal; longer with memory)
   6. Color-coded Excel (.xlsx) is generated with rows colored by EventType
-  7. Choose a viewer: Excel (colored), Timeline Explorer, Both, or None
+  7. Choose a viewer: Excel (colored), Timeline Explorer, Both, Open report
+     (the findings report), or None
   8. Filter, sort, pivot, investigate
 
-  The timeline builder produces both CSV (full data) and Excel (color-coded).
+  The timeline builder writes timeline.csv (full data), a color-coded
+  timeline.xlsx, and a findings report (report.pdf, report.html,
+  findings.csv): leads to review, each linked to its timeline rows.
   It parses only the triage collection data -- never queries the local system.
 
   Companion project: https://github.com/Jumbalicious79/win11-timeline-builder
@@ -1588,7 +1638,10 @@ capture before collection begins.
     file saved under a shortened name or with [ ] in its name, and that
     the browser copies made within a size cap (session files, history
     snapshots, extension manifests) count such a file and its size toward
-    the cap.
+    the cap. A file is recorded in the manifest, counted and hashed (the
+    same SHA-256) also when Get-FileHash is not there (Windows PowerShell
+    started from PowerShell 7 through cmd.exe), and the drive check for a
+    drive letter that does not exist gives nothing, with no error.
       powershell -ExecutionPolicy Bypass -File tests\Test-CollectionLogging.ps1
 
   tests\Test-CollectionZip.ps1 (no admin needed; also runs in CI)

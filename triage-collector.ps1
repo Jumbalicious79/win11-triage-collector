@@ -154,6 +154,12 @@ $script:triageIncludeSecrets = [bool]$IncludeSecrets
 function Find-WindowsRoot {
     param([string]$DrivePath)
 
+    # A drive that does not exist (or is not ready): Windows PowerShell 5.1's
+    # Get-ChildItem -Directory would fail with a parameter error for it
+    if (-not (Test-Path -LiteralPath $DrivePath)) {
+        return $null
+    }
+
     # Check direct root first
     if (Test-Path "${DrivePath}Windows\System32") {
         return $DrivePath
@@ -280,7 +286,7 @@ $script:IsLive = ("${TargetDrive}:" -eq $env:SystemDrive)
 if (-not (Test-Path $script:TargetRoot)) {
     Write-Host "ERROR: Drive ${TargetDrive}: does not exist or is not accessible." -ForegroundColor Red
     Restore-ConsoleMode
-    if (-not $Unattended) { pause }
+    # No pause: Run-TriageCollector.bat pauses after an error (exit code 1)
     exit 1
 }
 if (-not (Test-Path "${script:TargetRoot}Windows\System32")) {
@@ -374,7 +380,7 @@ if ($MemoryOutputPath) {
         # e.g. a drive that does not exist
         Write-Host "ERROR: -MemoryOutputPath $MemoryOutputPath -- $($_.Exception.Message)" -ForegroundColor Red
         Restore-ConsoleMode
-        if (-not $Unattended) { pause }
+        # No pause: Run-TriageCollector.bat pauses after an error (exit code 1)
         exit 1
     }
     if ($MemoryOutputPath.TrimEnd('\') -ne [System.IO.Path]::GetPathRoot($MemoryOutputPath).TrimEnd('\')) {
@@ -384,7 +390,7 @@ if ($MemoryOutputPath) {
         Write-Host "ERROR: -MemoryOutputPath $MemoryOutputPath is inside the collection folder $OutputPath," -ForegroundColor Red
         Write-Host "  so the memory dump would be zipped. Choose a folder outside it." -ForegroundColor Red
         Restore-ConsoleMode
-        if (-not $Unattended) { pause }
+        # No pause: Run-TriageCollector.bat pauses after an error (exit code 1)
         exit 1
     }
 }
@@ -699,6 +705,11 @@ if ($script:IsLive -and ($Categories -notcontains "Memory") -and -not $Unattende
         Write-Host ""
         Write-Host "  Captures a full RAM dump (~$ramGB GB on this system)." -ForegroundColor White
         Write-Host "  Runs FIRST to preserve pristine memory state." -ForegroundColor DarkGray
+        if ((Get-NativeMachineType) -eq 0xAA64) {
+            # The timeline builder skips ARM64 dumps (Volatility 3 has no ARM64 support)
+            Write-Host "  Note: this is an ARM64 machine. The timeline builder cannot analyze ARM64" -ForegroundColor DarkGray
+            Write-Host "  memory (Volatility 3 does not support it); the dump is for WinDbg." -ForegroundColor DarkGray
+        }
         Write-Host "  Dump file: $memDumpTarget" -ForegroundColor DarkGray
         Write-Host "  $(Format-SpaceCheck $memSpace)" -ForegroundColor DarkGray
         if ($memSpace.OnSystemDrive) {
@@ -842,6 +853,22 @@ function Get-FileLength {
         if ($fi.Exists) { return $fi.Length }
     } catch { Write-Verbose "Reading file size of ${Path}: $($_.Exception.Message)" }
     return -1
+}
+
+# SHA-256 of a file as upper-case hex (as Get-FileHash gives it). Hashed with
+# .NET, not Get-FileHash: Windows PowerShell started from PowerShell 7
+# (through cmd.exe) can load PowerShell 7's Utility module, which has no
+# Get-FileHash for it, and then no file would be recorded. Throws when the
+# file cannot be read.
+function Get-FileSha256 {
+    param([string]$Path)
+    $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+    try {
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        try { return ([System.BitConverter]::ToString($sha.ComputeHash($stream))).Replace("-", "") }
+        finally { $sha.Dispose() }
+    }
+    finally { $stream.Dispose() }
 }
 
 # Original Created/Modified/Accessed times (UTC) of a file, or $null if the
@@ -1102,7 +1129,7 @@ function Record-Manifest {
             $accessed = Format-UtcTime $SourceTimes.Accessed
         }
 
-        $hash = (Get-FileHash -LiteralPath $DestPath -Algorithm SHA256 -ErrorAction Stop).Hash
+        $hash = Get-FileSha256 $DestPath
         $fields = @(
             $hash,
             $SourcePath,
@@ -6781,7 +6808,8 @@ $summaryLines = @(
     "  COLLECTION SUMMARY"
     "============================================================="
     "  Target drive:   ${TargetDrive}: ($( if ($script:IsLive) { 'LIVE SYSTEM' } else { 'MOUNTED IMAGE' } ))"
-    "  Computer:       $env:COMPUTERNAME"
+    # From a mounted image, this computer is the one the collector ran on
+    $(if ($script:IsLive) { "  Computer:       $env:COMPUTERNAME" } else { "  Collector host: $env:COMPUTERNAME (the computer the collector ran on, not the image's)" })
     "  Start time:     $($script:startTime.ToString('yyyy-MM-dd HH:mm:ss'))"
     "  End time:       $($endTime.ToString('yyyy-MM-dd HH:mm:ss')) (before compression)"
     "  Duration:       $($duration.ToString('hh\:mm\:ss'))"
@@ -7015,6 +7043,15 @@ if (-not $NoCompress) {
         Write-Host "  Zip created:    $zipPath ($([math]::Round((Get-FileLength $zipPath) / 1MB, 2)) MB)" -ForegroundColor Green
     } else {
         Write-Host "  Zip NOT created -- collection left at: $OutputPath" -ForegroundColor Yellow
+    }
+} else {
+    # The timeline builder's browse mode (a double-click on
+    # Run-TimelineBuilder.bat) lists a collection folder in this reports\
+    # folder too; one elsewhere is dropped on the .bat
+    if ($PSScriptRoot -and [System.IO.Path]::GetDirectoryName($OutputPath) -eq ($PSScriptRoot.TrimEnd('\') + '\reports')) {
+        Write-Host "  Timeline:       double-click Run-TimelineBuilder.bat and pick the folder, or drop it on the .bat" -ForegroundColor DarkGray
+    } else {
+        Write-Host "  Timeline:       drop the folder on Run-TimelineBuilder.bat" -ForegroundColor DarkGray
     }
 }
 if ($memDumpMovedTo -and (Test-Path -LiteralPath $memDumpMovedTo)) {

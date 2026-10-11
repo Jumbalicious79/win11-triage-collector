@@ -119,6 +119,10 @@ $script:IncludeThunderbirdIndex = $false
 # The PowerShell edition running this test runs the probes and the collector
 $powershellExe = (Get-Process -Id $PID).Path
 $powershellName = [System.IO.Path]::GetFileName($powershellExe)
+# Process names are compared without case, as Windows does: Win32_Process
+# names keep the case of the command that started the process (the GitHub
+# runner starts PowerShell as pwsh.EXE / powershell.EXE), which can differ
+# from the program file's own name
 $manifestHeader = "SHA256,SourcePath,DestPath,SizeBytes,CollectedAt,RelativePath,SourceCreatedUtc,SourceModifiedUtc,SourceAccessedUtc`r`n"
 
 # A process as Get-CollectorProcessRecords lists it
@@ -556,12 +560,12 @@ while (-not [System.IO.File]::Exists($Release) -and (Get-Date) -lt $deadline) { 
             $launcherEntry = @($field | Where-Object { $_.Role -eq "Launcher" }) | Select-Object -First 1
             $consoleEntry = @($field | Where-Object { $_.Role -eq "Console" }) | Select-Object -First 1
             if ($launcherEntry) {
-                if ($launcherEntry.Pid -ne $cmd.Id -or $launcherEntry.Name -cne "cmd.exe") { $problems.Add("launcher $($launcherEntry.Name) PID $($launcherEntry.Pid), cmd.exe has PID $($cmd.Id)") }
+                if ($launcherEntry.Pid -ne $cmd.Id -or $launcherEntry.Name -ne "cmd.exe") { $problems.Add("launcher $($launcherEntry.Name) PID $($launcherEntry.Pid), cmd.exe has PID $($cmd.Id)") }
                 $diff = Get-DiffMs (ConvertTo-TestUtc $launcherEntry.StartUtc) $cmdStartUtc
                 if ($diff -gt 1) { $problems.Add("launcher start $($launcherEntry.StartUtc), cmd.exe started $($cmdStartUtc.ToString('o'))") }
             }
             if ($collectorEntry) {
-                if ($collectorEntry.Name -cne $powershellName -or $collectorEntry.ParentPid -ne $cmd.Id) { $problems.Add("collector $($collectorEntry.Name) parent $($collectorEntry.ParentPid)") }
+                if ($collectorEntry.Name -ne $powershellName -or $collectorEntry.ParentPid -ne $cmd.Id) { $problems.Add("collector $($collectorEntry.Name) parent $($collectorEntry.ParentPid)") }
                 try {
                     $live = [System.Diagnostics.Process]::GetProcessById([int]$collectorEntry.Pid)
                     $diff = Get-DiffMs (ConvertTo-TestUtc $collectorEntry.StartUtc) $live.StartTime.ToUniversalTime()
@@ -571,7 +575,7 @@ while (-not [System.IO.File]::Exists($Release) -and (Get-Date) -lt $deadline) { 
             }
             if ($consoleEntry) {
                 $wmi = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId=$([int]$consoleEntry.Pid)"
-                if ($consoleEntry.Name -cne "conhost.exe" -or $consoleEntry.ParentPid -ne $cmd.Id -or -not $wmi -or $wmi.ParentProcessId -ne $cmd.Id) { $problems.Add("console $($consoleEntry.Name) PID $($consoleEntry.Pid) parent $($consoleEntry.ParentPid)") }
+                if ($consoleEntry.Name -ne "conhost.exe" -or $consoleEntry.ParentPid -ne $cmd.Id -or -not $wmi -or $wmi.ParentProcessId -ne $cmd.Id) { $problems.Add("console $($consoleEntry.Name) PID $($consoleEntry.Pid) parent $($consoleEntry.ParentPid)") }
                 try {
                     $live = [System.Diagnostics.Process]::GetProcessById([int]$consoleEntry.Pid)
                     $diff = Get-DiffMs (ConvertTo-TestUtc $consoleEntry.StartUtc) $live.StartTime.ToUniversalTime()
@@ -685,11 +689,11 @@ while (-not [System.IO.File]::Exists($Release) -and (Get-Date) -lt $deadline) { 
     if (-not $first) { $problems.Add("no collection_info.json") }
     else {
         $entries = @($first.Info.CollectorProcesses)
-        if ($entries.Count -lt 1 -or $entries[0].Role -cne "Collector" -or $entries[0].Pid -ne $PID -or $entries[0].Name -cne $powershellName) { $problems.Add("first entry: $($entries[0] | ConvertTo-Json -Compress)") }
+        if ($entries.Count -lt 1 -or $entries[0].Role -cne "Collector" -or $entries[0].Pid -ne $PID -or $entries[0].Name -ne $powershellName) { $problems.Add("first entry: $($entries[0] | ConvertTo-Json -Compress)") }
         Test-StartUtcText -Raw $first.Raw -Expected $entries.Count -Problems $problems
         Test-InfoManifestRow -Manifest $manifestFile -InfoPath $infoPath -Problems $problems
         $expectedLine = "Collector's own processes recorded in collection_info.json: $powershellName (PID $PID, collector)"
-        if (@($logLines | Where-Object { $_.Contains($expectedLine) }).Count -ne 1) { $problems.Add("log: $($logLines -join ' | ')") }
+        if (@($logLines | Where-Object { $_.IndexOf($expectedLine, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 }).Count -ne 1) { $problems.Add("log: $($logLines -join ' | ')") }
         if ($first.Info.Mode -cne "Live" -or $first.Info.SchemaVersion -ne 1) { $problems.Add("Mode '$($first.Info.Mode)', SchemaVersion $($first.Info.SchemaVersion)") }
         Test-InfoProvenance -Info $first.Info -Version "2099.01.02" -Sha256 $collectorSha256 -Problems $problems
     }
@@ -904,9 +908,9 @@ while (-not [System.IO.File]::Exists($Release) -and (Get-Date) -lt $deadline) { 
             foreach ($child in @($entries | Where-Object { $_.Role -eq "Child" })) {
                 if (-not $collectorEntry -or $child.ParentPid -ne $collectorEntry.Pid -or (ConvertTo-TestUtc $child.StartUtc) -lt (ConvertTo-TestUtc $Run.Info.Info.CollectionStartUtc)) { $Problems.Add("child $($child.Name) PID $($child.Pid), parent $($child.ParentPid), started $($child.StartUtc)") }
             }
-            if ($collectorEntry -and ($collectorEntry.Name -cne $powershellName -or $collectorEntry.ParentPid -ne $Run.CmdPid)) { $Problems.Add("collector $($collectorEntry.Name), parent PID $($collectorEntry.ParentPid) (cmd.exe: $($Run.CmdPid))") }
-            if ($launcherEntry -and ($launcherEntry.Pid -ne $Run.CmdPid -or $launcherEntry.Name -cne "cmd.exe" -or (Get-DiffMs (ConvertTo-TestUtc $launcherEntry.StartUtc) $Run.CmdStartUtc) -gt 1)) { $Problems.Add("launcher $($launcherEntry.Name) PID $($launcherEntry.Pid) started $($launcherEntry.StartUtc); cmd.exe PID $($Run.CmdPid) started $($Run.CmdStartUtc.ToString('o'))") }
-            if ($consoleEntry -and ($consoleEntry.Name -cne "conhost.exe" -or $consoleEntry.ParentPid -ne $Run.CmdPid)) { $Problems.Add("console $($consoleEntry.Name), parent PID $($consoleEntry.ParentPid)") }
+            if ($collectorEntry -and ($collectorEntry.Name -ne $powershellName -or $collectorEntry.ParentPid -ne $Run.CmdPid)) { $Problems.Add("collector $($collectorEntry.Name), parent PID $($collectorEntry.ParentPid) (cmd.exe: $($Run.CmdPid))") }
+            if ($launcherEntry -and ($launcherEntry.Pid -ne $Run.CmdPid -or $launcherEntry.Name -ne "cmd.exe" -or (Get-DiffMs (ConvertTo-TestUtc $launcherEntry.StartUtc) $Run.CmdStartUtc) -gt 1)) { $Problems.Add("launcher $($launcherEntry.Name) PID $($launcherEntry.Pid) started $($launcherEntry.StartUtc); cmd.exe PID $($Run.CmdPid) started $($Run.CmdStartUtc.ToString('o'))") }
+            if ($consoleEntry -and ($consoleEntry.Name -ne "conhost.exe" -or $consoleEntry.ParentPid -ne $Run.CmdPid)) { $Problems.Add("console $($consoleEntry.Name), parent PID $($consoleEntry.ParentPid)") }
             # Start order: launcher, console, collector, the run's start
             if ($launcherEntry -and $consoleEntry -and $collectorEntry) {
                 $runStart = ConvertTo-TestUtc $Run.Info.Info.CollectionStartUtc
@@ -919,7 +923,7 @@ while (-not [System.IO.File]::Exists($Release) -and (Get-Date) -lt $deadline) { 
             Test-InfoManifestRow -Manifest $Run.Manifest -InfoPath $Run.InfoPath -Problems $Problems
             if ($collectorEntry -and $launcherEntry -and $consoleEntry) {
                 $line = "Collector's own processes recorded in collection_info.json: $powershellName (PID $($collectorEntry.Pid), collector), cmd.exe (PID $($launcherEntry.Pid), launcher), conhost.exe (PID $($consoleEntry.Pid), console)"
-                if (@($Run.Log | Where-Object { $_.Contains($line) }).Count -ne 1) { $Problems.Add("log line '$line' missing") }
+                if (@($Run.Log | Where-Object { $_.IndexOf($line, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 }).Count -ne 1) { $Problems.Add("log line '$line' missing") }
             }
             return $byRole
         }
@@ -954,7 +958,7 @@ while (-not [System.IO.File]::Exists($Release) -and (Get-Date) -lt $deadline) { 
         if ($byRole -and $byRole["MemoryCapture"]) {
             $memoryEntry = $byRole["MemoryCapture"]
             $report = Get-StandInReport $run.Acquisition
-            if ($memoryEntry.Name -cne "DumpIt.exe" -or $memoryEntry.Pid -ne $report.Pid -or $memoryEntry.ParentPid -ne $byRole["Collector"].Pid) { $problems.Add("memory capture $($memoryEntry.Name) PID $($memoryEntry.Pid) parent $($memoryEntry.ParentPid); the stand-in reports PID $($report.Pid)") }
+            if ($memoryEntry.Name -ne "DumpIt.exe" -or $memoryEntry.Pid -ne $report.Pid -or $memoryEntry.ParentPid -ne $byRole["Collector"].Pid) { $problems.Add("memory capture $($memoryEntry.Name) PID $($memoryEntry.Pid) parent $($memoryEntry.ParentPid); the stand-in reports PID $($report.Pid)") }
             if (-not $report.StartUtc -or (Get-DiffMs (ConvertTo-TestUtc $memoryEntry.StartUtc) $report.StartUtc) -gt 1) { $problems.Add("memory capture start $($memoryEntry.StartUtc), the stand-in reports $($report.StartUtc)") }
             if ((ConvertTo-TestUtc $memoryEntry.StartUtc) -lt (ConvertTo-TestUtc $run.Info.Info.CollectionStartUtc)) { $problems.Add("the capture tool started before the run") }
             if (@($run.Log | Where-Object { $_ -match "collection_info\.json updated: DumpIt\.exe \(PID $($report.Pid)\) recorded as the memory capture tool$" }).Count -ne 1) { $problems.Add("no 'collection_info.json updated' log line") }

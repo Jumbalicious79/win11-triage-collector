@@ -22,6 +22,30 @@
 #    and counted, with its SHA-256.
 #  - Find-WindowsRoot on a drive letter that does not exist
 #    (Run-TriageCollector.bat E without an E: drive): nothing, no error.
+#  - Get-TriageVolumeSerial: a serial for the temp folder's drive, none for
+#    a missing drive letter, and the volume's serial for a subst drive of a
+#    folder on it (subst needs no admin rights; removed afterwards), so the
+#    memory prompt never offers the system volume under another letter.
+#  - The collector's provenance: the git commit read from .git without
+#    git.exe (a .git folder, a worktree's .git file with an absolute or
+#    relative gitdir and its commondir, packed-refs, a detached HEAD;
+#    nothing and no error without a checkout, with an unreadable HEAD or a
+#    branch with no commit), compared with git itself for this repository
+#    when git.exe is there; the log lines (version, SHA-256 of the script,
+#    commit); collection_info.json's CollectorVersion,
+#    CollectorScriptSha256 and CollectorGitCommit (after SchemaVersion,
+#    null when unknown, the other fields unchanged).
+#  - The Run key log lines: values counted per hive (HKLM, loaded user
+#    hives) and the users whose hive is not loaded named; ProfileList read
+#    on this machine (read only).
+#  - USBSTOR (with a stand-in for the registry read): a result line and
+#    usb_storage_devices.txt with the devices, or with a note when there is
+#    no USBSTOR key, no device under it, or it cannot be read (a warning).
+#  - AppCompatCache read with .NET: the file is byte for byte the one
+#    "reg query" gives on this machine (both written as Save-CommandOutput
+#    writes them; reg.exe takes up to a minute here), with the value's hex
+#    as the timeline builder reads it; reg.exe's output (a stand-in) when
+#    the .NET read fails.
 # Folders stand in for the shadow copy and the target volume, and a
 # stand-in replaces the raw NTFS read, so no snapshot is made and no admin
 # rights are needed (Test-RawCopy.ps1 covers the raw NTFS read itself).
@@ -455,6 +479,334 @@ try {
         Case   = "Find-WindowsRoot on a missing drive"
         Expect = "nothing, no error$(if (-not $freeLetter) { ' (skipped: no free drive letter)' })"
         Note   = ($problems -join "; ")
+    })
+
+    # --- Get-TriageVolumeSerial (the memory prompt does not offer the
+    # system volume under another letter): the temp folder's drive has a
+    # serial, a missing drive letter none, and a subst drive of a folder on
+    # it the same serial (subst needs no admin rights; removed afterwards) ---
+    Write-Host "Case: volume serial numbers"
+    $problems = New-Object System.Collections.Generic.List[string]
+    $tempDriveRoot = [System.IO.Path]::GetPathRoot($workDir)
+    $tempSerial = Get-TriageVolumeSerial $tempDriveRoot
+    if ($tempSerial -notmatch '^[0-9A-F]{8}$') { $problems.Add("serial of ${tempDriveRoot}: '$tempSerial'") }
+    $serialInfo = "$tempDriveRoot $tempSerial"
+    if ($freeLetter) {
+        $missingSerial = Get-TriageVolumeSerial "${freeLetter}:\"
+        if ($missingSerial) { $problems.Add("serial '$missingSerial' for the missing drive ${freeLetter}:") }
+        $substFolder = Join-Path $workDir "subst"
+        New-Item -ItemType Directory -Path $substFolder -Force | Out-Null
+        $ErrorActionPreference = "Continue"
+        try {
+            $null = & subst.exe "${freeLetter}:" $substFolder 2>&1
+            if (Test-Path -LiteralPath "${freeLetter}:\") {
+                $substSerial = Get-TriageVolumeSerial "${freeLetter}:\"
+                if ($substSerial -cne $tempSerial) { $problems.Add("subst drive ${freeLetter}: has serial '$substSerial', its volume '$tempSerial'") }
+                $serialInfo += ", subst ${freeLetter}: $substSerial"
+            } else {
+                $serialInfo += " (subst not possible here)"
+            }
+        } finally {
+            $null = & subst.exe "${freeLetter}:" /d 2>&1
+            $ErrorActionPreference = "Stop"
+        }
+    }
+    if ($problems.Count -gt 0) { $failures++ }
+    $results.Add([PSCustomObject]@{
+        Result = $(if ($problems.Count -gt 0) { "FAIL" } else { "PASS" })
+        Case   = "Volume serial numbers"
+        Expect = "subst drive = its volume"
+        Note   = $(if ($problems.Count -gt 0) { $problems -join "; " } else { $serialInfo })
+    })
+
+    # --- The collector's provenance: the git commit read from .git without
+    # git.exe (a folder, a worktree's .git file with a relative or absolute
+    # gitdir and commondir, packed-refs, a detached HEAD), nothing (and no
+    # error) without a checkout or with an unreadable HEAD ---
+    Write-Host "Case: git commit without git.exe"
+    $problems = New-Object System.Collections.Generic.List[string]
+    $gitRoot = Join-Path $workDir "git"
+    $sha1 = "0123456789abcdef0123456789abcdef01234567"
+    $sha2 = "89ABCDEF0123456789ABCDEF0123456789ABCDEF"
+    $sha3 = "fedcba9876543210fedcba9876543210fedcba98"
+    function New-TestTextFile {
+        param([string]$Path, [string]$Text)
+        New-Item -ItemType Directory -Path (Split-Path $Path -Parent) -Force | Out-Null
+        [System.IO.File]::WriteAllText($Path, $Text)
+    }
+    # a: a .git folder, the branch in refs\heads
+    New-TestTextFile (Join-Path $gitRoot "a\.git\HEAD") "ref: refs/heads/phase3/r2`n"
+    New-TestTextFile (Join-Path $gitRoot "a\.git\refs\heads\phase3\r2") "$sha1`n"
+    # b: the branch only in packed-refs (after git gc), with a peeled tag line
+    New-TestTextFile (Join-Path $gitRoot "b\.git\HEAD") "ref: refs/heads/main`n"
+    New-TestTextFile (Join-Path $gitRoot "b\.git\packed-refs") "# pack-refs with: peeled fully-peeled sorted`n$sha3 refs/heads/mainline`n$sha2 refs/heads/main`n^$sha3`n"
+    # c: a detached HEAD
+    New-TestTextFile (Join-Path $gitRoot "c\.git\HEAD") "$sha2`n"
+    # d: a worktree: .git is a file naming the worktree's git folder
+    # (absolute), whose commondir leads to the main repository's refs
+    New-TestTextFile (Join-Path $gitRoot "main\.git\refs\heads\wt-branch") "$sha3`n"
+    New-TestTextFile (Join-Path $gitRoot "main\.git\worktrees\wt\HEAD") "ref: refs/heads/wt-branch`n"
+    New-TestTextFile (Join-Path $gitRoot "main\.git\worktrees\wt\commondir") "../..`n"
+    New-TestTextFile (Join-Path $gitRoot "d\.git") ("gitdir: " + (Join-Path $gitRoot "main\.git\worktrees\wt").Replace('\', '/') + "`n")
+    # e: the same with a relative gitdir
+    New-TestTextFile (Join-Path $gitRoot "e\.git") "gitdir: ../main/.git/worktrees/wt`n"
+    # f: no checkout; g: HEAD not readable as a ref or commit; h: a branch
+    # with no commit yet; i: .git file naming a folder that does not exist
+    New-Item -ItemType Directory -Path (Join-Path $gitRoot "f") -Force | Out-Null
+    New-TestTextFile (Join-Path $gitRoot "g\.git\HEAD") "not a ref`n"
+    New-TestTextFile (Join-Path $gitRoot "h\.git\HEAD") "ref: refs/heads/unborn`n"
+    New-TestTextFile (Join-Path $gitRoot "i\.git") "gitdir: C:/no/such/folder/.git`n"
+    $gitCases = @(
+        @{ Folder = "a"; Commit = $sha1; Branch = "phase3/r2" }
+        @{ Folder = "b"; Commit = $sha2.ToLowerInvariant(); Branch = "main" }
+        @{ Folder = "c"; Commit = $sha2.ToLowerInvariant(); Branch = "" }
+        @{ Folder = "d"; Commit = $sha3; Branch = "wt-branch" }
+        @{ Folder = "e"; Commit = $sha3; Branch = "wt-branch" }
+        @{ Folder = "f"; Commit = $null }
+        @{ Folder = "g"; Commit = $null }
+        @{ Folder = "h"; Commit = $null }
+        @{ Folder = "i"; Commit = $null }
+    )
+    foreach ($gitCase in $gitCases) {
+        $got = "not run"
+        try { $got = Get-CollectorGitCommit -Folder (Join-Path $gitRoot $gitCase.Folder) }
+        catch { $problems.Add("$($gitCase.Folder): error $($_.Exception.Message)"); continue }
+        if ($null -eq $gitCase.Commit) {
+            if ($null -ne $got) { $problems.Add("$($gitCase.Folder): '$($got.Commit)' instead of nothing") }
+        } elseif ($null -eq $got -or $got.Commit -cne $gitCase.Commit -or $got.Branch -cne $gitCase.Branch) {
+            $problems.Add("$($gitCase.Folder): '$($got.Commit)' on '$($got.Branch)', expected '$($gitCase.Commit)' on '$($gitCase.Branch)'")
+        }
+    }
+    # This repository, when it is a git checkout and git.exe is there: the
+    # commit git itself names
+    $repoInfo = "repository: not a checkout"
+    if ((Test-Path -LiteralPath (Join-Path $repoRoot ".git")) -and (Get-Command git -ErrorAction SilentlyContinue)) {
+        $ErrorActionPreference = "Continue"
+        try { $gitHead = (& git -C $repoRoot rev-parse HEAD 2>$null | Select-Object -First 1) } finally { $ErrorActionPreference = "Stop" }
+        $repoCommit = Get-CollectorGitCommit -Folder $repoRoot
+        if ($gitHead -and ($null -eq $repoCommit -or $repoCommit.Commit -cne "$gitHead".Trim())) { $problems.Add("this repository: '$($repoCommit.Commit)', git says '$gitHead'") }
+        $repoInfo = "repository at $("$gitHead".Trim().Substring(0, [Math]::Min(7, "$gitHead".Trim().Length)))"
+    }
+    if ($problems.Count -gt 0) { $failures++ }
+    $results.Add([PSCustomObject]@{
+        Result = $(if ($problems.Count -gt 0) { "FAIL" } else { "PASS" })
+        Case   = "Git commit read without git.exe"
+        Expect = "$($gitCases.Count) layouts, $repoInfo"
+        Note   = ($problems -join "; ")
+    })
+
+    # --- Provenance in the log and in collection_info.json: version, the
+    # script's SHA-256, the git commit (separate top-level fields; null when
+    # unknown) ---
+    Write-Host "Case: provenance in the log and collection_info.json"
+    $problems = New-Object System.Collections.Generic.List[string]
+    $scriptCopy = Join-Path $gitRoot "a\triage-collector.ps1"
+    [System.IO.File]::WriteAllText($scriptCopy, "# synthetic collector`r`n")
+    $scriptSha = (Get-FileHash -LiteralPath $scriptCopy -Algorithm SHA256).Hash
+    $prov = Get-CollectorProvenance -ScriptPath $scriptCopy -Version "2099.01.02"
+    if ($prov.Version -cne "2099.01.02" -or $prov.ScriptSha256 -cne $scriptSha -or $prov.GitCommit -cne $sha1 -or $prov.GitBranch -cne "phase3/r2") {
+        $problems.Add("provenance: $($prov.Version), $($prov.ScriptSha256), $($prov.GitCommit), $($prov.GitBranch)")
+    }
+    $provLines = @(Get-CollectorProvenanceLines $prov)
+    $expectedLines = @(
+        "Collector: version 2099.01.02, triage-collector.ps1 SHA-256 $scriptSha",
+        "Collector git commit: $sha1 (branch phase3/r2; uncommitted changes show only in the SHA-256)"
+    )
+    if (($provLines -join "|") -cne ($expectedLines -join "|")) { $problems.Add("log lines: $($provLines -join ' | ')") }
+    $noGit = Get-CollectorProvenance -ScriptPath (Join-Path $gitRoot "f\missing.ps1") -Version "2099.01.02"
+    $noGitLines = @(Get-CollectorProvenanceLines $noGit)
+    if ($noGit.ScriptSha256 -or $noGit.GitCommit -or ($noGitLines -join "|") -cne "Collector: version 2099.01.02, triage-collector.ps1 SHA-256 unknown (the script file could not be read)|Collector git commit: none (not run from a git checkout)") {
+        $problems.Add("no file, no checkout: '$($noGit.ScriptSha256)', '$($noGit.GitCommit)', $($noGitLines -join ' | ')")
+    }
+    $detached = @(Get-CollectorProvenanceLines (Get-CollectorProvenance -ScriptPath (Join-Path $gitRoot "c\x.ps1") -Version "1"))
+    if ($detached[1] -cne "Collector git commit: $($sha2.ToLowerInvariant()) (detached HEAD; uncommitted changes show only in the SHA-256)") { $problems.Add("detached: $($detached[1])") }
+
+    # collection_info.json: the three fields after SchemaVersion, the other
+    # fields as before; null when not known
+    $script:startTime = Get-Date
+    $script:TargetDrive = "C"
+    $script:IncludeSecrets = $false
+    $script:IncludeThunderbirdIndex = $false
+    $infoPath = Join-Path $OutputPath "collection_info.json"
+    foreach ($infoCase in @(@{ Prov = $prov; Version = "2099.01.02"; Sha = $scriptSha; Commit = $sha1 }, @{ Prov = $noGit; Version = "2099.01.02"; Sha = $null; Commit = $null }, @{ Prov = $null; Version = $null; Sha = $null; Commit = $null })) {
+        $script:collectorProvenance = $infoCase.Prov
+        Remove-Item -LiteralPath $infoPath -Force -ErrorAction SilentlyContinue
+        $ErrorActionPreference = "Continue"
+        try { Write-CollectionInfo } finally { $ErrorActionPreference = "Stop" }
+        if (-not (Test-Path -LiteralPath $infoPath)) { $problems.Add("collection_info.json not written"); continue }
+        $infoText = [System.IO.File]::ReadAllText($infoPath)
+        $info = $infoText | ConvertFrom-Json
+        $names = @($info.PSObject.Properties | ForEach-Object { $_.Name })
+        $expectedNames = "SchemaVersion,CollectorVersion,CollectorScriptSha256,CollectorGitCommit,ComputerName,CollectorUser,Mode,TargetDrive,TargetRoot,CollectionStartUtc,CollectorTimeZoneId,CollectorCulture,TargetTimeZoneId,SecretsIncluded,ThunderbirdIndexIncluded"
+        if (($names -join ",") -cne $expectedNames) { $problems.Add("fields: $($names -join ',')") }
+        if ($info.SchemaVersion -ne 1) { $problems.Add("SchemaVersion $($info.SchemaVersion)") }
+        if ($info.CollectorVersion -cne $infoCase.Version -or $info.CollectorScriptSha256 -cne $infoCase.Sha -or $info.CollectorGitCommit -cne $infoCase.Commit) {
+            $problems.Add("provenance fields '$($info.CollectorVersion)', '$($info.CollectorScriptSha256)', '$($info.CollectorGitCommit)'")
+        }
+        if ($null -eq $infoCase.Commit -and $infoText -notmatch '"CollectorGitCommit":\s*null') { $problems.Add("CollectorGitCommit is not null when unknown") }
+    }
+    $script:collectorProvenance = $null
+    if ($problems.Count -gt 0) { $failures++ }
+    $results.Add([PSCustomObject]@{
+        Result = $(if ($problems.Count -gt 0) { "FAIL" } else { "PASS" })
+        Case   = "Provenance: log lines, collection_info"
+        Expect = "version, SHA-256, commit; null if unknown"
+        Note   = ($problems -join "; ")
+    })
+
+    # --- Run keys: values counted per hive (HKLM, loaded user hives), and the
+    # user profiles whose hive is not loaded named (their Run values are only
+    # in the collected NTUSER.DAT) ---
+    Write-Host "Case: Run key log lines"
+    $problems = New-Object System.Collections.Generic.List[string]
+    $sidA = "S-1-5-21-1-2-3-1001"
+    $sidB = "S-1-5-21-1-2-3-1002"
+    $sidC = "S-1-12-1-4-5-6-7"
+    $runRows = @(
+        [PSCustomObject]@{ Hive = "HKLM"; User = "" }
+        [PSCustomObject]@{ Hive = "HKU\$sidA"; User = "Alice" }
+        [PSCustomObject]@{ Hive = "HKU\$sidA"; User = "Alice" }
+    )
+    $profiles = @(
+        [PSCustomObject]@{ Sid = $sidA; User = "Alice"; HasNtUser = $true }
+        [PSCustomObject]@{ Sid = $sidB; User = "Bob"; HasNtUser = $true }
+        [PSCustomObject]@{ Sid = $sidC; User = "Carol"; HasNtUser = $true }
+        [PSCustomObject]@{ Sid = "S-1-5-21-1-2-3-1009"; User = "NoHive"; HasNtUser = $false }
+    )
+    $runCases = @(
+        @{ Rows = $runRows; Loaded = @($sidA); Profiles = $profiles; Registry = $true
+           Lines = @("Run keys: 1 value(s) in HKLM, 2 value(s) in 1 loaded user hive(s).",
+               "Run keys not read live for 2 user(s) whose hive is not loaded: Bob, Carol (their Run values are in the collected Registry\<user>\NTUSER.DAT, which the timeline builder reads).") }
+        @{ Rows = $runRows; Loaded = @($sidA, $sidB, $sidC); Profiles = $profiles; Registry = $true
+           Lines = @("Run keys: 1 value(s) in HKLM, 2 value(s) in 3 loaded user hive(s).") }
+        @{ Rows = @(); Loaded = @(); Profiles = @($profiles[1]); Registry = $false
+           Lines = @("Run keys: 0 value(s) in HKLM, 0 value(s) in 0 loaded user hive(s).",
+               "Run keys not read live for 1 user(s) whose hive is not loaded: Bob (their NTUSER.DAT is collected only with the Registry category).") }
+    )
+    foreach ($runCase in $runCases) {
+        $got = @(Get-TriageRunKeyLogLines -Rows $runCase.Rows -LoadedSids $runCase.Loaded -Profiles $runCase.Profiles -RegistryCollected $runCase.Registry)
+        if (($got -join "|") -cne ($runCase.Lines -join "|")) { $problems.Add("got: $($got -join ' | ')") }
+    }
+    # ProfileList on this machine (read only): every entry a local or Entra
+    # ID account, with a name
+    $liveProfiles = @(Get-TriageProfileListUsers)
+    foreach ($liveProfile in $liveProfiles) {
+        if ($liveProfile.Sid -notmatch '^S-1-(5-21|12-1)-' -or -not $liveProfile.User -or $liveProfile.HasNtUser -isnot [bool]) { $problems.Add("ProfileList entry '$($liveProfile.Sid)', '$($liveProfile.User)', $($liveProfile.HasNtUser)") }
+    }
+    if ($problems.Count -gt 0) { $failures++ }
+    $results.Add([PSCustomObject]@{
+        Result = $(if ($problems.Count -gt 0) { "FAIL" } else { "PASS" })
+        Case   = "Run key log lines"
+        Expect = "per hive; unloaded hives named"
+        Note   = ($problems -join "; ")
+    })
+
+    # --- USBSTOR: usb_storage_devices.txt and a result line, also when there
+    # is no device (no key, an empty key) or it cannot be read ---
+    Write-Host "Case: USBSTOR result line"
+    $problems = New-Object System.Collections.Generic.List[string]
+    $usbDir = Join-Path $OutputPath "USB"
+    $usbFile = Join-Path $usbDir "usb_storage_devices.txt"
+    $usbCases = @(
+        @{ Mode = "devices"; Count = 2; Line = '\] USBSTOR: 2 USB storage device\(s\) recorded in the registry \(usb_storage_devices\.txt\)\.$'; File = '^FriendlyName\s*:\s*Test Disk 1 USB Device$' }
+        @{ Mode = "missing"; Count = 0; Line = '\] USBSTOR: no USB storage devices recorded in the registry \(no USBSTOR key\)\.$'; File = '^\(no USB storage devices recorded in the registry; there is no HKLM\\SYSTEM\\CurrentControlSet\\Enum\\USBSTOR key\)$' }
+        @{ Mode = "empty"; Count = 0; Line = '\] USBSTOR: no USB storage devices recorded in the registry \(the USBSTOR key has no device\)\.$'; File = '^\(no USB storage devices recorded in the registry; HKLM\\SYSTEM\\CurrentControlSet\\Enum\\USBSTOR has no device\)$' }
+        @{ Mode = "denied"; Count = 0; Line = '\] WARNING: USBSTOR: no USB storage device could be read from the registry -- Access is denied \(test\)$'; File = '^\(no USB storage device could be read from HKLM\\SYSTEM\\CurrentControlSet\\Enum\\USBSTOR -- Access is denied \(test\)\)$' }
+    )
+    foreach ($usbCase in $usbCases) {
+        Remove-Item -LiteralPath $usbFile -Force -ErrorAction SilentlyContinue
+        $logBefore = Get-LogLines
+        $script:usbMode = $usbCase.Mode
+        $ErrorActionPreference = "Continue"
+        try {
+            $returned = @(& {
+                # Stand-in for the registry read, in this block only (a
+                # function comes before the cmdlet)
+                Set-Item -Path function:Get-ItemProperty -Value {
+                    [CmdletBinding()]
+                    param([Parameter(Position = 0)][string]$Path)
+                    Write-Verbose "Stand-in read of $Path"
+                    switch ($script:usbMode) {
+                        "devices" {
+                            [PSCustomObject]@{ FriendlyName = "Test Disk 1 USB Device"; HardwareID = @("USBSTOR\DiskTest1", "GenDisk"); Mfg = "(Standard disk drives)"; Service = "disk"; ContainerID = "{00000000-0000-0000-0000-000000000001}"; PSChildName = "SERIAL1&0" }
+                            [PSCustomObject]@{ FriendlyName = "Test Disk 2 USB Device"; HardwareID = @("USBSTOR\DiskTest2"); Mfg = "(Standard disk drives)"; Service = "disk"; ContainerID = "{00000000-0000-0000-0000-000000000002}"; PSChildName = "SERIAL2&0" }
+                        }
+                        "missing" { Write-Error -Exception (New-Object System.Management.Automation.ItemNotFoundException "Cannot find path (test)") }
+                        "denied" { Write-Error -Exception (New-Object System.UnauthorizedAccessException "Access is denied (test)") }
+                    }
+                }
+                Save-TriageUsbStorDevices -UsbDir $usbDir
+            })
+        } finally { $ErrorActionPreference = "Stop" }
+        $logNew = @(Get-LogLines | Select-Object -Skip $logBefore.Count)
+        if ($returned.Count -ne 1 -or $returned[0] -ne $usbCase.Count) { $problems.Add("$($usbCase.Mode): returned '$($returned -join ',')'") }
+        if ($logNew.Count -ne 1 -or $logNew[0] -notmatch $usbCase.Line) { $problems.Add("$($usbCase.Mode): log '$($logNew -join ' | ')'") }
+        $fileLines = @()
+        if (Test-Path -LiteralPath $usbFile) { $fileLines = @(Get-Content -LiteralPath $usbFile) }
+        if (@($fileLines | Where-Object { $_ -match $usbCase.File }).Count -ne 1) { $problems.Add("$($usbCase.Mode): usb_storage_devices.txt '$($fileLines -join ' / ')'") }
+        if (@(Get-ManifestRows -SourcePath "(command: USB storage devices)" | Where-Object { $_.DestPath -eq $usbFile }).Count -lt 1) { $problems.Add("$($usbCase.Mode): not in the manifest") }
+    }
+    if ($problems.Count -gt 0) { $failures++ }
+    $results.Add([PSCustomObject]@{
+        Result = $(if ($problems.Count -gt 0) { "FAIL" } else { "PASS" })
+        Case   = "USBSTOR result line"
+        Expect = "count, or a note in the file"
+        Note   = ($problems -join "; ")
+    })
+
+    # --- AppCompatCache read with .NET: byte for byte the file "reg query"
+    # gave (both written as Save-CommandOutput writes them), on this
+    # machine; reg.exe still used when the .NET read fails ---
+    Write-Host "Case: AppCompatCache through .NET and reg query (reg query takes up to a minute)"
+    $problems = New-Object System.Collections.Generic.List[string]
+    $shimNet = Join-Path $workDir "shim\net\appcompat_cache.reg"
+    $shimReg = Join-Path $workDir "shim\reg\appcompat_cache.reg"
+    $shimInfo = ""
+    $ErrorActionPreference = "Continue"
+    try {
+        $script:appCompatCacheMethod = ""
+        $watch = [System.Diagnostics.Stopwatch]::StartNew()
+        Save-CommandOutput -Description "AppCompatCache (.NET)" -DestPath $shimNet -Command { Get-TriageAppCompatCacheText }
+        $netMs = $watch.ElapsedMilliseconds
+        $netMethod = $script:appCompatCacheMethod
+        $watch.Restart()
+        Save-CommandOutput -Description "AppCompatCache (reg query)" -DestPath $shimReg -Command {
+            reg query "HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\AppCompatCache" /v AppCompatCache 2>&1
+        }
+        $regMs = $watch.ElapsedMilliseconds
+    } finally { $ErrorActionPreference = "Stop" }
+    if ($netMethod -notmatch '^\d+ bytes read from the registry$') {
+        $shimInfo = "skipped: the .NET read failed here ($netMethod)"
+    } else {
+        $netBytes = [System.IO.File]::ReadAllBytes($shimNet)
+        $regBytes = [System.IO.File]::ReadAllBytes($shimReg)
+        if ([System.Convert]::ToBase64String($netBytes) -cne [System.Convert]::ToBase64String($regBytes)) {
+            $problems.Add(".NET file ($($netBytes.Length) bytes) differs from the reg query file ($($regBytes.Length) bytes)")
+        }
+        # What the timeline builder takes from it: the hex of the value
+        $netText = [System.IO.File]::ReadAllText($shimNet)
+        $valueBytes = [long]($netMethod -replace ' .*$', '')
+        if ($netText -notmatch 'AppCompatCache\s+REG_BINARY\s+([0-9A-Fa-f]+)' -or $Matches[1].Length -ne $valueBytes * 2) { $problems.Add("the hex of the value is not $valueBytes bytes") }
+        $shimInfo = "$($netBytes.Length) bytes identical; .NET $netMs ms, reg query $regMs ms"
+    }
+
+    # The fallback: no key through .NET -> reg.exe's output (a stand-in)
+    $savedOpen = ${function:Open-TriageRegKey}
+    Set-Item -Path function:Open-TriageRegKey -Value { return $null }
+    try {
+        $fallback = @(& {
+            function reg { "stand-in reg $($args -join ' ')" }
+            Get-TriageAppCompatCacheText
+        })
+    } finally { Set-Item -Path function:Open-TriageRegKey -Value $savedOpen }
+    if (($fallback -join "|") -cne 'stand-in reg query HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\AppCompatCache /v AppCompatCache') { $problems.Add("fallback output: $($fallback -join ' | ')") }
+    if ($script:appCompatCacheMethod -cne "read with reg query (the .NET read failed: the key could not be opened)") { $problems.Add("fallback method: $($script:appCompatCacheMethod)") }
+    if ($problems.Count -gt 0) { $failures++ }
+    $results.Add([PSCustomObject]@{
+        Result = $(if ($problems.Count -gt 0) { "FAIL" } else { "PASS" })
+        Case   = "AppCompatCache .NET = reg query"
+        Expect = "byte for byte; reg.exe fallback"
+        Note   = $(if ($problems.Count -gt 0) { $problems -join "; " } else { $shimInfo })
     })
 }
 catch {

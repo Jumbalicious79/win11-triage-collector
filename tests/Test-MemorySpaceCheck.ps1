@@ -9,17 +9,27 @@
 #     share, and the log line it gives;
 #   - Get-VolumeSpace on the temp folder's drive, a UNC path and a missing
 #     drive;
-#   - the prompt (run with stand-ins for the drives and the answers): the
-#     numbers, the warning about the system drive, other drives offered;
-#     none of it with -Unattended;
+#   - the prompt (run with stand-ins for the drives, the machine type and
+#     the answers): the numbers, the warning about the system drive (with
+#     "another drive is better" only when another drive has room, which is
+#     then named and offered first, also when the dump fits on the system
+#     drive), other drives offered (never a subst drive of the system
+#     volume), the ARM64 note; what it logs (what was
+#     shown, the answer, why it was not shown); none of it with -Unattended;
 #   - the result check (Get-MemoryCaptureResult) on a redacted DumpIt log
-#     (fixtures\memory) and a failing variant;
+#     (fixtures\memory) and a failing variant, with DumpIt's SHA-256 and
+#     JSON path;
 #   - the memory section, run with a stand-in capture tool: no room (an
 #     error, no capture), low reserve (a warning, capture), a complete dump
-#     (recorded), a failed, empty or missing one (an error; set aside out of
-#     the collection or deleted; left and named when it is locked),
+#     (recorded; the collector's SHA-256 against DumpIt's: match, MISMATCH
+#     as a warning, or none printed; the waits explained on screen), a
+#     failed, empty or missing one (an error; set aside out of the
+#     collection or deleted; left and named when it is locked),
 #     -MemoryOutputPath, WinPmem and Magnet RAM Capture; the dump's
-#     manifest row has its full path, size and hash;
+#     manifest row has its full path, size and hash; the JSON file DumpIt's
+#     output names: a note when it was not written, recorded in the
+#     manifest (or copied into Memory\ from a -MemoryOutputPath folder)
+#     when it was;
 #   - the summary and compression step with a dump: moved next to the zip
 #     (its manifest row then names that path), kept with the folder (no
 #     zip, the summary corrected) when it cannot be moved, moved back with
@@ -30,7 +40,8 @@
 #     never "pass -MemoryDumpPath", which Run-TimelineBuilder.bat cannot);
 #     the rest of the manifest unchanged, and kept as it was when it cannot
 #     be changed; a failed dump still in the folder: set aside then, or no
-#     zip.
+#     zip; the sizes (the collection without the dump, the dump on its one
+#     "Memory dump:" line, the zip at the end).
 # No admin rights needed. Exit code 0 = pass, 1 = fail.
 #
 #   powershell -ExecutionPolicy Bypass -File tests\Test-MemorySpaceCheck.ps1
@@ -289,9 +300,10 @@ try {
     $stderrRecord = New-Object System.Management.Automation.ErrorRecord (New-Object System.Exception "Error: synthetic message on stderr"), "NativeCommandError", "NotSpecified", $null
     $resultCases = @(
         @{ What = "DumpIt log of a complete capture"; Output = $okLog; Dump = 34261114880; Ram = $ram2
-           Complete = $true; NtStatus = "0x00000000"; Reported = 34261114880; Summary = '^34261114880 bytes \(100% of the RAM\); DumpIt reported NtStatus 0x00000000 and a file of 34261114880 bytes$' }
+           Complete = $true; NtStatus = "0x00000000"; Reported = 34261114880; Summary = '^34261114880 bytes \(100% of the RAM\); DumpIt reported NtStatus 0x00000000 and a file of 34261114880 bytes$'
+           Sha256 = "00112233445566778899AABBCCDDEEFF00112233445566778899AABBCCDDEEFF"; Json = "C:\Triage\reports\TriageCollection_2026-01-02_03-04\Memory\memory_dump.json" }
         @{ What = "failing DumpIt log"; Output = $failedLog; Dump = 12GB; Ram = $ram2
-           Complete = $false; NtStatus = "0xC000007F"; Reported = 17179869184; ErrorLines = @("Error: Not enough disk space to save dump file.")
+           Complete = $false; NtStatus = "0xC000007F"; Reported = 17179869184; ErrorLines = @("Error: Not enough disk space to save dump file."); Sha256 = ""; Json = ""
            Problems = @('^DumpIt reported NtStatus 0xC000007F$', '^DumpIt reported a file of 17179869184 bytes, the dump has 12884901888 bytes$', '^the dump has 12884901888 bytes, less than 95% of the RAM \(34261106688 bytes\)$') }
         @{ What = "complete log, file 4 KB short"; Output = $okLog; Dump = 34261114880 - 4096; Ram = $ram2
            Complete = $false; Problems = @('^DumpIt reported a file of 34261114880 bytes, the dump has 34261110784 bytes$') }
@@ -317,6 +329,8 @@ try {
         if ($case.ContainsKey("NtStatus") -and $check.NtStatus -cne $case.NtStatus) { $problems.Add("NtStatus '$($check.NtStatus)'") }
         if ($case.ContainsKey("Reported") -and [long]$check.ReportedBytes -ne [long]$case.Reported) { $problems.Add("reported $($check.ReportedBytes)") }
         if ($case.ContainsKey("Summary") -and $check.Summary -notmatch $case.Summary) { $problems.Add("summary '$($check.Summary)'") }
+        if ($case.ContainsKey("Sha256") -and $check.ReportedSha256 -cne $case.Sha256) { $problems.Add("SHA-256 '$($check.ReportedSha256)'") }
+        if ($case.ContainsKey("Json") -and $check.JsonPath -cne $case.Json) { $problems.Add("JSON path '$($check.JsonPath)'") }
         $expectedErrors = @()
         if ($case.ContainsKey("ErrorLines")) { $expectedErrors = @($case.ErrorLines) }
         if ((@($check.ErrorLines) -join "|") -cne ($expectedErrors -join "|")) { $problems.Add("error lines '$(@($check.ErrorLines) -join ' | ')'") }
@@ -342,8 +356,20 @@ try {
     }
     $script:testDriveRoots = @()
     function Get-MemoryDumpDriveRoots { return $script:testDriveRoots }
+    # Volume serial numbers by root ("" when not listed): a drive with the
+    # system drive's is the same volume (a subst drive)
+    $script:testSerials = @{ "C:\" = "AC3C47A2"; "D:\" = "11112222"; "E:\" = "33334444"; "F:\" = "55556666"; "U:\" = "AC3C47A2" }
+    function Get-TriageVolumeSerial {
+        param([string]$Root)
+        $key = $Root.ToUpperInvariant()
+        if ($script:testSerials.ContainsKey($key)) { return $script:testSerials[$key] }
+        return ""
+    }
     $script:testRamBytes = [long]0
     function Get-PhysicalMemoryBytes { return $script:testRamBytes }
+    # The machine type: x64 unless a case sets ARM64 (the prompt's note)
+    $script:testMachineType = 0x8664
+    function Get-NativeMachineType { return $script:testMachineType }
     # The capture tool: a function run as "& $memTool /TYPE DMP ... /OUTPUT
     # <file>" (DumpIt), "acquire <file>" (WinPmem) or "... /output <file>"
     # (Magnet RAM Capture) that writes a dump of DumpBytes (-1: none) and
@@ -355,16 +381,21 @@ try {
     $script:lockDump = $false
     $script:testLock = $null
     $script:testToolName = "DumpIt"
+    # The stand-in's lines may name the dump's JSON file ("<json>" in a line
+    # stands for <dump without extension>.json, as DumpIt names it); with
+    # WriteJson it writes that file too
     function Invoke-TestCaptureTool {
         $script:toolCalls++
         $outFile = $null
         for ($a = 0; $a -lt $args.Count - 1; $a++) { if ($args[$a] -eq "/OUTPUT" -or $args[$a] -eq "acquire") { $outFile = [string]$args[$a + 1] } }
+        $jsonFile = [System.IO.Path]::ChangeExtension($outFile, ".json")
         if ($script:standIn.DumpBytes -ge 0) {
             $stream = [System.IO.File]::Create($outFile)
             try { $stream.SetLength($script:standIn.DumpBytes) } finally { $stream.Dispose() }
             if ($script:lockDump) { $script:testLock = [System.IO.File]::Open($outFile, "Open", "Read", "Read") }
         }
-        foreach ($line in $script:standIn.Lines) { $line }
+        if ($script:standIn.WriteJson) { [System.IO.File]::WriteAllText($jsonFile, '{"synthetic": true}') }
+        foreach ($line in $script:standIn.Lines) { $line.Replace("<json>", $jsonFile) }
         if ($script:standIn.Throw) { throw $script:standIn.Throw }
     }
     function Find-MemoryCaptureTool {
@@ -399,12 +430,14 @@ try {
 
     # Runs the prompt with these answers; returns what it showed and set
     function Invoke-Prompt {
-        param([string[]]$Answers, [string]$MemoryOutputPathIn = "")
+        param([string[]]$Answers, [string]$MemoryOutputPathIn = "", [string[]]$CategoriesIn = @())
         $script:answers.Clear()
         foreach ($answer in $Answers) { $script:answers.Enqueue($answer) }
         $script:prompts.Clear()
         $script:memorySpaceAccepted = $false
+        $script:memoryPromptLog = $null
         $Categories = $defaultCategories
+        if ($CategoriesIn) { $Categories = $CategoriesIn }
         $MemoryOutputPath = $MemoryOutputPathIn
         $thrown = ""
         $screen = @()
@@ -418,6 +451,8 @@ try {
             Accepted         = $script:memorySpaceAccepted
             Prompts          = @($script:prompts)
             AnswersLeft      = $script:answers.Count
+            # What the collector logs about the prompt once the log exists
+            PromptLog        = @($script:memoryPromptLog)
         }
     }
     $script:testVolumes = @{
@@ -445,6 +480,14 @@ try {
     if ($run.Categories[0] -ne "Memory") { $problems.Add("Categories: $($run.Categories -join ',')") }
     if ($run.MemoryOutputPath -ne "D:\TriageMemory") { $problems.Add("MemoryOutputPath '$($run.MemoryOutputPath)'") }
     if ($run.Accepted) { $problems.Add("marked as accepted anyway") }
+    # The log (written once it exists): what was shown, and the answer;
+    # no ARM64 note on an x64 machine
+    $runTwoLog = @(
+        ('^' + [regex]::Escape('Memory prompt: shown for DumpIt (tools\dumpit\stand-in.exe). Free space on C:\: 40.8 GB; memory dump ~31.9 GB + collection ~5 GB would leave ~3.9 GB (to keep free on the system drive: 20 GB) -- LowReserve') + '$'),
+        ('^' + [regex]::Escape('Memory prompt: system drive warning shown; other drive(s) with room offered: D:\') + '$')
+    )
+    Test-LinesInOrder -Lines $run.PromptLog -Expected ($runTwoLog + @(('^' + [regex]::Escape('Memory prompt: answer 1 of 3 -- Write the dump to D:\TriageMemory (453 GB free) -- recommended') + '$'))) -Problems $problems -Where "prompt log"
+    if ($run.PromptLog.Count -ne 3) { $problems.Add("prompt log: $($run.PromptLog -join ' | ')") }
     Add-Result "prompt: run 2, other drive chosen" $problems -Info "D:\TriageMemory"
 
     # Bad answers are asked again: also one too large for an [int] and an
@@ -456,6 +499,9 @@ try {
     if ($run.Prompts.Count -ne 6 -or $run.AnswersLeft -ne 0) { $problems.Add("$($run.Prompts.Count) question(s), $($run.AnswersLeft) answer(s) left") }
     if ($run.Categories[0] -ne "Memory" -or $run.MemoryOutputPath) { $problems.Add("Categories $($run.Categories -join ','), MemoryOutputPath '$($run.MemoryOutputPath)'") }
     if (-not $run.Accepted) { $problems.Add("not marked as accepted anyway") }
+    # Only the answer taken is logged
+    Test-LinesInOrder -Lines $run.PromptLog -Expected ($runTwoLog + @(('^' + [regex]::Escape('Memory prompt: answer 2 of 3 -- Write the dump to C:\ anyway') + '$'))) -Problems $problems -Where "prompt log"
+    if ($run.PromptLog.Count -ne 3) { $problems.Add("prompt log: $($run.PromptLog -join ' | ')") }
     Add-Result "prompt: run 2, here anyway (after bad answers)" $problems -Info "asked $($run.Prompts.Count) times"
 
     $run = Invoke-Prompt -Answers @("3")
@@ -463,7 +509,18 @@ try {
     if ($run.Thrown) { $problems.Add("prompt threw: $($run.Thrown)") }
     Test-LinesInOrder -Lines $run.Screen -Expected @('^Memory capture skipped\.$') -Problems $problems -Where "screen"
     if ($run.Categories -contains "Memory" -or $run.MemoryOutputPath) { $problems.Add("Categories $($run.Categories -join ','), MemoryOutputPath '$($run.MemoryOutputPath)'") }
+    Test-LinesInOrder -Lines $run.PromptLog -Expected @('^Memory prompt: answer 3 of 3 -- Skip memory, collect artifacts only$') -Problems $problems -Where "prompt log"
     Add-Result "prompt: run 2, skipped" $problems
+
+    # An ARM64 machine: the note on screen, and that it was shown in the log
+    $script:testMachineType = 0xAA64
+    $run = Invoke-Prompt -Answers @("3")
+    $script:testMachineType = 0x8664
+    $problems = New-Problems
+    if ($run.Thrown) { $problems.Add("prompt threw: $($run.Thrown)") }
+    Test-LinesInOrder -Lines $run.Screen -Expected @('^  Note: this is an ARM64 machine\. The timeline builder cannot analyze ARM64$', '^  memory \(Volatility 3 does not support it\); the dump is for WinDbg\.$', '^  Dump file: ') -Problems $problems -Where "screen"
+    Test-LinesInOrder -Lines $run.PromptLog -Expected @('^Memory prompt: shown for DumpIt ', '^Memory prompt: ARM64 note shown \(the timeline builder cannot analyze ARM64 memory; the dump is for WinDbg\)\.$', '^Memory prompt: answer 3 of 3 -- Skip memory') -Problems $problems -Where "prompt log"
+    Add-Result "prompt: ARM64 note shown and logged" $problems
 
     # No room on C: and no other drive: nothing to choose, no question
     $script:testVolumes["C:\"] = New-TestVolume -Root "C:\" -FreeGB 2.6 -TotalGB 487.41
@@ -471,21 +528,73 @@ try {
     $run = Invoke-Prompt -Answers @()
     $problems = New-Problems
     if ($run.Thrown) { $problems.Add("prompt threw: $($run.Thrown)") }
-    Test-LinesInOrder -Lines $run.Screen -Expected @('^  Not enough free space: less than 1 GB would be left free on C:\\\.$', '^  No other drive has room for the dump\.$', '^Memory capture skipped\.$') -Problems $problems -Where "screen"
+    Test-LinesInOrder -Lines $run.Screen -Expected @('^  space that can still hold deleted files \(no other local drive has room for it\)\.$', '^  Not enough free space: less than 1 GB would be left free on C:\\\.$', '^  No other drive has room for the dump\.$', '^Memory capture skipped\.$') -Problems $problems -Where "screen"
     if ($run.Prompts.Count -ne 0) { $problems.Add("asked: $($run.Prompts -join ' | ')") }
     if (@($run.Screen | Where-Object { $_ -match '^\s+\[\d\]' }).Count -gt 0) { $problems.Add("choices shown") }
+    if (@($run.Screen | Where-Object { $_ -match 'another drive is better' }).Count -gt 0) { $problems.Add("'another drive is better' with no other drive") }
     if ($run.Categories -contains "Memory") { $problems.Add("Memory added") }
+    Test-LinesInOrder -Lines $run.PromptLog -Expected @(' -- NoFit$', '^Memory prompt: system drive warning shown; no other local drive has room for the dump\.$', '^Memory prompt: no question asked \(no drive has room for the dump\): memory capture skipped\.$') -Problems $problems -Where "prompt log"
     Add-Result "prompt: no room anywhere, no question" $problems
 
-    # Plenty of room: today's Yes / No, still the system drive warning
+    # Plenty of room and no other drive with room (E: is FAT32): today's
+    # Yes / No, the system drive warning without "another drive is better"
+    # (Run-TriageCollector.bat cannot pass -MemoryOutputPath)
     $script:testVolumes["C:\"] = New-TestVolume -Root "C:\" -FreeGB 400 -TotalGB 487.41
     $run = Invoke-Prompt -Answers @("1")
     $problems = New-Problems
     if ($run.Thrown) { $problems.Add("prompt threw: $($run.Thrown)") }
-    Test-LinesInOrder -Lines $run.Screen -Expected @('would leave ~363\.1 GB', '^  The dump would be written to the system drive being examined', '^  \[1\] Yes -- capture memory \(recommended for incident response\)$', '^  \[2\] No  -- skip memory, collect artifacts only$', '^Memory capture enabled\. Will run first\.$') -Problems $problems -Where "screen"
+    Test-LinesInOrder -Lines $run.Screen -Expected @('would leave ~363\.1 GB', '^  The dump would be written to the system drive being examined, over free$', '^  space that can still hold deleted files \(no other local drive has room for it\)\.$', '^  \[1\] Yes -- capture memory \(recommended for incident response\)$', '^  \[2\] No  -- skip memory, collect artifacts only$', '^Memory capture enabled\. Will run first\.$') -Problems $problems -Where "screen"
+    if (@($run.Screen | Where-Object { $_ -match 'another drive is better|\[3\]' }).Count -gt 0) { $problems.Add("'another drive is better', or a third choice") }
     if (($run.Prompts -join "|") -ne "Include memory capture? (1-2)") { $problems.Add("prompts: $($run.Prompts -join ' | ')") }
     if ($run.Categories[0] -ne "Memory" -or $run.MemoryOutputPath -or $run.Accepted) { $problems.Add("Categories $($run.Categories -join ','), MemoryOutputPath '$($run.MemoryOutputPath)', accepted $($run.Accepted)") }
-    Add-Result "prompt: room on the system drive, Yes / No" $problems
+    Test-LinesInOrder -Lines $run.PromptLog -Expected @(' -- Ok$', '^Memory prompt: system drive warning shown; no other local drive has room for the dump\.$', '^Memory prompt: answer 1 of 2 -- Yes -- capture memory \(recommended for incident response\)$') -Problems $problems -Where "prompt log"
+    Add-Result "prompt: room on the system drive only, Yes / No" $problems
+
+    # Room on the system drive, and D: has room too: "another drive is
+    # better" names D:, which is offered first (recommended), then C:, then
+    # skip; D: chosen
+    $script:testDriveRoots = @("C:\", "D:\", "E:\")
+    $run = Invoke-Prompt -Answers @("1")
+    $problems = New-Problems
+    if ($run.Thrown) { $problems.Add("prompt threw: $($run.Thrown)") }
+    Test-LinesInOrder -Lines $run.Screen -Expected @(
+        '^  The dump would be written to the system drive being examined, over free$',
+        '^  space that can still hold deleted files: another drive is better \(D:\\ has room\)\.$',
+        '^  \[1\] Write the dump to D:\\TriageMemory \(453 GB free\) -- recommended$',
+        '^  \[2\] Write the dump to C:\\ \(the system drive being examined\)$',
+        '^  \[3\] Skip memory, collect artifacts only$',
+        '^Memory dump: D:\\TriageMemory\\TriageCollection_2026-01-02_03-04_memory_dump\.dmp$'
+    ) -Problems $problems -Where "screen"
+    if (($run.Prompts -join "|") -ne "Include memory capture? (1-3)") { $problems.Add("prompts: $($run.Prompts -join ' | ')") }
+    if ($run.Categories[0] -ne "Memory" -or $run.MemoryOutputPath -ne "D:\TriageMemory" -or $run.Accepted) { $problems.Add("Categories $($run.Categories -join ','), MemoryOutputPath '$($run.MemoryOutputPath)', accepted $($run.Accepted)") }
+    Test-LinesInOrder -Lines $run.PromptLog -Expected @(' -- Ok$', '^Memory prompt: system drive warning shown; other drive\(s\) with room offered: D:\\$', '^Memory prompt: answer 1 of 3 -- Write the dump to D:\\TriageMemory') -Problems $problems -Where "prompt log"
+    Add-Result "prompt: room on C: and D:, D: offered first" $problems
+
+    # ... and C: chosen: captured there, not "anyway" (it fits)
+    $run = Invoke-Prompt -Answers @("2")
+    $problems = New-Problems
+    if ($run.Thrown) { $problems.Add("prompt threw: $($run.Thrown)") }
+    if ($run.Categories[0] -ne "Memory" -or $run.MemoryOutputPath -or $run.Accepted) { $problems.Add("Categories $($run.Categories -join ','), MemoryOutputPath '$($run.MemoryOutputPath)', accepted $($run.Accepted)") }
+    Add-Result "prompt: room on C: and D:, C: chosen" $problems
+
+    # A subst drive (U:, a folder of C: under its own letter: a fixed drive
+    # with C:'s volume serial) is the system volume: never offered, also
+    # not when it seems to have room
+    $script:testVolumes["U:\"] = New-TestVolume -Root "U:\" -FreeGB 400 -TotalGB 487.41
+    $problems = New-Problems
+    $script:testDriveRoots = @("C:\", "U:\", "E:\")
+    $run = Invoke-Prompt -Answers @("2")
+    if ($run.Thrown) { $problems.Add("prompt threw: $($run.Thrown)") }
+    if (@($run.Screen | Where-Object { $_ -match 'U:\\|another drive is better' }).Count -gt 0) { $problems.Add("U: offered alone: $($run.Screen -join ' | ')") }
+    Test-LinesInOrder -Lines $run.Screen -Expected @('\(no other local drive has room for it\)\.$', '^  \[1\] Yes -- capture memory', '^  \[2\] No ') -Problems $problems -Where "screen, U: alone"
+    $script:testDriveRoots = @("C:\", "U:\", "D:\")
+    $run = Invoke-Prompt -Answers @("3")
+    if ($run.Thrown) { $problems.Add("prompt threw: $($run.Thrown)") }
+    if (@($run.Screen | Where-Object { $_ -match 'U:\\' }).Count -gt 0) { $problems.Add("U: offered with D:") }
+    Test-LinesInOrder -Lines $run.Screen -Expected @('another drive is better \(D:\\ has room\)\.$', '^  \[1\] Write the dump to D:\\TriageMemory', '^  \[2\] Write the dump to C:\\ ', '^  \[3\] Skip') -Problems $problems -Where "screen, U: and D:"
+    Add-Result "prompt: a subst drive of C: is not another drive" $problems
+    $script:testVolumes.Remove("U:\")
+    $script:testDriveRoots = @("C:\", "E:\")
 
     # -MemoryOutputPath on another drive: checked there, no system drive warning
     $run = Invoke-Prompt -Answers @("2") -MemoryOutputPathIn "D:\Dumps"
@@ -530,17 +639,27 @@ try {
     Add-Result "prompt: collection on an NTFS stick, Yes / No" $problems
     $script:OutputPath = "C:\Triage\reports\TriageCollection_2026-01-02_03-04"
 
-    # Free space unknown: a warning and Yes / No
+    # Free space unknown on the system drive: a warning; D: has room, so it
+    # is offered first, then C:; C: chosen (accepted without a check)
     $script:testVolumes.Remove("C:\")
+    $run = Invoke-Prompt -Answers @("2")
+    $problems = New-Problems
+    if ($run.Thrown) { $problems.Add("prompt threw: $($run.Thrown)") }
+    Test-LinesInOrder -Lines $run.Screen -Expected @('^  Free space on C:\\: unknown', 'another drive is better \(D:\\ has room\)\.$', '^  Free space not checked: the free space could not be read\.$', '^  \[1\] Write the dump to D:\\TriageMemory', '^  \[2\] Write the dump to C:\\ \(the system drive being examined\)$', '^Memory capture enabled\.') -Problems $problems -Where "screen"
+    if (-not $run.Accepted -or $run.MemoryOutputPath) { $problems.Add("accepted $($run.Accepted), MemoryOutputPath '$($run.MemoryOutputPath)'") }
+    Add-Result "prompt: free space unknown" $problems
+
+    # ... and with no other drive: Yes / No
+    $script:testDriveRoots = @("C:\", "E:\")
     $run = Invoke-Prompt -Answers @("1")
     $problems = New-Problems
     if ($run.Thrown) { $problems.Add("prompt threw: $($run.Thrown)") }
     Test-LinesInOrder -Lines $run.Screen -Expected @('^  Free space on C:\\: unknown', '^  Free space not checked: the free space could not be read\.$', '^  \[1\] Yes -- capture memory', '^Memory capture enabled\.') -Problems $problems -Where "screen"
     if (-not $run.Accepted) { $problems.Add("not marked as accepted") }
-    Add-Result "prompt: free space unknown" $problems
+    Add-Result "prompt: free space unknown, no other drive" $problems
 
     # -Unattended: no prompt at all (memory only with -Categories Memory,
-    # checked by the memory section)
+    # checked by the memory section); the log says why
     $script:Unattended = $true
     $run = Invoke-Prompt -Answers @()
     $script:Unattended = $false
@@ -549,7 +668,30 @@ try {
     if ($run.Screen.Count -gt 0) { $problems.Add("shown: $($run.Screen -join ' | ')") }
     if ($run.Prompts.Count -ne 0) { $problems.Add("asked: $($run.Prompts -join ' | ')") }
     if ($run.Categories -contains "Memory" -or $run.MemoryOutputPath -or $run.Accepted) { $problems.Add("Categories $($run.Categories -join ','), MemoryOutputPath '$($run.MemoryOutputPath)', accepted $($run.Accepted)") }
+    if (($run.PromptLog -join "|") -cne "Memory prompt: not shown (-Unattended; memory is captured only with -Categories Memory).") { $problems.Add("prompt log: $($run.PromptLog -join ' | ')") }
     Add-Result "prompt: not shown with -Unattended" $problems
+
+    # The other reasons it is not shown, as logged: Memory given with
+    # -Categories; no capture tool; a mounted image (nothing to log)
+    $problems = New-Problems
+    $run = Invoke-Prompt -Answers @() -CategoriesIn @("Memory", "FileSystem")
+    if ($run.Thrown -or $run.Screen.Count -gt 0 -or ($run.PromptLog -join "|") -cne "Memory prompt: not shown (Memory given with -Categories).") { $problems.Add("-Categories Memory: '$($run.Thrown)', shown $($run.Screen.Count), log '$($run.PromptLog -join ' | ')'") }
+    $savedToolName = $script:testToolName
+    Set-Item -Path function:Find-MemoryCaptureTool -Value { $script:skippedMemTools = @(); return $null }
+    try { $run = Invoke-Prompt -Answers @() }
+    finally {
+        Set-Item -Path function:Find-MemoryCaptureTool -Value {
+            $script:skippedMemTools = @()
+            return [PSCustomObject]@{ Name = $script:testToolName; Path = "Invoke-TestCaptureTool"; RelPath = "tools\$($script:testToolName.ToLowerInvariant())\stand-in.exe" }
+        }
+    }
+    $script:testToolName = $savedToolName
+    if ($run.Thrown -or $run.Screen.Count -gt 0 -or ($run.PromptLog -join "|") -cne "Memory prompt: not shown (no memory capture tool in tools\).") { $problems.Add("no tool: '$($run.Thrown)', shown $($run.Screen.Count), log '$($run.PromptLog -join ' | ')'") }
+    $script:IsLive = $false
+    $run = Invoke-Prompt -Answers @()
+    $script:IsLive = $true
+    if ($run.Thrown -or $run.Screen.Count -gt 0 -or $run.PromptLog.Count -ne 0) { $problems.Add("mounted image: '$($run.Thrown)', shown $($run.Screen.Count), log '$($run.PromptLog -join ' | ')'") }
+    Add-Result "prompt: why it was not shown, logged" $problems
 
     # The choices themselves (Get-MemoryCaptureChoices)
     $problems = New-Problems
@@ -557,20 +699,30 @@ try {
         [PSCustomObject]@{ Root = "D:\"; DumpDir = "D:\TriageMemory"; Check = [PSCustomObject]@{ FreeBytes = 453GB } },
         [PSCustomObject]@{ Root = "G:\"; DumpDir = "G:\TriageMemory"; Check = [PSCustomObject]@{ FreeBytes = 100GB } }
     )
+    # System: the dump would go to the system drive (OnSystemDrive)
     $choiceCases = @(
         @{ Result = "Ok"; Drives = @(); Actions = "Here,Skip" }
         @{ Result = "Unknown"; Drives = @(); Actions = "Here,Skip" }
+        @{ Result = "Ok"; Drives = $twoDrives; Actions = "Here,Skip" }
+        @{ Result = "Ok"; Drives = $twoDrives; System = $true; Actions = "Other,Other,Here,Skip" }
+        @{ Result = "Unknown"; Drives = $twoDrives; System = $true; Actions = "Other,Other,Here,Skip" }
+        @{ Result = "Ok"; Drives = @(); System = $true; Actions = "Here,Skip" }
         @{ Result = "LowReserve"; Drives = $twoDrives; Actions = "Other,Other,Here,Skip" }
+        @{ Result = "LowReserve"; Drives = $twoDrives; System = $true; Actions = "Other,Other,Here,Skip" }
         @{ Result = "LowReserve"; Drives = @(); Actions = "Here,Skip" }
         @{ Result = "NoFit"; Drives = $twoDrives; Actions = "Other,Other,Skip" }
+        @{ Result = "NoFit"; Drives = $twoDrives; System = $true; Actions = "Other,Other,Skip" }
         @{ Result = "NoFit"; Drives = @(); Actions = "Skip" }
     )
     foreach ($case in $choiceCases) {
-        $choices = @(Get-MemoryCaptureChoices -Check ([PSCustomObject]@{ Result = $case.Result; Root = "C:\" }) -OtherDrives $case.Drives)
+        $choices = @(Get-MemoryCaptureChoices -Check ([PSCustomObject]@{ Result = $case.Result; Root = "C:\"; OnSystemDrive = [bool]$case.System }) -OtherDrives $case.Drives)
         $actions = ($choices | ForEach-Object { $_.Action }) -join ","
-        if ($actions -ne $case.Actions) { $problems.Add("$($case.Result) with $(@($case.Drives).Count) drive(s): $actions") }
+        if ($actions -ne $case.Actions) { $problems.Add("$($case.Result) (system drive $([bool]$case.System)) with $(@($case.Drives).Count) drive(s): $actions") }
+        $hereLabel = @($choices | Where-Object { $_.Action -eq "Here" } | ForEach-Object { $_.Label }) -join ""
+        if ($case.Result -eq "LowReserve" -and $hereLabel -cne "Write the dump to C:\ anyway") { $problems.Add("LowReserve: here '$hereLabel'") }
+        if ($case.Result -in @("Ok", "Unknown") -and $case.System -and @($case.Drives).Count -gt 0 -and $hereLabel -cne "Write the dump to C:\ (the system drive being examined)") { $problems.Add("$($case.Result) on the system drive: here '$hereLabel'") }
         $recommended = @($choices | Where-Object { $_.Label -like "*recommended*" })
-        if ($case.Drives.Count -gt 0 -and ($recommended.Count -ne 1 -or $recommended[0].DumpDir -ne "D:\TriageMemory")) { $problems.Add("$($case.Result): recommended '$(@($recommended | ForEach-Object { $_.Label }) -join ' | ')'") }
+        if (@($choices | Where-Object { $_.Action -eq "Other" }).Count -gt 0 -and ($recommended.Count -ne 1 -or $recommended[0].DumpDir -ne "D:\TriageMemory")) { $problems.Add("$($case.Result): recommended '$(@($recommended | ForEach-Object { $_.Label }) -join ' | ')'") }
     }
     Add-Result "prompt: choices per result" $problems
 
@@ -582,14 +734,27 @@ try {
     $script:Categories = @("Memory", "FileSystem")
     $script:testRamBytes = [long]1MB
     $completeBytes = [long]1MB + 8192
+    # Sha256: the "SHA-256:" line DumpIt prints after the capture; JsonLine:
+    # its "JSON path:" line, naming <dump>.json; WriteJson: that file is
+    # written too (DumpIt does only with Dmp2Json.exe beside it)
     function New-StandIn {
-        param([long]$DumpBytes, [long]$ReportedBytes = -2, [string]$NtStatus = "0x00000000", [string[]]$Extra = @(), [string]$Throw = "")
+        param([long]$DumpBytes, [long]$ReportedBytes = -2, [string]$NtStatus = "0x00000000", [string[]]$Extra = @(), [string]$Throw = "", [string]$Sha256 = "", [switch]$JsonLine, [switch]$WriteJson)
         if ($ReportedBytes -eq -2) { $ReportedBytes = $DumpBytes }
         $lines = @("  DumpIt 0.0.00000000 (X64) (synthetic test output)") + $Extra
         if ($ReportedBytes -ge 0) { $lines += "    Created file size:           $ReportedBytes bytes (1 Mb)" }
         if ($NtStatus) { $lines += "    NtStatus (troubleshooting):   $NtStatus" }
-        return [PSCustomObject]@{ DumpBytes = $DumpBytes; Lines = $lines; Throw = $Throw }
+        if ($Sha256) { $lines += "    SHA-256: $Sha256" }
+        if ($JsonLine) { $lines += "    JSON path:                  <json>" }
+        return [PSCustomObject]@{ DumpBytes = $DumpBytes; Lines = $lines; Throw = $Throw; WriteJson = [bool]$WriteJson }
     }
+    # SHA-256 of the stand-in's dump (Bytes zero bytes), as DumpIt prints it
+    function Get-ZeroSha256 {
+        param([long]$Bytes)
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        try { return ([System.BitConverter]::ToString($sha.ComputeHash((New-Object byte[] $Bytes)))).Replace("-", "") }
+        finally { $sha.Dispose() }
+    }
+    $completeSha = Get-ZeroSha256 $completeBytes
 
     # Runs the memory section for a new collection folder; returns what it
     # logged and left behind. LockDump: the dump stays open (see
@@ -609,6 +774,7 @@ try {
         $script:totalBytes = 0
         $script:memDumpPath = $null
         $script:memDumpIncompletePath = $null
+        $script:memDumpRecordedBytes = [long]0
         $script:memorySpaceAccepted = [bool]$Accepted
         $script:MemoryOutputPath = $DumpDir
         $script:standIn = $StandIn
@@ -655,6 +821,7 @@ try {
             Rows         = $rows
             MemDumpPath  = $script:memDumpPath
             Incomplete   = $script:memDumpIncompletePath
+            RecordedSize = $script:memDumpRecordedBytes
         }
     }
     function Test-SectionRun {
@@ -684,29 +851,67 @@ try {
     }
     $rootText = [regex]::Escape((ConvertTo-LogText $tempRoot))
 
-    # Complete dump in Memory\: recorded, kept
-    $run = Invoke-MemorySection -Name "complete" -StandIn (New-StandIn $completeBytes)
+    # Complete dump in Memory\: recorded, kept. DumpIt printed the dump's
+    # SHA-256: the collector's hash matches it. The screen says what the
+    # waits are (DumpIt shows nothing while it runs; the collector's hash).
+    # The JSON file DumpIt's output names was not written (ARM64): a note
+    $run = Invoke-MemorySection -Name "complete" -StandIn (New-StandIn $completeBytes -Sha256 $completeSha.ToLowerInvariant() -JsonLine)
     $problems = New-Problems
     $dumpText = [regex]::Escape((ConvertTo-LogText $run.DumpPath))
+    $jsonText = [regex]::Escape((ConvertTo-LogText ([System.IO.Path]::ChangeExtension($run.DumpPath, ".json"))))
     Test-SectionRun -Run $run -Lines @(
         "Memory dump file: $dumpText$",
         "Free space on ${rootText}: 500 GB; memory dump ~0 GB \+ collection ~5 GB would leave ~495 GB \(to keep free on the system drive: 20 GB\)$",
         'The memory dump is written to the system drive being examined',
         'Capturing memory',
+        '\] DumpIt shows nothing until it exits: it writes the dump, then computes the dump''s SHA-256 before it exits\.$',
+        '\] Hashing the memory dump \(SHA-256 of 0 GB\) for the manifest\.\.\.$',
         "Memory dump check: $completeBytes bytes \(100\.8% of the RAM\); DumpIt reported NtStatus 0x00000000 and a file of $completeBytes bytes$",
-        "OK: Memory dump captured: $dumpText"
+        "\] Memory dump SHA-256 check: match -- the collector's SHA-256 of the dump equals the one DumpIt printed \($completeSha\)$",
+        "OK: Memory dump captured: $dumpText",
+        "\] Note: the DumpIt output names a JSON file that DumpIt did not write \($jsonText\); it writes one only when Dmp2Json\.exe is beside it, which its ARM64 build does not include\. Nothing is missing from the collection\.$"
     ) -Errors 0 -ToolCalls 1 -Problems $problems -Absent @('WARNING', 'ERROR')
     if ($run.MemDumpPath -ne $run.DumpPath) { $problems.Add("memDumpPath '$($run.MemDumpPath)'") }
     if ((Get-FileLength $run.DumpPath) -ne $completeBytes) { $problems.Add("dump is $(Get-FileLength $run.DumpPath) bytes") }
+    if ($run.RecordedSize -ne $completeBytes) { $problems.Add("recorded dump size $($run.RecordedSize), expected $completeBytes") }
     Test-DumpRow -Rows $run.Rows -Tool "DumpIt" -DestPath $run.DumpPath -RelativePath "Memory\memory_dump.dmp" -Problems $problems
     if (@($run.Rows | Where-Object { $_.SourcePath -eq "(memory capture tool output: DumpIt)" }).Count -ne 1) { $problems.Add("acquisition log not in the manifest") }
-    Add-Result "section: complete dump" $problems -Info "$completeBytes bytes"
+    if (@($run.Rows | Where-Object { $_.SourcePath -like "*JSON*" }).Count -ne 0) { $problems.Add("a JSON row in the manifest") }
+    Add-Result "section: complete dump, SHA-256 matches DumpIt's" $problems -Info "$completeBytes bytes"
+
+    # DumpIt printed another SHA-256: a warning (MISMATCH), not an error;
+    # the dump is still recorded with the collector's hash
+    $otherSha = "AB" * 32
+    $run = Invoke-MemorySection -Name "shamismatch" -StandIn (New-StandIn $completeBytes -Sha256 $otherSha)
+    $problems = New-Problems
+    Test-SectionRun -Run $run -Lines @(
+        "WARNING: Memory dump SHA-256 check: MISMATCH -- DumpIt printed $otherSha, the collector computed $completeSha for the dump file \(the manifest has the collector's\)\. The dump changed after DumpIt hashed it, or a read failed\.$",
+        'OK: Memory dump captured'
+    ) -Errors 0 -ToolCalls 1 -Problems $problems -Absent @('check: match', 'JSON')
+    Test-DumpRow -Rows $run.Rows -Tool "DumpIt" -DestPath $run.DumpPath -RelativePath "Memory\memory_dump.dmp" -Problems $problems
+    Add-Result "section: SHA-256 differs from DumpIt's -> MISMATCH warning" $problems
+
+    # No SHA-256 printed: the collector's hash alone, said so
+    $run = Invoke-MemorySection -Name "nosha" -StandIn (New-StandIn $completeBytes)
+    $problems = New-Problems
+    Test-SectionRun -Run $run -Lines @("\] Memory dump SHA-256: $completeSha \(DumpIt printed no SHA-256 to compare it with\)$", 'OK: Memory dump captured') -Errors 0 -ToolCalls 1 -Problems $problems -Absent @('SHA-256 check', 'JSON')
+    Add-Result "section: no SHA-256 from DumpIt -> hash logged" $problems
+
+    # DumpIt wrote the JSON file (Dmp2Json.exe beside it): recorded in the
+    # manifest, in Memory\
+    $run = Invoke-MemorySection -Name "json" -StandIn (New-StandIn $completeBytes -Sha256 $completeSha -JsonLine -WriteJson)
+    $problems = New-Problems
+    $jsonFile = [System.IO.Path]::ChangeExtension($run.DumpPath, ".json")
+    Test-SectionRun -Run $run -Lines @('check: match', 'OK: Memory dump captured', ("\] DumpIt wrote the JSON file its output names, recorded in the manifest: " + [regex]::Escape((ConvertTo-LogText $jsonFile)) + '$')) -Errors 0 -ToolCalls 1 -Problems $problems -Absent @('Note: ')
+    $jsonRows = @($run.Rows | Where-Object { $_.SourcePath -eq "(memory capture tool output: DumpIt JSON)" })
+    if ($jsonRows.Count -ne 1 -or $jsonRows[0].RelativePath -cne "Memory\memory_dump.json" -or $jsonRows[0].SHA256 -cne (Get-FileHash -LiteralPath $jsonFile -Algorithm SHA256).Hash) { $problems.Add("JSON row: $($jsonRows.Count), '$(@($jsonRows | ForEach-Object { $_.RelativePath }) -join ',')'") }
+    Add-Result "section: DumpIt's JSON file recorded" $problems
 
     # WinPmem and Magnet RAM Capture: a raw image, recorded the same way
     # (in Memory\, and in a -MemoryOutputPath folder as the prompt sets it)
     $run = Invoke-MemorySection -Name "winpmem" -Tool "WinPmem" -StandIn (New-StandIn $completeBytes -ReportedBytes -1 -NtStatus "")
     $problems = New-Problems
-    Test-SectionRun -Run $run -Lines @('Memory capture tool: WinPmem ', 'OK: Memory dump captured: ') -Errors 0 -ToolCalls 1 -Problems $problems
+    Test-SectionRun -Run $run -Lines @('Memory capture tool: WinPmem ', "\] Memory dump SHA-256: $completeSha$", 'OK: Memory dump captured: ') -Errors 0 -ToolCalls 1 -Problems $problems -Absent @('DumpIt')
     if ($run.DumpPath -cne (Join-Path $OutputPath "Memory\memory_dump.raw") -or $run.MemDumpPath -cne $run.DumpPath) { $problems.Add("dump path '$($run.DumpPath)', memDumpPath '$($run.MemDumpPath)'") }
     Test-DumpRow -Rows $run.Rows -Tool "WinPmem" -DestPath $run.DumpPath -RelativePath "Memory\memory_dump.raw" -Problems $problems
     Add-Result "section: WinPmem raw image recorded" $problems
@@ -799,16 +1004,20 @@ try {
 
     # -MemoryOutputPath: the dump there under the collection's name, the
     # acquisition log in Memory\, the dump row outside the collection
+    # The JSON file DumpIt wrote next to the dump there: copied into Memory\
     $dumpDir = Join-Path $workDir "dumps\not yet created"
-    $run = Invoke-MemorySection -Name "dumpdir" -StandIn (New-StandIn $completeBytes) -DumpDir $dumpDir
+    $run = Invoke-MemorySection -Name "dumpdir" -StandIn (New-StandIn $completeBytes -JsonLine -WriteJson) -DumpDir $dumpDir
     $problems = New-Problems
     $expectedDump = Join-Path $dumpDir "TriageCollection_2026-01-02_03-04_memory_dump.dmp"
+    $expectedJson = Join-Path $dumpDir "TriageCollection_2026-01-02_03-04_memory_dump.json"
     if ($run.DumpPath -ne $expectedDump) { $problems.Add("dump path '$($run.DumpPath)'") }
-    Test-SectionRun -Run $run -Lines @(("Memory dump file: " + [regex]::Escape((ConvertTo-LogText $expectedDump)) + '$'), 'OK: Memory dump captured') -Errors 0 -ToolCalls 1 -Problems $problems
+    Test-SectionRun -Run $run -Lines @(("Memory dump file: " + [regex]::Escape((ConvertTo-LogText $expectedDump)) + '$'), 'OK: Memory dump captured', ("\] DumpIt wrote the JSON file its output names next to the dump, copied into the collection's Memory folder: " + [regex]::Escape((ConvertTo-LogText $expectedJson)) + '$')) -Errors 0 -ToolCalls 1 -Problems $problems
     if ($run.MemDumpPath -ne $expectedDump -or (Get-FileLength $expectedDump) -ne $completeBytes) { $problems.Add("memDumpPath '$($run.MemDumpPath)', $(Get-FileLength $expectedDump) bytes") }
     if (-not (Test-Path -LiteralPath $run.AcqLog)) { $problems.Add("no acquisition log in Memory\") }
     Test-DumpRow -Rows $run.Rows -Tool "DumpIt" -DestPath $expectedDump -RelativePath "" -Problems $problems
-    Add-Result "section: -MemoryOutputPath" $problems
+    $jsonRows = @($run.Rows | Where-Object { $_.SourcePath -eq $expectedJson })
+    if ($jsonRows.Count -ne 1 -or $jsonRows[0].RelativePath -cne "Memory\TriageCollection_2026-01-02_03-04_memory_dump.json") { $problems.Add("JSON copy: $($jsonRows.Count) row(s) '$(@($jsonRows | ForEach-Object { $_.RelativePath }) -join ',')'") }
+    Add-Result "section: -MemoryOutputPath (JSON file copied in)" $problems
 
     # A failed capture to -MemoryOutputPath: renamed in place
     $run = Invoke-MemorySection -Name "dumpdirfailed" -StandIn (New-StandIn -DumpBytes 4096 -ReportedBytes 4096) -DumpDir (Join-Path $workDir "dumps2")
@@ -902,7 +1111,11 @@ try {
         $manifestBefore = [System.IO.File]::ReadAllBytes($manifestFile)
         $script:fileCount = 3
         $script:errorCount = 0
+        # The total counts the recorded dump (4 bytes), as Record-Manifest
+        # did; the summary shows the collection without it
         $script:totalBytes = 1000
+        $script:memDumpRecordedBytes = [long]0
+        if ($script:memDumpPath) { $script:memDumpRecordedBytes = [long]4 }
         $locks = @()
         if ($LockDump) { $locks += [System.IO.File]::Open($dump, "Open", "Read", "Read") }
         if ($LockZip) {
@@ -998,15 +1211,32 @@ try {
         if ($dumpRows -ne [int][bool]$DestPath) { $Problems.Add("manifest $Where has $dumpRows dump row(s)") }
     }
 
+    # The summary on screen at the end has one "Memory dump:" line (with the
+    # dump's size); the log (when the folder was kept) has it too
+    function Test-OneDumpLine {
+        param([object]$Final, [System.Collections.Generic.List[string]]$Problems)
+        $onScreen = @($Final.Screen | Where-Object { $_ -match '^  Memory dump:' })
+        if ($onScreen.Count -ne 1) { $Problems.Add("$($onScreen.Count) 'Memory dump:' line(s) in the summary at the end: $($onScreen -join ' | ')") }
+        $logged = @($Final.Log | Where-Object { $_ -match '^\[[^\]]+\]   Memory dump:' })
+        if ($Final.Folder -and $logged.Count -lt 1) { $Problems.Add("no 'Memory dump:' line in collection_log.txt") }
+    }
+
+    # The sizes: the collection without the dump (1000 - 4 bytes), the dump
+    # on its line, the zip at the end
     $final = Invoke-Final -Name "zip"
     $problems = New-Problems
     Test-LinesInOrder -Lines $final.Screen -Expected @(
-        ('Memory dump:    ' + [regex]::Escape($final.Next) + ' \(kept outside the zip\)$'),
+        '\]   Collection size: 996 bytes \(without the memory dump\)$',
+        ('Memory dump:    ' + [regex]::Escape($final.Next) + ' \(4 bytes, kept outside the zip\)$'),
         'Memory dump detected .* keeping it next to the zip\.$',
         ('\] collection_manifest\.csv: the memory dump''s row now names ' + [regex]::Escape($final.Next) + '$'),
         'OK: Compressed to ',
-        ('^  Memory dump:    ' + [regex]::Escape($final.Next) + ' \(')
+        '^  Collection size: 996 bytes \(without the memory dump\)$',
+        ('^  Memory dump:    ' + [regex]::Escape($final.Next) + ' \(4 bytes, kept outside the zip\)$'),
+        ('^  Zip created:    ' + [regex]::Escape("$OutputPath.zip") + ' \([\d.]+ MB\)$')
     ) -Problems $problems -Where "screen"
+    if (@($final.Screen | Where-Object { $_ -match 'Total size' }).Count -gt 0) { $problems.Add("'Total size' shown") }
+    Test-OneDumpLine -Final $final -Problems $problems
     if (-not $final.Zip -or $final.Folder) { $problems.Add("zip $($final.Zip), folder kept $($final.Folder)") }
     if ((Get-FileLength $final.Next) -ne 4 -or (Get-FileLength $final.Dump) -ge 0) { $problems.Add("dump not next to the zip") }
     if (@($final.Entries | Where-Object { $_ -like "*memory_dump*" }).Count -gt 0) { $problems.Add("dump in the zip") }
@@ -1030,7 +1260,7 @@ try {
     # manifest is as it was) and the summary line
     $final = Invoke-Final -Name "zipfail" -LockZip
     $problems = New-Problems
-    $movedBackLine = '  Memory dump:    ' + [regex]::Escape($final.Dump) + ' \(moved back, no zip was created\)$'
+    $movedBackLine = '  Memory dump:    ' + [regex]::Escape($final.Dump) + ' \(4 bytes, moved back, no zip was created\)$'
     Test-LinesInOrder -Lines $final.Screen -Expected @(
         ('\] collection_manifest\.csv: the memory dump''s row now names ' + [regex]::Escape($final.Next) + '$'),
         'WARNING: Compression failed, no zip created: ',
@@ -1038,11 +1268,11 @@ try {
         ('\] ' + $movedBackLine),
         '^  COLLECTION SUMMARY$',
         ('^' + $movedBackLine),
-        'Zip NOT created -- collection left at: ',
-        ('^  Memory dump:    ' + [regex]::Escape($final.Dump) + ' \(')
+        'Zip NOT created -- collection left at: '
     ) -Problems $problems -Where "screen"
     if (@($final.Screen | Where-Object { $_ -match '^  Memory dump:.*kept outside the zip' }).Count -gt 0) { $problems.Add("the summary on screen names the path next to the zip") }
-    Test-LinesInOrder -Lines $final.Log -Expected @(('\] ' + [regex]::Escape('  Memory dump:    ' + (ConvertTo-LogText $final.Dump) + ' (moved back, no zip was created)') + '$')) -Problems $problems -Where "collection_log.txt"
+    Test-OneDumpLine -Final $final -Problems $problems
+    Test-LinesInOrder -Lines $final.Log -Expected @(('\] ' + [regex]::Escape('  Memory dump:    ' + (ConvertTo-LogText $final.Dump) + ' (4 bytes, moved back, no zip was created)') + '$')) -Problems $problems -Where "collection_log.txt"
     if (-not $final.ZipKept -or -not $final.Folder -or (Get-FileLength $final.Dump) -ne 4 -or (Get-FileLength $final.Next) -ge 0) { $problems.Add("file at the zip path kept $($final.ZipKept), folder kept $($final.Folder), dump back in it $((Get-FileLength $final.Dump) -eq 4)") }
     Test-ManifestAfter -Before $final.ManifestBefore -After $final.FolderManifest -Tool "DumpIt" -DestPath $final.Dump -RelativePath "Memory\memory_dump.dmp" -Problems $problems -Where "in the folder"
     if ($null -ne $final.FolderManifest -and [System.Convert]::ToBase64String($final.FolderManifest) -cne [System.Convert]::ToBase64String($final.ManifestBefore)) { $problems.Add("manifest not as it was") }
@@ -1069,19 +1299,19 @@ try {
     # zip: corrected in the log, and on screen at the end
     $final = Invoke-Final -Name "locked" -LockDump
     $problems = New-Problems
-    $correctedLine = '  Memory dump:    ' + [regex]::Escape($final.Dump) + ' \(not moved out, the folder is not zipped\)$'
+    $correctedLine = '  Memory dump:    ' + [regex]::Escape($final.Dump) + ' \(4 bytes, not moved out, the folder is not zipped\)$'
     Test-LinesInOrder -Lines $final.Screen -Expected @(
         'WARNING: Could not move the memory dump out of the collection folder, so the folder is not compressed: ',
         'The collection is kept at: ',
         ('\] ' + $correctedLine),
         '^  COLLECTION SUMMARY$',
         ('^' + $correctedLine),
-        'Zip NOT created -- collection left at: ',
-        ('^  Memory dump:    ' + [regex]::Escape($final.Dump) + ' \(')
+        'Zip NOT created -- collection left at: '
     ) -Problems $problems -Where "screen"
     if (@($final.Screen | Where-Object { $_ -match '^  Memory dump:.*kept outside the zip' }).Count -gt 0) { $problems.Add("the summary on screen names the path next to the zip") }
-    $correctedLog = '\] ' + [regex]::Escape('  Memory dump:    ' + (ConvertTo-LogText $final.Dump) + ' (not moved out, the folder is not zipped)') + '$'
-    Test-LinesInOrder -Lines $final.Log -Expected @('kept outside the zip\)$', 'WARNING: Could not move the memory dump out', $correctedLog) -Problems $problems -Where "collection_log.txt"
+    Test-OneDumpLine -Final $final -Problems $problems
+    $correctedLog = '\] ' + [regex]::Escape('  Memory dump:    ' + (ConvertTo-LogText $final.Dump) + ' (4 bytes, not moved out, the folder is not zipped)') + '$'
+    Test-LinesInOrder -Lines $final.Log -Expected @('\(4 bytes, kept outside the zip\)$', 'WARNING: Could not move the memory dump out', $correctedLog) -Problems $problems -Where "collection_log.txt"
     if (@($final.Screen | Where-Object { $_ -match 'Compressing to:|row now names' }).Count -gt 0) { $problems.Add("compression started, or the manifest row changed") }
     if ($final.Zip -or -not $final.Folder -or (Get-FileLength $final.Dump) -ne 4) { $problems.Add("zip $($final.Zip), folder kept $($final.Folder), dump in it $((Get-FileLength $final.Dump) -eq 4)") }
     Test-ManifestAfter -Before $final.ManifestBefore -After $final.FolderManifest -Tool "DumpIt" -DestPath $final.Dump -RelativePath "Memory\memory_dump.dmp" -Problems $problems -Where "in the folder"
@@ -1140,7 +1370,8 @@ try {
     $final = Invoke-Final -Name "dumpdir" -DumpDir (Join-Path $workDir "dumpdir-final")
     $problems = New-Problems
     $hintLines = $driveHint + 'to the zip under this name)'
-    Test-LinesInOrder -Lines $final.Screen -Expected (@('Memory dump:    ' + [regex]::Escape($final.Dump) + '$') + (Get-HintPatterns $hintLines -Logged) + @('OK: Compressed to ') + (Get-HintPatterns $hintLines) + @('^  Memory dump:    ' + [regex]::Escape($final.Dump) + ' \(')) -Problems $problems -Where "screen"
+    Test-LinesInOrder -Lines $final.Screen -Expected (@('Memory dump:    ' + [regex]::Escape($final.Dump) + ' \(4 bytes\)$') + (Get-HintPatterns $hintLines -Logged) + @('OK: Compressed to ', ('^  Memory dump:    ' + [regex]::Escape($final.Dump) + ' \(4 bytes\)$')) + (Get-HintPatterns $hintLines)) -Problems $problems -Where "screen"
+    Test-OneDumpLine -Final $final -Problems $problems
     if (@($final.Screen | Where-Object { $_ -match 'MemoryDumpPath' }).Count -gt 0) { $problems.Add("the summary asks for -MemoryDumpPath") }
     if (-not $final.Zip -or (Get-FileLength $final.Dump) -ne 4) { $problems.Add("zip $($final.Zip), dump left $((Get-FileLength $final.Dump) -eq 4)") }
     if (@($final.Screen | Where-Object { $_ -match 'Memory dump detected|row now names' }).Count -gt 0) { $problems.Add("dump moved, or its row changed") }
@@ -1152,7 +1383,8 @@ try {
     $final = Invoke-Final -Name "dumpdirnozip" -DumpDir (Join-Path $workDir "dumpdirnozip-final") -NoZip
     $problems = New-Problems
     $hintLines = $driveHint + 'to the collection folder under this name)'
-    Test-LinesInOrder -Lines $final.Screen -Expected (@('\]   Memory dump:    ' + [regex]::Escape($final.Dump) + '$') + (Get-HintPatterns $hintLines -Logged) + @('^  COLLECTION SUMMARY$') + (Get-HintPatterns $hintLines) + @('^  Memory dump:    ' + [regex]::Escape($final.Dump) + ' \(')) -Problems $problems -Where "screen"
+    Test-LinesInOrder -Lines $final.Screen -Expected (@('\]   Memory dump:    ' + [regex]::Escape($final.Dump) + ' \(4 bytes\)$') + (Get-HintPatterns $hintLines -Logged) + @('^  COLLECTION SUMMARY$', ('^  Memory dump:    ' + [regex]::Escape($final.Dump) + ' \(4 bytes\)$')) + (Get-HintPatterns $hintLines)) -Problems $problems -Where "screen"
+    Test-OneDumpLine -Final $final -Problems $problems
     Test-LinesInOrder -Lines $final.Log -Expected (Get-HintPatterns $hintLines -Logged) -Problems $problems -Where "collection_log.txt"
     if (@($final.Screen | Where-Object { $_ -match 'MemoryDumpPath|to the zip under' }).Count -gt 0) { $problems.Add("the summary asks for -MemoryDumpPath, or names the zip") }
     if ($final.Zip -or -not $final.Folder -or (Get-FileLength $final.Dump) -ne 4) { $problems.Add("zip $($final.Zip), folder kept $($final.Folder), dump left $((Get-FileLength $final.Dump) -eq 4)") }
@@ -1177,6 +1409,7 @@ try {
         $script:fileCount = 3
         $script:errorCount = 0
         $script:totalBytes = 1000
+        $script:memDumpRecordedBytes = [long]0
         $screen = @(& {
             $ErrorActionPreference = "Continue"
             . $summaryBlock
@@ -1197,10 +1430,11 @@ try {
 
     $final = Invoke-Final -Name "nozip" -NoZip
     $problems = New-Problems
-    Test-LinesInOrder -Lines $final.Screen -Expected @(('^  Output:         ' + [regex]::Escape($OutputPath) + '$'), ('^  Memory dump:    ' + [regex]::Escape($final.Dump) + '$')) -Problems $problems -Where "screen"
+    Test-LinesInOrder -Lines $final.Screen -Expected @('^  Collection size: 996 bytes \(without the memory dump\)$', ('^  Output:         ' + [regex]::Escape($OutputPath) + '$'), ('^  Memory dump:    ' + [regex]::Escape($final.Dump) + ' \(4 bytes\)$')) -Problems $problems -Where "screen"
+    Test-OneDumpLine -Final $final -Problems $problems
     if ($final.Zip -or -not $final.Folder) { $problems.Add("zip $($final.Zip), folder kept $($final.Folder)") }
     $logged = @(Get-Content -LiteralPath $logFile)
-    Test-LinesInOrder -Lines $logged -Expected @(('Memory dump:    ' + [regex]::Escape((ConvertTo-LogText $final.Dump)) + '$')) -Problems $problems -Where "collection_log.txt"
+    Test-LinesInOrder -Lines $logged -Expected @(('Memory dump:    ' + [regex]::Escape((ConvertTo-LogText $final.Dump)) + ' \(4 bytes\)$')) -Problems $problems -Where "collection_log.txt"
     Test-ManifestAfter -Before $final.ManifestBefore -After $final.FolderManifest -Tool "DumpIt" -DestPath $final.Dump -RelativePath "Memory\memory_dump.dmp" -Problems $problems -Where "in the folder"
     Add-Result "summary: -NoCompress names the dump" $problems
 
@@ -1217,7 +1451,8 @@ try {
     $final = Invoke-Final -Name "dumpdirparent" -DumpDir (Join-Path $workDir "dumpdirparent")
     $problems = New-Problems
     if ($final.Dump -ne $final.Next) { $problems.Add("dump path '$($final.Dump)', expected '$($final.Next)'") }
-    Test-LinesInOrder -Lines $final.Screen -Expected @(('\]   Memory dump:    ' + [regex]::Escape($final.Dump) + '$'), 'OK: Compressed to ', ('^  Memory dump:    ' + [regex]::Escape($final.Dump) + '$')) -Problems $problems -Where "screen"
+    Test-LinesInOrder -Lines $final.Screen -Expected @(('\]   Memory dump:    ' + [regex]::Escape($final.Dump) + ' \(4 bytes\)$'), 'OK: Compressed to ', ('^  Memory dump:    ' + [regex]::Escape($final.Dump) + ' \(4 bytes\)$')) -Problems $problems -Where "screen"
+    Test-OneDumpLine -Final $final -Problems $problems
     if (@($final.Screen | Where-Object { $_ -match 'timeline builder|under this name|Memory dump detected' }).Count -gt 0) { $problems.Add("a hint, or the dump moved") }
     if (-not $final.Zip -or (Get-FileLength $final.Dump) -ne 4 -or @($final.Entries | Where-Object { $_ -like "*memory_dump*" }).Count -gt 0) { $problems.Add("zip $($final.Zip), dump left $((Get-FileLength $final.Dump) -eq 4)") }
     Test-ManifestAfter -Before $final.ManifestBefore -After $final.ZipManifest -Tool "DumpIt" -DestPath $final.Dump -RelativePath "" -Problems $problems -Where "in the zip"

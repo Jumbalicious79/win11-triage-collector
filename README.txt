@@ -6,8 +6,9 @@ tools required.
 
 Designed to be used with win11-timeline-builder, which parses this script's
 output into a unified chronological timeline and a findings report, then
-lets you choose a viewer (Excel, Timeline Explorer, the report). Both tools
-are available as separate repos for independent use.
+lets you choose a viewer (Excel and the report together, Excel, Timeline
+Explorer, the report). Both tools are available as separate repos for
+independent use.
 
   Companion project: https://github.com/Jumbalicious79/win11-timeline-builder
 
@@ -40,8 +41,13 @@ Required directory structure:
       README.txt
       report\                     <-- findings report rules and renderer
                                       (needed for report.pdf)
+      memory\                     <-- ARM64 memory dump analysis
       tools\                      <-- auto-downloaded tools (each in own subfolder)
+        dbgeng\                   <-- optional: debugger engine DLLs
+                                      (ARM64 memory dumps)
         sqlite3\                  <-- auto-downloaded: browser history parser
+        symbols\                  <-- auto-downloaded: Windows kernel symbols
+                                      (ARM64 memory dumps)
         TimelineExplorer\         <-- auto-downloaded: forensic CSV viewer
         volatility3\              <-- optional: vol.exe for memory analysis
       reports\                    <-- timelines save here
@@ -218,13 +224,14 @@ needed -- plug in, double-click, collect, analyze.
   For memory capture: extract Magnet DumpIt into tools\dumpit\ (see
   tools\dumpit\README.txt). The script prompts on live system runs when a
   capture tool is detected. See the "Optional Tools" section below. On a
-  Windows ARM64 machine the prompt notes that the timeline builder cannot
-  analyze ARM64 memory (Volatility 3 does not support it): the dump is for
-  WinDbg. What the prompt showed (the space check, the system drive
-  warning and the other drives offered, the ARM64 note) and the answer
-  given are written to collection_log.txt once it exists ("Memory prompt:"
-  lines after "Collection Started"); so is why it was not shown
-  (-Unattended, Memory given with -Categories, no capture tool).
+  Windows ARM64 machine the prompt notes that the timeline builder reads
+  ARM64 memory with Microsoft's debugger engine: the processes and their
+  command lines, not network connections or services (Volatility 3 does
+  not support ARM64). What the prompt showed (the space check, the system
+  drive warning and the other drives offered, the ARM64 note) and the
+  answer given are written to collection_log.txt once it exists
+  ("Memory prompt:" lines after "Collection Started"); so is why it was
+  not shown (-Unattended, Memory given with -Categories, no capture tool).
 
   While it runs, QuickEdit is off in its console window, so a click in the
   window cannot pause the run. (With QuickEdit on, a click starts a text
@@ -1180,16 +1187,20 @@ The fastest path from collection to analysis:
      on Run-TimelineBuilder.bat)
   3. Pick a collection number
   4. If the collection's memory dump is found (next to the zip, or where
-     collection_manifest.csv says it was written, e.g. D:\TriageMemory)
-     and Volatility 3 is installed, the script prompts to include memory
-     analysis. A Windows ARM64 dump is not offered (Volatility 3 cannot
-     analyze ARM64 memory; open it in WinDbg), and the findings report
-     notes that the dump was not analyzed
+     collection_manifest.csv says it was written, e.g. D:\TriageMemory),
+     the script prompts to include memory analysis: with Volatility 3 (in
+     the builder's tools\volatility3\) for an x64 dump, with Microsoft's
+     debugger engine (part of Windows) for a Windows ARM64 dump, which
+     gives the processes and their command lines (not network connections
+     or services; the first time per Windows build it downloads the
+     kernel's symbol file, about 10 MB, from Microsoft). A dump that is not
+     analyzed is noted in the findings report
   5. Timeline builds (about 5 minutes for a 100 MB collection, ~300,000
      events with the $MFT and the USN journal; longer with memory)
   6. Color-coded Excel (.xlsx) is generated with rows colored by EventType
-  7. Choose a viewer: Excel (colored), Timeline Explorer, Both, Open report
-     (the findings report), or None
+  7. Choose a viewer: Excel + findings report (both at once), Excel
+     (colored), Timeline Explorer, Excel + Timeline Explorer, Open report
+     (the findings report alone), or None
   8. Filter, sort, pivot, investigate
 
   The timeline builder writes timeline.csv (full data), a color-coded
@@ -1693,9 +1704,10 @@ capture before collection begins.
   Timing: Adds 2-5 minutes depending on RAM size.
   Ordering: Runs FIRST to capture pristine RAM before other collection.
   Live only: Memory capture is skipped for mounted forensic images.
-  Analysis: win11-timeline-builder analyzes x64 dumps with Volatility 3.
-            Volatility 3 cannot analyze Windows ARM64 memory; open ARM64
-            dumps in WinDbg instead.
+  Analysis: win11-timeline-builder analyzes x64 dumps with Volatility 3
+            and Windows ARM64 dumps with Microsoft's debugger engine
+            (processes and command lines; not network connections or
+            services). WinDbg opens both.
 
   If no tool is found in tools\, the script does not prompt and proceeds
   with standard artifact collection. No errors, no noise.

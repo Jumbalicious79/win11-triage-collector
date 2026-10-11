@@ -771,10 +771,12 @@ if ($script:IsLive -and ($Categories -notcontains "Memory") -and -not $Unattende
         Write-Host "  Captures a full RAM dump (~$ramGB GB on this system)." -ForegroundColor White
         Write-Host "  Runs FIRST to preserve pristine memory state." -ForegroundColor DarkGray
         if ((Get-NativeMachineType) -eq 0xAA64) {
-            # The timeline builder skips ARM64 dumps (Volatility 3 has no ARM64 support)
-            Write-Host "  Note: this is an ARM64 machine. The timeline builder cannot analyze ARM64" -ForegroundColor DarkGray
-            Write-Host "  memory (Volatility 3 does not support it); the dump is for WinDbg." -ForegroundColor DarkGray
-            $script:memoryPromptLog.Add("Memory prompt: ARM64 note shown (the timeline builder cannot analyze ARM64 memory; the dump is for WinDbg).")
+            # The timeline builder reads ARM64 dumps with Microsoft's debugger engine
+            # (Volatility 3 has no ARM64 support): processes and command lines only
+            Write-Host "  Note: this is an ARM64 machine. The timeline builder reads ARM64 memory" -ForegroundColor DarkGray
+            Write-Host "  with Microsoft's debugger engine: processes and command lines, not" -ForegroundColor DarkGray
+            Write-Host "  network connections or services (Volatility 3 does not support ARM64)." -ForegroundColor DarkGray
+            $script:memoryPromptLog.Add("Memory prompt: ARM64 note shown (the timeline builder reads ARM64 memory with Microsoft's debugger engine: processes and command lines, not network connections or services).")
         }
         Write-Host "  Dump file: $memDumpTarget" -ForegroundColor DarkGray
         Write-Host "  $(Format-SpaceCheck $memSpace)" -ForegroundColor DarkGray

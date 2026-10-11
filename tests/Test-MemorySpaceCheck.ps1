@@ -538,8 +538,10 @@ try {
     $script:testMachineType = 0x8664
     $problems = New-Problems
     if ($run.Thrown) { $problems.Add("prompt threw: $($run.Thrown)") }
-    Test-LinesInOrder -Lines $run.Screen -Expected @('^  Note: this is an ARM64 machine\. The timeline builder cannot analyze ARM64$', '^  memory \(Volatility 3 does not support it\); the dump is for WinDbg\.$', '^  Dump file: ') -Problems $problems -Where "screen"
-    Test-LinesInOrder -Lines $run.PromptLog -Expected @('^Memory prompt: shown for DumpIt ', '^Memory prompt: ARM64 note shown \(the timeline builder cannot analyze ARM64 memory; the dump is for WinDbg\)\.$', '^Memory prompt: answer 3 of 3 -- Skip memory') -Problems $problems -Where "prompt log"
+    Test-LinesInOrder -Lines $run.Screen -Expected @('^  Note: this is an ARM64 machine\. The timeline builder reads ARM64 memory$', '^  with Microsoft''s debugger engine: processes and command lines, not$', '^  network connections or services \(Volatility 3 does not support ARM64\)\.$', '^  Dump file: ') -Problems $problems -Where "screen"
+    Test-LinesInOrder -Lines $run.PromptLog -Expected @('^Memory prompt: shown for DumpIt ', '^Memory prompt: ARM64 note shown \(the timeline builder reads ARM64 memory with Microsoft''s debugger engine: processes and command lines, not network connections or services\)\.$', '^Memory prompt: answer 3 of 3 -- Skip memory') -Problems $problems -Where "prompt log"
+    # The old wording (the dump only for WinDbg, nothing analyzed) is gone
+    if (@($run.Screen + $run.PromptLog | Where-Object { $_ -match 'cannot analyze|for WinDbg' }).Count -gt 0) { $problems.Add("the old 'cannot analyze ... for WinDbg' wording is still shown or logged") }
     Add-Result "prompt: ARM64 note shown and logged" $problems
 
     # No room on C: and no other drive: nothing to choose, no question

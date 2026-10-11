@@ -175,7 +175,9 @@ To prepare a USB drive as a portable forensic triage kit:
       Run-TimelineBuilder.bat
       README.txt
       report\                     <-- findings report rules and renderer
-      tools\                      <-- sqlite3\, TimelineExplorer\, volatility3\
+      memory\                     <-- ARM64 memory dump analysis
+      tools\                      <-- sqlite3\, TimelineExplorer\, volatility3\,
+                                      dbgeng\, symbols\
       reports\                    <-- timelines save here
 
   Copy both repository folders whole (the list shows the main parts).

@@ -86,7 +86,9 @@ more than forensic purity:
      With memory capture the dump, as large as the RAM, goes there too:
      FAT32 (common on USB sticks) cannot hold a file of 4 GB or more, so
      use an NTFS or exFAT drive. The memory prompt checks the free space
-     first and offers another drive when the dump does not fit.
+     first and offers another drive when the dump does not fit, or when it
+     would go to the system drive being examined and another local drive
+     has room.
   4. Unplug the USB and take it to your analysis workstation
   5. Place win11-timeline-builder alongside the collector (or anywhere)
   6. Double-click Run-TimelineBuilder.bat -- it auto-finds the triage zips
@@ -218,7 +220,11 @@ needed -- plug in, double-click, collect, analyze.
   capture tool is detected. See the "Optional Tools" section below. On a
   Windows ARM64 machine the prompt notes that the timeline builder cannot
   analyze ARM64 memory (Volatility 3 does not support it): the dump is for
-  WinDbg.
+  WinDbg. What the prompt showed (the space check, the system drive
+  warning and the other drives offered, the ARM64 note) and the answer
+  given are written to collection_log.txt once it exists ("Memory prompt:"
+  lines after "Collection Started"); so is why it was not shown
+  (-Unattended, Memory given with -Categories, no capture tool).
 
   While it runs, QuickEdit is off in its console window, so a click in the
   window cannot pause the run. (With QuickEdit on, a click starts a text
@@ -244,7 +250,13 @@ needed -- plug in, double-click, collect, analyze.
 
   -MemoryOutputPath and -MinFreeSpaceGB (see Parameters) are only available
   this way: the .bat passes only the drive letter and fast / nozip. Its
-  memory prompt offers another drive for the dump by itself when needed.
+  memory prompt offers another drive for the dump by itself when needed:
+  when the dump does not fit, or would eat into the system drive's
+  reserve, or would go to the system drive while another local (fixed or
+  removable) drive has room; a drive letter on the system volume itself,
+  such as a subst drive, does not count. It says "another drive is better"
+  only then, naming that drive; with none, it says that no other local
+  drive has room.
 
 
 ## How It Handles Windows Defender
@@ -287,6 +299,11 @@ not inside it (it is as large as the machine's RAM):
 DumpIt writes a Microsoft crash dump (.dmp); WinPmem and Magnet RAM Capture
 write a raw image (memory_dump.raw).
 
+The summary at the end gives the sizes apart: "Collection size" is the
+files collected, without the memory dump (it is not in the zip); the
+"Memory dump:" line names the dump with its size (once); "Zip created"
+gives the zip's size.
+
 With -MemoryOutputPath <folder> (or another drive chosen at the memory
 prompt) the dump is written to that folder from the start, under the same
 <collection>_memory_dump.dmp name; Memory\memory_acquisition_log.txt stays
@@ -321,7 +338,9 @@ Inside the zip:
 
   TriageCollection_2026-04-08_08-04\
     collection_info.json              -- host, mode, start time, time zones,
-                                         the collector's own process IDs
+                                         collector version, script SHA-256
+                                         and git commit, the collector's own
+                                         process IDs
     collection_log.txt                -- full run log
     collection_manifest.csv           -- SHA256, source, dest, size, source file
                                          times per file (see Output File Formats)
@@ -329,6 +348,9 @@ Inside the zip:
     Memory\                               -- only if memory capture was selected
       memory_dump.dmp / .raw          -- full RAM dump (saved separately, not in zip)
       memory_acquisition_log.txt      -- capture tool output log
+      memory_dump.json                -- only when DumpIt wrote it (it needs
+                                         Dmp2Json.exe beside DumpIt.exe,
+                                         which the ARM64 build lacks)
     FileSystem\
       $MFT                            -- Master File Table, raw copy
       $LogFile                        -- NTFS transaction log, raw copy
@@ -364,7 +386,9 @@ Inside the zip:
                                          exists (absent on Windows 11)
       bam_entries.csv                 -- BAM: per-user program paths with
                                          decoded last-execution times (UTC)
-      appcompat_cache.reg             -- ShimCache execution artifacts
+      appcompat_cache.reg             -- ShimCache execution artifacts (the
+                                         text "reg query" prints, read with
+                                         .NET)
       SRUM\                           -- SRUDB.dat (SRUM database) with its
                                          checkpoint, logs and flush map
     Network\
@@ -402,6 +426,7 @@ Inside the zip:
                                          with first install / arrival / removal
                                          times (UTC)
       usb_storage_devices.txt         -- USB storage device registry entries
+                                         (a note when there are none)
       usb_devices.txt                 -- all USB device entries
       mounted_devices.csv             -- MountedDevices, decoded: each drive
                                          letter and volume GUID with its GPT
@@ -483,7 +508,9 @@ Inside the zip:
                      Saved separately from the zip due to size. The free
                      space is checked before the capture and the dump
                      after it (see Memory Capture Setup).
-  Acquisition log    memory_acquisition_log.txt: the capture tool's output,
+  Acquisition log    memory_acquisition_log.txt: the capture tool's output
+                     (the collector compares DumpIt's SHA-256 in it with
+                     its own hash of the dump and logs the result),
                      for DumpIt the only record of its SHA-256 of the dump
                      and its NtStatus. Kept in the zip and listed in the
                      manifest.
@@ -580,6 +607,11 @@ Inside the zip:
                              time per program per user (all user SIDs, decoded
                              to UTC in bam_entries.csv). Live system only.
   AppCompatCache             ShimCache -- program presence/execution evidence.
+                             Read with .NET (a few milliseconds) and written
+                             as the text "reg query" prints, byte for byte
+                             what reg.exe gave (it took 10-60 s for the
+                             ~350 KB value); reg.exe is still used when the
+                             .NET read fails. The log says which.
   RecentApps                 Recently launched apps with run counts, for every
                              logged-in user. The key does not exist on Windows
                              11 and recent Windows 10 builds; nothing is written
@@ -863,6 +895,16 @@ Written at the start of the run (and again after a memory capture, see
 CollectorProcesses), at the root of the collection:
 
   SchemaVersion        1
+  CollectorVersion     Version of the collector that made the collection
+                       (yyyy.mm.dd of its last change, raised with every
+                       change), e.g. "2026.10.10"; null if unknown
+  CollectorScriptSha256  SHA-256 of the triage-collector.ps1 file that ran
+                       (upper-case hex): names the exact code, local edits
+                       included; null if it could not be read
+  CollectorGitCommit   Git commit checked out where triage-collector.ps1
+                       ran from (read from its .git folder, or a worktree's
+                       .git file, without git.exe); null when it was not
+                       run from a git checkout (e.g. a copy on a USB drive)
   ComputerName         Machine running the collector
   CollectorUser        Account that ran the collector
   Mode                 "Live" or "MountedImage"
@@ -910,14 +952,19 @@ CollectorProcesses), at the root of the collection:
                                         cmdlets run in)
                          MemoryCapture  the memory capture tool (DumpIt)
                        Written at the start of the run, and updated after a
-                       memory capture to add the capture tool. The command
-                       lines are not recorded.
+                       memory capture to add the capture tool (every other
+                       field, the provenance fields included, stays as it
+                       was). The command lines are not recorded.
 
-SecretsIncluded, ThunderbirdIndexIncluded and CollectorProcesses are
-additive fields; SchemaVersion stays 1. The timeline builder uses the
-time-zone and culture fields to convert local-time text (USN journal,
-setupapi logs) correctly even when the analysis machine uses a different
-time zone or locale.
+The same provenance is logged at the start of collection_log.txt
+("Collector: version ..., triage-collector.ps1 SHA-256 ..." and "Collector
+git commit: ..."). CollectorVersion, CollectorScriptSha256,
+CollectorGitCommit, SecretsIncluded, ThunderbirdIndexIncluded and
+CollectorProcesses are additive fields (readers ignore fields they do not
+know); SchemaVersion stays 1. The timeline builder uses the time-zone and
+culture fields to convert local-time text (USN journal, setupapi logs)
+correctly even when the analysis machine uses a different time zone or
+locale.
 
 CollectorProcesses lets the timeline builder tell the collector's own
 processes in the memory dump apart from everything else. Its report leaves
@@ -1027,6 +1074,13 @@ Keys covered, for HKLM and for every loaded user hive (local and Entra ID
 accounts): Run, RunOnce, WOW6432Node Run/RunOnce, Policies\Explorer\Run.
 run_keys.txt lists the same keys plus Shell Folders / User Shell Folders.
 
+The log counts the values per hive ("Run keys: 1 value(s) in HKLM, 1
+value(s) in 1 loaded user hive(s).") and names the users whose hive is not
+loaded (not logged on), whose Run values are therefore not in run_keys.csv:
+"Run keys not read live for 1 user(s) whose hive is not loaded: <user>".
+The timeline builder reads their Run keys from the collected
+Registry\<user>\NTUSER.DAT.
+
 ### Persistence\startup_folders.csv  (live system and mounted images)
 
   Scope                "AllUsers" or "User"
@@ -1049,6 +1103,14 @@ run_keys.txt lists the same keys plus Shell Folders / User Shell Folders.
   LastRemovalUtc       Last time the device was removed
 
 Devices that are no longer connected are included.
+
+usb_storage_devices.txt lists the USBSTOR registry entries (FriendlyName,
+HardwareID, Mfg, Service, ContainerID, instance). With none it holds a note
+instead (no USBSTOR key, or no device under it; Disk Cleanup's device driver
+cleanup can remove them), and the log has a result line either way:
+"USBSTOR: N USB storage device(s) recorded in the registry" or "USBSTOR: no
+USB storage devices recorded in the registry (...)". A read error with no
+device read is a warning.
 
 ### USB\mounted_devices.csv  (live system only)
 
@@ -1587,26 +1649,47 @@ capture before collection begins.
              20 GB)
            and, when the dump does not fit or would eat into the reserve,
            offers other drives where it fits ([1] D:\TriageMemory --
-           recommended, [2] here anyway, [3] skip). The check is repeated
+           recommended, [2] here anyway, [3] skip). When the dump fits on
+           the system drive and another local (fixed or removable) drive
+           has room too, that drive is offered first as well ([1]
+           D:\TriageMemory -- recommended, [2] the system drive, [3] skip).
+           The check is repeated
            right before the capture and logged; if the dump does not fit
            then, the capture is skipped as an error and the rest of the
            collection still runs. The output drive is also checked for the
            collection at the start of every run (a warning only).
            Writing the dump to the system drive being examined overwrites
            free space that can still hold deleted files: another drive is
-           better. FAT32 (common on USB sticks) cannot hold a dump of 4 GB
+           better. The prompt says so, naming the drive, only when another
+           local drive has room for the dump (the .bat cannot pass
+           -MemoryOutputPath); otherwise it says that no other local drive
+           has room. FAT32 (common on USB sticks) cannot hold a dump of 4 GB
            or more.
   Process: The tool runs in the collector's console window. Its output
-           (standard output, then standard error) is saved as
-           memory_acquisition_log.txt, and its process ID and start time
-           are added to collection_info.json (CollectorProcesses). Ctrl+C
+           (standard output, then standard error), read when it exits, is
+           saved as memory_acquisition_log.txt and checked (below), and its
+           process ID and start time are added to collection_info.json
+           (CollectorProcesses). Ctrl+C
            reaches the tool too; one still running 5 seconds later is
            ended, with a warning.
   Checks: After the capture, DumpIt's "Error:" lines are copied into the
           log, and the dump is kept only when it exists, is not empty,
           DumpIt reported NtStatus 0x00000000 and the size the file has,
           and it holds at least 95% of the RAM. Otherwise the capture is an
-          error, and the dump is set aside (see Known Limitations).
+          error, and the dump is set aside (see Known Limitations). A
+          complete dump is hashed (SHA-256, for the manifest), and the hash
+          is compared with the one DumpIt printed: the log says "match", or
+          gives a MISMATCH warning with both hashes (the manifest keeps the
+          collector's). DumpIt shows nothing on screen while it runs: it
+          writes the dump, then hashes it before it exits; the log says so
+          before the capture, and says when the collector's own hash of the
+          dump starts.
+  JSON:   DumpIt's output names a JSON file next to the dump ("JSON path:"),
+          which it writes only when Dmp2Json.exe is beside DumpIt.exe. The
+          ARM64 build has none, so on ARM64 the file is never written; the
+          log notes that it is missing and that nothing is missing from the
+          collection. When it is written, it is listed in the manifest (and
+          copied into Memory\ from a -MemoryOutputPath folder).
   Timing: Adds 2-5 minutes depending on RAM size.
   Ordering: Runs FIRST to capture pristine RAM before other collection.
   Live only: Memory capture is skipped for mounted forensic images.
@@ -1628,10 +1711,11 @@ capture before collection begins.
     file, a file extended past its written data, and an NTFS-compressed
     file, which the raw read must decline cleanly.
 
-  tests\Test-Collect*.ps1 (run as Administrator; all six also run in CI)
-    Each builds a fake mounted image in a temporary folder (a
-    Windows\System32 tree with test artifacts), maps it to a free drive
-    letter with subst, runs the collector on it with -Unattended
+  tests\Test-Collect*.ps1 (run as Administrator; all seven also run in CI)
+    Each but Test-CollectLive.ps1 (below) builds a fake mounted image in
+    a temporary folder (a Windows\System32 tree with test artifacts),
+    maps it to a free drive letter with subst, runs the collector on it
+    with -Unattended
     -NoCompress and one category, and checks what was and was not
     collected (byte for byte, with manifest rows: original path, hash of
     the copy, original times). The drive letter and the files are removed
@@ -1698,8 +1782,32 @@ capture before collection begins.
     true, the warning is logged, and a junction out of the profile is not
     followed.
 
+  tests\Test-CollectLive.ps1 (-Categories Execution,USB,Persistence on
+    this computer)
+    Runs the collector on the computer running the test, as
+    Run-TriageCollector.bat does for its system drive (-TargetDrive <the
+    system drive's letter> -Unattended -NoCompress), into a temporary
+    folder that is removed afterwards, and checks what only a live run
+    reaches: the provenance log lines ("Collector: version ...,
+    triage-collector.ps1 SHA-256 ...", "Collector git commit: ...") and
+    collection_info.json's CollectorVersion, CollectorScriptSha256 (the
+    SHA-256 of the script that ran) and CollectorGitCommit agree, with
+    CollectorProcesses in the same file naming the collector's PowerShell
+    (started by the test) first; the
+    AppCompatCache line ("N bytes read from the registry") and
+    Execution\appcompat_cache.reg in reg query's layout with 2 x N hex
+    digits; one USBSTOR result line and a USB\usb_storage_devices.txt with
+    those devices or a note; and the Run key line, whose HKLM and user
+    counts are those of Persistence\run_keys.csv. It reads this computer's
+    registry and files and changes nothing (as Administrator the collector
+    makes and removes its shadow copy and temporary Defender exclusion, as
+    in any run). Without Administrator rights, pass -CollectorPath as
+    above; the steps that need them then log warnings, which it does not
+    check.
+
     powershell -ExecutionPolicy Bypass -File tests\Test-CollectBrowser.ps1
     powershell -ExecutionPolicy Bypass -File tests\Test-CollectEmail.ps1 -AllowSystemChanges
+    powershell -ExecutionPolicy Bypass -File tests\Test-CollectLive.ps1
 
   tests\Test-ShadowCopy.ps1 (no admin needed; also runs in CI)
     Checks how a copy from the shadow copy is reported, with a folder
@@ -1730,7 +1838,22 @@ capture before collection begins.
     the cap. A file is recorded in the manifest, counted and hashed (the
     same SHA-256) also when Get-FileHash is not there (Windows PowerShell
     started from PowerShell 7 through cmd.exe), and the drive check for a
-    drive letter that does not exist gives nothing, with no error.
+    drive letter that does not exist gives nothing, with no error. Volume
+    serial numbers: the temp folder's drive has one, a missing drive letter
+    none, and a subst drive of a folder on it the same (so the memory
+    prompt never offers the system volume under another letter). The
+    collector's provenance: the git commit read without git.exe from a
+    .git folder, a worktree's .git file (absolute or relative gitdir,
+    commondir), packed-refs and a detached HEAD, nothing (and no error)
+    without a checkout, and this repository's commit as git names it (when
+    git.exe is there); the log lines and collection_info.json's
+    CollectorVersion, CollectorScriptSha256 and CollectorGitCommit (null
+    when unknown). The Run key log lines (values per hive, the users whose
+    hive is not loaded). The USBSTOR result line and usb_storage_devices.txt
+    with devices, with no USBSTOR key, an empty one, or an unreadable one
+    (a warning). AppCompatCache read with .NET: the file is byte for byte
+    the one "reg query" gives on the machine running the test (reg.exe takes
+    up to a minute), and reg.exe's output is used when the .NET read fails.
       powershell -ExecutionPolicy Bypass -File tests\Test-CollectionLogging.ps1
 
   tests\Test-CollectionZip.ps1 (no admin needed; also runs in CI)
@@ -1789,53 +1912,65 @@ capture before collection begins.
     and backslashes, the dump file; a tool that cannot start throws, and a
     stop (as Ctrl+C) ends a tool still running. collection_info.json
     written twice: one manifest row, with the second version's hash and
-    size; a second write that fails keeps the first version and its row;
-    a mounted image gets no CollectorProcesses. The memory section: the
-    process list read before the tool runs, the tool's process recorded
-    right after, collection_info.json written again after the capture.
-    End to end: the collector (a copy in a temporary folder, with the
-    stand-in as tools\dumpit\<arch>\DumpIt.exe and a RAM size of 1 MB, so
-    no real memory is captured) run through cmd.exe with -Unattended: a
-    capture (Collector, Launcher, Console and MemoryCapture, each PID,
-    start time and parent link checked), a run without Memory, one with no
-    capture tool and one with a tool that cannot start (no capture tool
-    recorded), and a mounted image (subst; no CollectorProcesses). The
+    size, and the provenance fields in both versions; a second write that
+    fails keeps the first version and its row; a mounted image gets no
+    CollectorProcesses. The memory section: the process list read before
+    the tool runs, the tool's process recorded right after,
+    collection_info.json written again after the capture. End to end: the
+    collector (a copy in a temporary folder, with the stand-in as
+    tools\dumpit\<arch>\DumpIt.exe and a RAM size of 1 MB, so no real
+    memory is captured) run through cmd.exe with -Unattended: a capture
+    (Collector, Launcher, Console and MemoryCapture, each PID, start time
+    and parent link checked; the stand-in prints a "SHA-256:" line as
+    DumpIt does, and the log says it matches the collector's hash of the
+    dump; the file written after the capture keeps the provenance fields),
+    a run without Memory, one with no capture tool and one with a tool
+    that cannot start (no capture tool recorded), and a mounted image
+    (subst; no CollectorProcesses). The
     end-to-end part needs Administrator rights, like the collector;
     without them, pass -CollectorPath with a copy of the collector that
     has no admin check.
       powershell -ExecutionPolicy Bypass -File tests\Test-CollectorProcesses.ps1
 
   tests\Test-MemorySpaceCheck.ps1 (no admin needed; also runs in CI)
-    Checks the free space check before a memory capture and the check of
-    its result, without capturing anything. The space check with run 2's
-    numbers (C: 40.8 GB free, 32 GB of RAM: low reserve) and other cases:
-    no room, another drive, a FAT32 stick, -MinFreeSpaceGB, unknown free
-    space or RAM, the collection's share, and the log line. Free space read
-    from the temp folder's drive, its UNC admin share (when reachable) and
-    a missing drive. The prompt, with stand-ins for the drives and the
-    answers: the numbers, the system drive warning, other drives offered
-    (D: for run 2, not a FAT32 or too-small drive). The result check on a
-    redacted DumpIt log (tests\fixtures\memory) and a failing variant
-    (nonzero NtStatus, short file, an "Error:" line). The memory section
-    with a stand-in tool: no room (an error, no capture), low reserve (a
-    warning), a complete, failed, empty or missing dump, an earlier dump at
-    the path, -MemoryOutputPath, WinPmem and Magnet RAM Capture, a failed
-    dump that cannot be renamed or is held open; the dump's manifest row
-    has its full path, size and hash; a capture reads the collector's
-    process list first, then records the tool's process and writes
-    collection_info.json again (not when the tool did not start). The
-    summary and compression step: the dump moved next to the zip (the
-    manifest in the zip then names that path), or the folder kept unzipped
-    (and the summary corrected) when it
-    cannot be moved; moved back with its manifest row when the zip fails;
-    the rest of the manifest unchanged, and kept as it was (a warning) when
-    it cannot be changed; for a dump that is not next to the zip, the lines
-    that the timeline builder finds it through the manifest (or, on a
-    network path, does not) and that a moved dump goes next to the zip
-    (next to the folder with -NoCompress), never "pass -MemoryDumpPath"; a
-    failed dump still in the folder set aside then, or the folder not
-    zipped. The prompt asks again after a bad answer (also a number too
-    large for an [int]) and is not shown with -Unattended.
+    Checks the free space check before a memory capture and the check of its
+    result, without capturing anything. The space check with run 2's numbers
+    (C: 40.8 GB free, 32 GB of RAM: low reserve) and other cases: no room,
+    another drive, a FAT32 stick, -MinFreeSpaceGB, unknown free space or RAM,
+    the collection's share, and the log line. Free space read from the temp
+    folder's drive, its UNC admin share (when reachable) and a missing drive.
+    The prompt, with stand-ins for the drives, the machine type and the
+    answers: the numbers, the system drive warning ("another drive is better",
+    naming it, only when another drive has room; that drive offered first also
+    when the dump fits on the system drive), other drives offered (D: for run
+    2, not a FAT32 or too-small drive, nor a subst drive of the system
+    volume), the ARM64 note, and the "Memory prompt:" lines it leaves for the
+    log (what was shown, the answer, why it was not shown). The result check
+    on a redacted DumpIt log (tests\fixtures\memory) and a failing variant
+    (nonzero NtStatus, short file, an "Error:" line), with DumpIt's SHA-256
+    and JSON path. The memory section with a stand-in tool: no room (an error,
+    no capture), low reserve (a warning), a complete, failed, empty or missing
+    dump, an earlier dump at the path, -MemoryOutputPath, WinPmem and Magnet
+    RAM Capture, a failed dump that cannot be renamed or is held open; the
+    dump's manifest row has its full path, size and hash; the collector's
+    SHA-256 against DumpIt's (match, a MISMATCH warning, none printed), read
+    from the output Invoke-MemoryCaptureTool returns; DumpIt's JSON file (a
+    note when it was not written, listed in the manifest when it was); a
+    capture reads the collector's process list first, then records the tool's
+    process and writes collection_info.json again (not when the tool did not
+    start). The summary and compression step: the sizes (the collection
+    without the dump, the dump on its one "Memory dump:" line, the zip); the
+    dump moved next to the zip (the manifest in the zip then names that path),
+    or the folder kept unzipped (and the summary corrected) when it cannot be
+    moved; moved back with its manifest row when the zip fails; the rest of
+    the manifest unchanged, and kept as it was (a warning) when it cannot be
+    changed; for a dump that is not next to the zip, the lines that the
+    timeline builder finds it through the manifest (or, on a network path,
+    does not) and that a moved dump goes next to the zip (next to the folder
+    with -NoCompress), never "pass -MemoryDumpPath"; a failed dump still in
+    the folder set aside then, or the folder not zipped. The prompt asks again
+    after a bad answer (also a number too large for an [int]) and is not shown
+    with -Unattended.
       powershell -ExecutionPolicy Bypass -File tests\Test-MemorySpaceCheck.ps1
 
   tests\Test-ConsoleMode.ps1 (no admin needed; also runs in CI)

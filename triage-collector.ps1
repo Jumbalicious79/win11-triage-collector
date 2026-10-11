@@ -55,6 +55,11 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
 $ErrorActionPreference = "Continue"
 $script:startTime = Get-Date
 $timestamp = Get-Date -Format "yyyy-MM-dd_HH-mm"
+# The collector's version (yyyy.mm.dd of the change), raised with every
+# change to this script. Logged and written to collection_info.json with
+# the SHA-256 of this file and the git commit it was run from, which name
+# the exact code (see Get-CollectorProvenance)
+$script:CollectorVersion = "2026.10.10"
 
 # --- Console QuickEdit: off for the run ---
 # With QuickEdit on, a click in the console window starts a text selection,
@@ -451,6 +456,16 @@ function Format-SpaceGB {
     return [math]::Round($Bytes / 1GB, 1)
 }
 
+# A file or collection size for the summary: GB or MB with two decimals,
+# bytes under 1 MB
+function Format-TriageSize {
+    [OutputType([string])]
+    param([long]$Bytes)
+    if ($Bytes -ge 1GB) { return "$([math]::Round($Bytes / 1GB, 2)) GB" }
+    if ($Bytes -ge 1MB) { return "$([math]::Round($Bytes / 1MB, 2)) MB" }
+    return "$Bytes bytes"
+}
+
 # Free space check for a memory dump (and the rest of the collection) on
 # one volume. Pure: it works only on the values passed in.
 #   Volume: Get-VolumeSpace result (Root, FreeBytes, TotalBytes,
@@ -612,14 +627,17 @@ function Get-MemoryDumpPath {
     return [System.IO.Path]::Combine($OutputPath, "Memory", "memory_dump.$ext")
 }
 
-# Ready fixed and removable drives, as roots ("D:\"). A function of its
-# own so the tests can stand in for the machine's drives
+# Ready fixed and removable drives, as roots ("D:\"). The type is checked
+# before IsReady: IsReady on a network drive asks the server, and on a
+# share that does not answer it waits (the prompt now runs this for every
+# dump on the system drive). A function of its own so the tests can stand
+# in for the machine's drives
 function Get-MemoryDumpDriveRoots {
     $roots = @()
     try {
         foreach ($drive in [System.IO.DriveInfo]::GetDrives()) {
             try {
-                if ($drive.IsReady -and ($drive.DriveType -eq [System.IO.DriveType]::Fixed -or $drive.DriveType -eq [System.IO.DriveType]::Removable)) {
+                if (($drive.DriveType -eq [System.IO.DriveType]::Fixed -or $drive.DriveType -eq [System.IO.DriveType]::Removable) -and $drive.IsReady) {
                     $roots += $drive.RootDirectory.FullName
                 }
             } catch { Write-Verbose "Checking drive $($drive.Name): $($_.Exception.Message)" }
@@ -628,15 +646,49 @@ function Get-MemoryDumpDriveRoots {
     return $roots
 }
 
-# Drives to offer for the memory dump instead: not the system drive, not
-# ExcludeRoot (where it would go now), and only where it fits (Ok). The
-# dump goes to <drive>\TriageMemory there
+# Volume serial number of a drive root ("D:\"), as 8 hex digits, "" when
+# unknown. Two drive letters with the same serial are the same volume: a
+# subst drive (a folder of C: under its own letter) shows as a fixed drive
+# with C:'s serial. Read with GetVolumeInformation, which asks only that
+# drive (a WMI Win32_LogicalDisk query can wait on a network share that
+# does not answer). The type is compiled once per session. A function of
+# its own so the tests can stand in for it
+function Get-TriageVolumeSerial {
+    [OutputType([string])]
+    param([string]$Root)
+    try {
+        if ($Root -notmatch '^[A-Za-z]:\\?$') { return "" }
+        if (-not ('TriageNative.VolumeInfo' -as [type])) {
+            Add-Type -Namespace TriageNative -Name VolumeInfo -ErrorAction Stop -MemberDefinition @'
+[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+public static extern bool GetVolumeInformation(string rootPathName, System.Text.StringBuilder volumeNameBuffer, int volumeNameSize,
+    out uint volumeSerialNumber, out uint maximumComponentLength, out uint fileSystemFlags,
+    System.Text.StringBuilder fileSystemNameBuffer, int fileSystemNameSize);
+'@
+        }
+        $serial = [uint32]0
+        $maxComponent = [uint32]0
+        $flags = [uint32]0
+        if ([TriageNative.VolumeInfo]::GetVolumeInformation($Root.Substring(0, 2) + '\', $null, 0, [ref]$serial, [ref]$maxComponent, [ref]$flags, $null, 0)) {
+            return $serial.ToString("X8")
+        }
+    } catch { Write-Verbose "Reading the volume serial number of ${Root}: $($_.Exception.Message)" }
+    return ""
+}
+
+# Drives to offer for the memory dump instead: not the system drive (also
+# not under another letter, such as a subst drive), not ExcludeRoot (where
+# it would go now), and only where it fits (Ok). The dump goes to
+# <drive>\TriageMemory there
 function Get-MemoryDumpOtherDrives {
     param([long]$RamBytes, [string]$ToolName, [string]$ExcludeRoot = "")
     $drives = @()
+    $systemSerial = $null
     foreach ($root in @(Get-MemoryDumpDriveRoots)) {
         $key = $root.TrimEnd('\')
         if ($key -eq $env:SystemDrive -or $key -eq $ExcludeRoot.TrimEnd('\')) { continue }
+        if ($null -eq $systemSerial) { $systemSerial = Get-TriageVolumeSerial ($env:SystemDrive + '\') }
+        if ($systemSerial -and (Get-TriageVolumeSerial $root) -eq $systemSerial) { continue }
         $dumpDir = [System.IO.Path]::Combine($root, "TriageMemory")
         $check = Get-TriageSpaceCheck -Path (Get-MemoryDumpPath -ToolName $ToolName -DumpDir $dumpDir) -RamBytes $RamBytes -ToolName $ToolName
         if ($check.Result -eq "Ok") {
@@ -648,13 +700,16 @@ function Get-MemoryDumpOtherDrives {
 
 # Choices of the memory capture prompt for a space check. Action: Here
 # (capture to the planned place), Other (to DumpDir on another drive) or
-# Skip. Ok and Unknown: Yes / No. LowReserve: each other drive (the first
-# one recommended), here anyway, skip. NoFit: each other drive, skip; with
-# no other drive only Skip, and the prompt asks nothing
+# Skip. Ok and Unknown: Yes / No, or, when the dump would go to the system
+# drive (OnSystemDrive) and another drive has room, each other drive (the
+# first one recommended), the system drive, skip. LowReserve: each other
+# drive (the first one recommended), here anyway, skip. NoFit: each other
+# drive, skip; with no other drive only Skip, and the prompt asks nothing
 function Get-MemoryCaptureChoices {
     param([object]$Check, [object[]]$OtherDrives = @())
     $choices = @()
-    if ($Check.Result -eq "LowReserve" -or $Check.Result -eq "NoFit") {
+    $offerOther = $Check.OnSystemDrive -and @($OtherDrives).Count -gt 0
+    if ($Check.Result -eq "LowReserve" -or $Check.Result -eq "NoFit" -or $offerOther) {
         foreach ($drive in $OtherDrives) {
             $label = "Write the dump to $($drive.DumpDir) ($(Format-SpaceGB $drive.Check.FreeBytes) GB free)"
             if ($choices.Count -eq 0) { $label += " -- recommended" }
@@ -662,6 +717,8 @@ function Get-MemoryCaptureChoices {
         }
         if ($Check.Result -eq "LowReserve") {
             $choices += [PSCustomObject]@{ Action = "Here"; DumpDir = ""; Label = "Write the dump to $($Check.Root) anyway" }
+        } elseif ($Check.Result -ne "NoFit") {
+            $choices += [PSCustomObject]@{ Action = "Here"; DumpDir = ""; Label = "Write the dump to $($Check.Root) (the system drive being examined)" }
         }
         $choices += [PSCustomObject]@{ Action = "Skip"; DumpDir = ""; Label = "Skip memory, collect artifacts only" }
     } else {
@@ -676,13 +733,20 @@ function Get-MemoryCaptureChoices {
 # and not -Unattended. It shows the free space the dump would leave where it
 # would be written and, when it does not fit or would eat into the system
 # drive's reserve, offers other drives where it fits (the dump then goes to
-# <drive>\TriageMemory, as with -MemoryOutputPath). The memory section
-# checks again right before the capture.
+# <drive>\TriageMemory, as with -MemoryOutputPath). When the dump would go
+# to the system drive, other local drives where it fits are offered too
+# (Run-TriageCollector.bat cannot pass -MemoryOutputPath, so the prompt is
+# the only way there); "another drive is better" is said only then. The
+# memory section checks again right before the capture.
+# What the prompt showed and the answer given go to the log once it exists
+# ($script:memoryPromptLog, written after the "Collection Started" line).
 $script:memorySpaceAccepted = $false   # "anyway" chosen here (LowReserve or Unknown)
 if ($script:IsLive -and ($Categories -notcontains "Memory") -and -not $Unattended) {
+    $script:memoryPromptLog = New-Object System.Collections.Generic.List[string]
     $memCaptureTool = Find-MemoryCaptureTool
     foreach ($skipped in $script:skippedMemTools) {
         Write-Host "Memory capture: $skipped -- skipped (this is an ARM64 machine)." -ForegroundColor DarkGray
+        $script:memoryPromptLog.Add("Memory prompt: $skipped -- skipped (this is an ARM64 machine).")
     }
 
     if ($memCaptureTool) {
@@ -692,10 +756,11 @@ if ($script:IsLive -and ($Categories -notcontains "Memory") -and -not $Unattende
         $memDumpTarget = Get-MemoryDumpPath -ToolName $memCaptureTool.Name -DumpDir $MemoryOutputPath
         $memSpace = Get-TriageSpaceCheck -Path $memDumpTarget -RamBytes $ramBytes -ToolName $memCaptureTool.Name
         $memOtherDrives = @()
-        if ($memSpace.Result -eq "LowReserve" -or $memSpace.Result -eq "NoFit") {
+        if ($memSpace.Result -eq "LowReserve" -or $memSpace.Result -eq "NoFit" -or $memSpace.OnSystemDrive) {
             $memOtherDrives = @(Get-MemoryDumpOtherDrives -RamBytes $ramBytes -ToolName $memCaptureTool.Name -ExcludeRoot $memSpace.Root)
         }
         $memChoices = @(Get-MemoryCaptureChoices -Check $memSpace -OtherDrives $memOtherDrives)
+        $script:memoryPromptLog.Add("Memory prompt: shown for $memToolInfo. $(Format-SpaceCheck $memSpace) -- $($memSpace.Result)")
         Write-Host ""
         Write-Host "========================================" -ForegroundColor Cyan
         Write-Host "  Memory Capture" -ForegroundColor Cyan
@@ -709,12 +774,20 @@ if ($script:IsLive -and ($Categories -notcontains "Memory") -and -not $Unattende
             # The timeline builder skips ARM64 dumps (Volatility 3 has no ARM64 support)
             Write-Host "  Note: this is an ARM64 machine. The timeline builder cannot analyze ARM64" -ForegroundColor DarkGray
             Write-Host "  memory (Volatility 3 does not support it); the dump is for WinDbg." -ForegroundColor DarkGray
+            $script:memoryPromptLog.Add("Memory prompt: ARM64 note shown (the timeline builder cannot analyze ARM64 memory; the dump is for WinDbg).")
         }
         Write-Host "  Dump file: $memDumpTarget" -ForegroundColor DarkGray
         Write-Host "  $(Format-SpaceCheck $memSpace)" -ForegroundColor DarkGray
         if ($memSpace.OnSystemDrive) {
             Write-Host "  The dump would be written to the system drive being examined, over free" -ForegroundColor Yellow
-            Write-Host "  space that can still hold deleted files: another drive is better." -ForegroundColor Yellow
+            if ($memOtherDrives.Count -gt 0) {
+                $memOtherRoots = @($memOtherDrives | ForEach-Object { $_.Root }) -join ", "
+                Write-Host "  space that can still hold deleted files: another drive is better ($($memOtherDrives[0].Root) has room)." -ForegroundColor Yellow
+                $script:memoryPromptLog.Add("Memory prompt: system drive warning shown; other drive(s) with room offered: $memOtherRoots")
+            } else {
+                Write-Host "  space that can still hold deleted files (no other local drive has room for it)." -ForegroundColor Yellow
+                $script:memoryPromptLog.Add("Memory prompt: system drive warning shown; no other local drive has room for the dump.")
+            }
         }
         if ($memSpace.Result -eq "NoFit") {
             Write-Host "  Not enough free space: $($memSpace.Reason)." -ForegroundColor Red
@@ -729,10 +802,14 @@ if ($script:IsLive -and ($Categories -notcontains "Memory") -and -not $Unattende
             # NoFit and no other drive: nothing to choose
             $memChoice = $memChoices[0]
             Write-Host "  No other drive has room for the dump." -ForegroundColor Yellow
+            $script:memoryPromptLog.Add("Memory prompt: no question asked (no drive has room for the dump): memory capture skipped.")
         } else {
+            # Green: the recommended choices (another drive, else capturing here
+            # when it fits)
+            $memHasOther = @($memChoices | Where-Object { $_.Action -eq "Other" }).Count -gt 0
             for ($i = 0; $i -lt $memChoices.Count; $i++) {
                 $choiceColor = "White"
-                if ($memChoices[$i].Action -eq "Other" -or ($memChoices[$i].Action -eq "Here" -and $memSpace.Result -ne "LowReserve")) { $choiceColor = "Green" }
+                if ($memChoices[$i].Action -eq "Other" -or ($memChoices[$i].Action -eq "Here" -and -not $memHasOther -and $memSpace.Result -ne "LowReserve")) { $choiceColor = "Green" }
                 Write-Host "  [$($i + 1)] $($memChoices[$i].Label)" -ForegroundColor $choiceColor
             }
             Write-Host ""
@@ -742,6 +819,7 @@ if ($script:IsLive -and ($Categories -notcontains "Memory") -and -not $Unattende
                 $memAnswer = Read-Host "Include memory capture? (1-$($memChoices.Count))"
             } while ($memAnswer -notin $memAnswers)
             $memChoice = $memChoices[[int]$memAnswer - 1]
+            $script:memoryPromptLog.Add("Memory prompt: answer $memAnswer of $($memChoices.Count) -- $($memChoice.Label)")
         }
 
         if (-not $memChoice -or $memChoice.Action -eq "Skip") {
@@ -762,6 +840,15 @@ if ($script:IsLive -and ($Categories -notcontains "Memory") -and -not $Unattende
             }
             Write-Host ""
         }
+    } else {
+        $script:memoryPromptLog.Add("Memory prompt: not shown (no memory capture tool in tools\).")
+    }
+} else {
+    $script:memoryPromptLog = New-Object System.Collections.Generic.List[string]
+    if ($script:IsLive -and $Categories -contains "Memory") {
+        $script:memoryPromptLog.Add("Memory prompt: not shown (Memory given with -Categories).")
+    } elseif ($script:IsLive) {
+        $script:memoryPromptLog.Add("Memory prompt: not shown (-Unattended; memory is captured only with -Categories Memory).")
     }
 }
 
@@ -1148,7 +1235,9 @@ function Record-Manifest {
         $script:totalBytes += $fileSize
         # Final path of the last recorded copy (Copy-ForensicFile may have
         # shortened its name; the Email section lists where each copy went)
+        # and its hash (the memory section compares the dump's with DumpIt's)
         $script:lastRecordedDestPath = $DestPath
+        $script:lastRecordedSha256 = $hash
     } catch {
         Log-Warning "Could not hash/record: $DestPath -- $($_.Exception.Message)"
     }
@@ -1311,16 +1400,21 @@ function Invoke-MemoryCaptureTool {
 # use it. A dump that failed is set aside (memDumpIncompletePath)
 $script:memDumpPath = $null
 $script:memDumpIncompletePath = $null
+# Size of the dump as Record-Manifest counted it in $script:totalBytes (0:
+# not recorded), so the summary can show the collection without it
+$script:memDumpRecordedBytes = [long]0
 
 # Checks a finished memory capture. Output: the capture tool's output
 # (Invoke-MemoryCaptureTool); DumpBytes: size of the dump file, -1 if there is
 # none (Get-FileLength); RamBytes: 0 if unknown. Reads what DumpIt reports
-# ("NtStatus (troubleshooting): 0x...", "Created file size: N bytes") and
-# collects the tool's "Error:" lines. The dump is complete when it exists,
-# is not empty, the tool reported NtStatus 0 and the size the file has
-# (each only when reported), and it holds at least 95% of the RAM (when
-# known). Returns Complete, Problems (why not), ErrorLines, NtStatus (""
-# when not reported), ReportedBytes (-1 when not reported) and Summary.
+# ("NtStatus (troubleshooting): 0x...", "Created file size: N bytes",
+# "SHA-256: <hex>", "JSON path: <file>") and collects the tool's "Error:"
+# lines. The dump is complete when it exists, is not empty, the tool
+# reported NtStatus 0 and the size the file has (each only when reported),
+# and it holds at least 95% of the RAM (when known). Returns Complete,
+# Problems (why not), ErrorLines, NtStatus ("" when not reported),
+# ReportedBytes (-1 when not reported), ReportedSha256 (upper case, ""
+# when not reported), JsonPath ("" when not named) and Summary.
 function Get-MemoryCaptureResult {
     param(
         [object[]]$Output,
@@ -1331,12 +1425,16 @@ function Get-MemoryCaptureResult {
     $errorLines = @()
     $ntStatus = ""
     $reportedBytes = [long]-1
+    $reportedSha256 = ""
+    $jsonPath = ""
     foreach ($item in @($Output)) {
         if ($null -eq $item) { continue }
         $line = [string]$item
         if ($line -match '^\s*Error:') { $errorLines += $line.Trim() }
         if ($line -match 'NtStatus[^:]*:\s*0x([0-9A-Fa-f]{1,8})\b') { $ntStatus = "0x" + $Matches[1].ToUpperInvariant() }
         if ($line -match 'Created file size:\s*(\d+)\s*bytes') { $reportedBytes = [long]$Matches[1] }
+        if ($line -match '^\s*SHA-256:\s*([0-9A-Fa-f]{64})\s*$') { $reportedSha256 = $Matches[1].ToUpperInvariant() }
+        if ($line -match '^\s*JSON path:\s*(\S.*?)\s*$') { $jsonPath = $Matches[1] -replace '^\\\?\?\\', '' }
     }
     $problems = @()
     if ($DumpBytes -lt 0) { $problems += "no dump file was written" }
@@ -1360,12 +1458,66 @@ function Get-MemoryCaptureResult {
     if ($reported.Count -gt 0) { $summary += "; $ToolName reported " + ($reported -join " and ") }
     else { $summary += "; $ToolName reported no NtStatus or file size" }
     return [PSCustomObject]@{
-        Complete      = ($problems.Count -eq 0)
-        Problems      = $problems
-        ErrorLines    = $errorLines
-        NtStatus      = $ntStatus
-        ReportedBytes = $reportedBytes
-        Summary       = $summary
+        Complete       = ($problems.Count -eq 0)
+        Problems       = $problems
+        ErrorLines     = $errorLines
+        NtStatus       = $ntStatus
+        ReportedBytes  = $reportedBytes
+        ReportedSha256 = $reportedSha256
+        JsonPath       = $jsonPath
+        Summary        = $summary
+    }
+}
+
+# After a complete capture: the collector's SHA-256 of the dump (Sha256,
+# from Record-Manifest; "" when it could not be hashed) against the one
+# the capture tool printed (ReportedSha256, DumpIt's "SHA-256:" line; ""
+# when none). Logs "match", or a warning "MISMATCH" (the manifest keeps
+# the collector's hash, of the file as it is), or the hash alone when
+# there is nothing to compare
+function Write-MemoryDumpHashCheck {
+    [OutputType([void])]
+    param(
+        [string]$ToolName,
+        [string]$ReportedSha256,
+        [string]$Sha256
+    )
+    if (-not $Sha256) { return }
+    if (-not $ReportedSha256) {
+        if ($ToolName -eq "DumpIt") { Log "Memory dump SHA-256: $Sha256 (DumpIt printed no SHA-256 to compare it with)" }
+        else { Log "Memory dump SHA-256: $Sha256" }
+        return
+    }
+    if ($ReportedSha256.Equals($Sha256, [System.StringComparison]::OrdinalIgnoreCase)) {
+        Log "Memory dump SHA-256 check: match -- the collector's SHA-256 of the dump equals the one $ToolName printed ($Sha256)"
+    } else {
+        Log-Warning "Memory dump SHA-256 check: MISMATCH -- $ToolName printed $($ReportedSha256.ToUpperInvariant()), the collector computed $Sha256 for the dump file (the manifest has the collector's). The dump changed after $ToolName hashed it, or a read failed."
+    }
+}
+
+# The JSON file DumpIt's output names ("JSON path: <file>", next to the
+# dump). DumpIt writes it only when Dmp2Json.exe is beside DumpIt.exe (its
+# ARM64 build has none), so it is often missing: a note in the log says
+# so. When it is there: recorded in the manifest in the collection, or
+# copied into MemDir (Memory\) from a -MemoryOutputPath folder
+function Save-MemoryDumpJson {
+    [OutputType([void])]
+    param(
+        [string]$JsonPath,
+        [string]$MemDir,
+        [string]$ToolName
+    )
+    if (-not $JsonPath) { return }
+    if ((Get-FileLength $JsonPath) -lt 0) {
+        Log "Note: the $ToolName output names a JSON file that $ToolName did not write ($JsonPath); it writes one only when Dmp2Json.exe is beside it, which its ARM64 build does not include. Nothing is missing from the collection."
+        return
+    }
+    if (Get-CollectionRelativePath $JsonPath) {
+        Record-Manifest -SourcePath "(memory capture tool output: $ToolName JSON)" -DestPath $JsonPath
+        Log "$ToolName wrote the JSON file its output names, recorded in the manifest: $JsonPath"
+    } else {
+        Copy-ForensicFile -SourcePath $JsonPath -DestDir $MemDir
+        Log "$ToolName wrote the JSON file its output names next to the dump, copied into the collection's Memory folder: $JsonPath"
     }
 }
 
@@ -2102,12 +2254,123 @@ function Format-CollectorProcessList {
     return (@($Field | ForEach-Object { "$($_.Name) (PID $($_.Pid), $($labels[[string]$_.Role]))" }) -join ", ")
 }
 
+# ----------------------------------------------------------
+# Helpers: the collector's own provenance (version, SHA-256 of
+# this script, git commit), for the log and collection_info.json
+# ----------------------------------------------------------
+# The commit checked out in Folder (the script's folder), read from its
+# .git folder, or from the .git file of a worktree ("gitdir: <path>"),
+# without git.exe: HEAD names a commit (detached), or a branch whose commit
+# is in refs\heads\... or packed-refs, of the worktree's git folder or of
+# the main repository its "commondir" names. Returns Commit (lower-case
+# hex) and Branch ("" when detached), or $null when Folder is not a git
+# checkout or the commit cannot be read. Never throws.
+function Get-CollectorGitCommit {
+    param([string]$Folder)
+    try {
+        if (-not $Folder) { return $null }
+        $dotGit = Join-Path $Folder ".git"
+        $gitDir = ""
+        if ([System.IO.Directory]::Exists($dotGit)) {
+            $gitDir = $dotGit
+        } elseif ([System.IO.File]::Exists($dotGit)) {
+            $pointer = [System.IO.File]::ReadAllText($dotGit).Trim()
+            if ($pointer -match '^gitdir:\s*(.+)$') {
+                $gitDir = $Matches[1].Trim()
+                if (-not [System.IO.Path]::IsPathRooted($gitDir)) { $gitDir = Join-Path $Folder $gitDir }
+            }
+        }
+        if (-not $gitDir -or -not [System.IO.Directory]::Exists($gitDir)) { return $null }
+        $gitDir = [System.IO.Path]::GetFullPath($gitDir)
+        $headFile = Join-Path $gitDir "HEAD"
+        if (-not [System.IO.File]::Exists($headFile)) { return $null }
+        $head = [System.IO.File]::ReadAllText($headFile).Trim()
+        $idPattern = '^([0-9a-fA-F]{40}|[0-9a-fA-F]{64})$'
+        if ($head -match $idPattern) {
+            return [PSCustomObject]@{ Commit = $head.ToLowerInvariant(); Branch = "" }
+        }
+        if ($head -notmatch '^ref:\s*(refs/\S+)$') { return $null }
+        $ref = $Matches[1]
+        $branch = $ref -replace '^refs/heads/', ''
+        $dirs = @($gitDir)
+        $commonFile = Join-Path $gitDir "commondir"
+        if ([System.IO.File]::Exists($commonFile)) {
+            $common = [System.IO.File]::ReadAllText($commonFile).Trim()
+            if ($common) {
+                if (-not [System.IO.Path]::IsPathRooted($common)) { $common = Join-Path $gitDir $common }
+                $dirs += [System.IO.Path]::GetFullPath($common)
+            }
+        }
+        foreach ($dir in $dirs) {
+            $refFile = Join-Path $dir $ref.Replace('/', '\')
+            if ([System.IO.File]::Exists($refFile)) {
+                $commit = [System.IO.File]::ReadAllText($refFile).Trim()
+                if ($commit -match $idPattern) { return [PSCustomObject]@{ Commit = $commit.ToLowerInvariant(); Branch = $branch } }
+            }
+            $packedRefs = Join-Path $dir "packed-refs"
+            if ([System.IO.File]::Exists($packedRefs)) {
+                foreach ($line in [System.IO.File]::ReadAllLines($packedRefs)) {
+                    if ($line -match '^([0-9a-fA-F]{40}|[0-9a-fA-F]{64}) (\S+)$' -and $Matches[2] -ceq $ref) {
+                        return [PSCustomObject]@{ Commit = $Matches[1].ToLowerInvariant(); Branch = $branch }
+                    }
+                }
+            }
+        }
+    } catch {
+        Write-Verbose "Reading the git commit of ${Folder}: $($_.Exception.Message)"
+    }
+    return $null
+}
+
+# Version, SHA-256 of the script file (upper-case hex, "" when it cannot be
+# read) and git commit / branch ("" when not run from a git checkout) of
+# the collector run from ScriptPath. Never throws.
+function Get-CollectorProvenance {
+    param([string]$ScriptPath, [string]$Version)
+    $sha256 = ""
+    $git = $null
+    if ($ScriptPath) {
+        try { $sha256 = Get-FileSha256 $ScriptPath }
+        catch { Write-Verbose "Hashing ${ScriptPath}: $($_.Exception.Message)" }
+        $git = Get-CollectorGitCommit -Folder ([System.IO.Path]::GetDirectoryName($ScriptPath))
+    }
+    $commit = ""
+    $branch = ""
+    if ($git) { $commit = $git.Commit; $branch = $git.Branch }
+    return [PSCustomObject]@{
+        Version      = $Version
+        ScriptPath   = $ScriptPath
+        ScriptSha256 = $sha256
+        GitCommit    = $commit
+        GitBranch    = $branch
+    }
+}
+
+# The provenance lines of the log (from Get-CollectorProvenance)
+function Get-CollectorProvenanceLines {
+    [OutputType([string[]])]
+    param([object]$Provenance)
+    $sha = $Provenance.ScriptSha256
+    if (-not $sha) { $sha = "unknown (the script file could not be read)" }
+    $lines = @("Collector: version $($Provenance.Version), triage-collector.ps1 SHA-256 $sha")
+    if ($Provenance.GitCommit) {
+        $where = "detached HEAD"
+        if ($Provenance.GitBranch) { $where = "branch $($Provenance.GitBranch)" }
+        $lines += "Collector git commit: $($Provenance.GitCommit) ($where; uncommitted changes show only in the SHA-256)"
+    } else {
+        $lines += "Collector git commit: none (not run from a git checkout)"
+    }
+    return $lines
+}
+
 # Write collection_info.json at the collection root and record it in the
-# manifest. Live runs also record the collector's own processes
-# (CollectorProcesses; the first call reads them). Called at the start of
-# the run, and after a memory capture again with -Added (e.g. "DumpIt.exe
-# (PID 10232)") and -AddedAs ("the memory capture tool") once the tool's
-# process is recorded: the file is then replaced through
+# manifest. Every version names the collector that made it
+# (CollectorVersion, CollectorScriptSha256, CollectorGitCommit from
+# $script:collectorProvenance). Live runs also record the collector's own
+# processes (CollectorProcesses; the first call reads them). Called at the
+# start of the run, and after a memory capture again with -Added (e.g.
+# "DumpIt.exe (PID 10232)") and -AddedAs ("the memory capture tool") once
+# the tool's process is recorded: the file is then replaced through
 # collection_info.json.new (a failed write, say on a disk the dump has
 # filled, keeps the first version: a warning) and its manifest row updated
 function Write-CollectionInfo {
@@ -2129,8 +2392,22 @@ function Write-CollectionInfo {
             $mode = "MountedImage"
             $targetTz = Get-ImageTimeZoneId
         }
+        # The collector that made the collection (additive fields, see the
+        # README): $null where unknown
+        $provenance = $script:collectorProvenance
+        $collectorVersion = $null
+        $collectorSha256 = $null
+        $collectorCommit = $null
+        if ($provenance) {
+            if ($provenance.Version) { $collectorVersion = [string]$provenance.Version }
+            if ($provenance.ScriptSha256) { $collectorSha256 = [string]$provenance.ScriptSha256 }
+            if ($provenance.GitCommit) { $collectorCommit = [string]$provenance.GitCommit }
+        }
         $info = [PSCustomObject][ordered]@{
             SchemaVersion            = 1
+            CollectorVersion         = $collectorVersion
+            CollectorScriptSha256    = $collectorSha256
+            CollectorGitCommit       = $collectorCommit
             ComputerName             = $env:COMPUTERNAME
             CollectorUser            = [Security.Principal.WindowsIdentity]::GetCurrent().Name
             Mode                     = $mode
@@ -2236,6 +2513,10 @@ if ($script:IsLive) {
 }
 
 Log "=== Windows Forensic Triage Collection Started ==="
+# Which collector made this collection: version, SHA-256 of this script,
+# git commit (also in collection_info.json)
+$script:collectorProvenance = Get-CollectorProvenance -ScriptPath $PSCommandPath -Version $script:CollectorVersion
+foreach ($provenanceLine in (Get-CollectorProvenanceLines $script:collectorProvenance)) { Log $provenanceLine }
 Log "Output directory: $OutputPath"
 Log "Target drive: ${TargetDrive}:"
 Log "Target root: $($script:TargetRoot)"
@@ -2250,6 +2531,8 @@ if ($MemoryOutputPath) { Log "Memory dump folder: $MemoryOutputPath" }
 if ($null -ne $consoleModeAtStart) {
     Log "Console QuickEdit is off for this run, so a click in the window cannot pause it (copy text with the window menu: Edit > Mark)."
 }
+# What the memory prompt (before the log existed) showed and the answer
+foreach ($memoryPromptLine in @($script:memoryPromptLog)) { Log $memoryPromptLine }
 # Free space for the collection and its zip on the output drive (a warning
 # only; a memory dump is checked right before the capture)
 $outputSpace = Get-TriageSpaceCheck -Path $OutputPath -NoDump
@@ -2363,6 +2646,12 @@ if ($Categories -contains "Memory") {
 
             if ($memCaptureAllowed) {
                 Log "Capturing memory -- this may take several minutes..."
+                if ($memToolName -eq "DumpIt") {
+                    # Its output is read when it exits (Invoke-MemoryCaptureTool):
+                    # the screen shows nothing while it writes the dump and
+                    # then hashes it
+                    Log "DumpIt shows nothing until it exits: it writes the dump, then computes the dump's SHA-256 before it exits."
+                }
                 # The collector's own processes running now, as the dump
                 # sees them (collection_info.json); the capture tool's own
                 # process is added once it has started
@@ -2398,18 +2687,31 @@ if ($Categories -contains "Memory") {
                     $memResult = Get-MemoryCaptureResult -Output $result -DumpBytes (Get-FileLength $dumpFile) -RamBytes $ramBytes -ToolName $memToolName
                     foreach ($memErrorLine in $memResult.ErrorLines) { Log-Warning "${memToolName}: $memErrorLine" }
                     if ($memResult.Complete) {
-                        $dumpSizeGB = [math]::Round((Get-FileLength $dumpFile) / 1GB, 2)
+                        $dumpBytes = Get-FileLength $dumpFile
+                        $dumpSizeGB = [math]::Round($dumpBytes / 1GB, 2)
                         # The compression step changes the row's path when
-                        # it moves the dump (Set-ManifestDumpPath)
+                        # it moves the dump (Set-ManifestDumpPath). Hashing
+                        # a dump of several GB takes a while: said first
+                        Log "Hashing the memory dump (SHA-256 of $dumpSizeGB GB) for the manifest..."
+                        $script:lastRecordedDestPath = $null
                         Record-Manifest -SourcePath "(memory dump via $memToolName)" -DestPath $dumpFile
                         $script:memDumpPath = $dumpFile
                         Log "Memory dump check: $($memResult.Summary)"
+                        if ($script:lastRecordedDestPath -eq $dumpFile) {
+                            # Counted in the collection's total by Record-Manifest:
+                            # the summary shows the dump's size on its own
+                            $script:memDumpRecordedBytes = $dumpBytes
+                            Write-MemoryDumpHashCheck -ToolName $memToolName -ReportedSha256 $memResult.ReportedSha256 -Sha256 $script:lastRecordedSha256
+                        }
                         Log-Success "Memory dump captured: $dumpFile ($dumpSizeGB GB)"
                     } else {
                         Log-Error "Memory capture failed: $($memResult.Problems -join '; ')."
                         Log-Warning "Check acquisition log: $memLogFile"
                         $script:errorCount++
                     }
+                    # The JSON file DumpIt's output names: recorded, or a
+                    # note that it was not written
+                    Save-MemoryDumpJson -JsonPath $memResult.JsonPath -MemDir $memDir -ToolName $memToolName
                 }
                 catch {
                     Log-Error "Memory capture failed: $($_.Exception.Message)"
@@ -4002,6 +4304,45 @@ function Get-TriageBamRows {
     return $rows
 }
 
+# AppCompatCache (ShimCache) as the lines "reg query <key> /v AppCompatCache"
+# prints, which is what Execution\appcompat_cache.reg holds and the
+# timeline builder parses: a blank line, the key, "    AppCompatCache
+# REG_BINARY    <HEX>" (4 spaces before each part), a blank line. Read with
+# .NET: reg.exe takes 10-60 s to print the ~350 KB value, .NET a few
+# milliseconds, and the file is byte for byte the same. When the value
+# cannot be read as binary data that way, reg.exe runs as before (its
+# output, an error included, is what the file then holds).
+# $script:appCompatCacheMethod says which was used, for the log.
+function Get-TriageAppCompatCacheText {
+    $keyPath = "SYSTEM\CurrentControlSet\Control\Session Manager\AppCompatCache"
+    $reason = "the key could not be opened"
+    $key = Open-TriageRegKey -Hive "HKLM" -SubKey $keyPath
+    if ($null -ne $key) {
+        try {
+            $data = $key.GetValue("AppCompatCache", $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+            if ($null -eq $data) {
+                $reason = "the value is missing"
+            } elseif ($data -isnot [byte[]] -or $key.GetValueKind("AppCompatCache") -ne [Microsoft.Win32.RegistryValueKind]::Binary) {
+                $reason = "the value is not binary data"
+            } else {
+                $script:appCompatCacheMethod = "$($data.Length) bytes read from the registry"
+                return @(
+                    ""
+                    "HKEY_LOCAL_MACHINE\$keyPath"
+                    ("    AppCompatCache    REG_BINARY    " + [System.BitConverter]::ToString($data).Replace("-", ""))
+                    ""
+                )
+            }
+        } catch {
+            $reason = $_.Exception.Message
+        } finally {
+            $key.Close()
+        }
+    }
+    $script:appCompatCacheMethod = "read with reg query (the .NET read failed: $reason)"
+    return @(reg query "HKLM\$keyPath" /v AppCompatCache 2>&1)
+}
+
 # SRUM (System Resource Usage Monitor): copies every file of the sru folder
 # (SourceDir) to DestDir -- the ESE database SRUDB.dat with its checkpoint
 # (SRU.chk), transaction logs (SRU*.log, SRUtmp.log), reserve logs
@@ -4111,6 +4452,45 @@ function Copy-TriageSrumFiles {
     } elseif (-not $listError) {
         Log "SRUM folder is empty: $SourceDir"
     }
+}
+
+# USB storage devices in the registry (HKLM\...\Enum\USBSTOR\<device>\
+# <instance>): usb_storage_devices.txt (FriendlyName, HardwareID, Mfg,
+# Service, ContainerID, PSChildName per instance) and a result line in the
+# log. With none, the file says so (an empty file would be dropped, and
+# nothing would show why): no USBSTOR key (Windows has recorded no USB
+# storage device, or the record was cleaned up, e.g. by Disk Cleanup's
+# device driver cleanup) or no instance under it. A read error with no
+# device read is a warning. Returns the number of instances.
+function Save-TriageUsbStorDevices {
+    [OutputType([int])]
+    param([string]$UsbDir)
+    $usbStorErrors = $null
+    $usbStorItems = @(Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Enum\USBSTOR\*\*" -ErrorAction SilentlyContinue -ErrorVariable usbStorErrors)
+    $usbStorMissing = @($usbStorErrors | Where-Object { $_.Exception -is [System.Management.Automation.ItemNotFoundException] }).Count -gt 0
+    $otherErrors = @($usbStorErrors | Where-Object { $_.Exception -isnot [System.Management.Automation.ItemNotFoundException] })
+    $usbStorNote = "(no USB storage devices recorded in the registry; HKLM\SYSTEM\CurrentControlSet\Enum\USBSTOR has no device)"
+    if ($otherErrors.Count -gt 0) { $usbStorNote = "(no USB storage device could be read from HKLM\SYSTEM\CurrentControlSet\Enum\USBSTOR -- $($otherErrors[0].Exception.Message))" }
+    elseif ($usbStorMissing) { $usbStorNote = "(no USB storage devices recorded in the registry; there is no HKLM\SYSTEM\CurrentControlSet\Enum\USBSTOR key)" }
+    Save-CommandOutput -Description "USB storage devices" `
+        -DestPath (Join-Path $UsbDir "usb_storage_devices.txt") `
+        -Command {
+            if ($usbStorItems.Count -gt 0) {
+                $usbStorItems | Select-Object FriendlyName, HardwareID, Mfg, Service, ContainerID, PSChildName | Format-List
+            } else {
+                $usbStorNote
+            }
+        }
+    if ($usbStorItems.Count -gt 0) {
+        Log "USBSTOR: $($usbStorItems.Count) USB storage device(s) recorded in the registry (usb_storage_devices.txt)."
+    } elseif ($otherErrors.Count -gt 0) {
+        Log-Warning "USBSTOR: no USB storage device could be read from the registry -- $($otherErrors[0].Exception.Message)"
+    } elseif ($usbStorMissing) {
+        Log "USBSTOR: no USB storage devices recorded in the registry (no USBSTOR key)."
+    } else {
+        Log "USBSTOR: no USB storage devices recorded in the registry (the USBSTOR key has no device)."
+    }
+    return $usbStorItems.Count
 }
 
 # USB storage disks known to PnP (including devices not currently connected)
@@ -4408,6 +4788,66 @@ function Get-TriageRunKeyRows {
     return $rows
 }
 
+# User profiles in ProfileList (local S-1-5-21-... and Entra ID S-1-12-1-...
+# accounts): Sid, User (as Resolve-TriageSidUser names it, the profile
+# folder) and HasNtUser (the profile folder has an NTUSER.DAT)
+function Get-TriageProfileListUsers {
+    $users = @()
+    $profileList = Open-TriageRegKey -Hive "HKLM" -SubKey "SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList"
+    if ($null -eq $profileList) { return $users }
+    try {
+        foreach ($sid in $profileList.GetSubKeyNames()) {
+            if ($sid -notmatch '^S-1-(5-21|12-1)-[\d-]+$') { continue }
+            $profilePath = ""
+            $profileKey = $profileList.OpenSubKey($sid, $false)
+            if ($null -ne $profileKey) {
+                try { $profilePath = [string]$profileKey.GetValue("ProfileImagePath") } finally { $profileKey.Close() }
+            }
+            $hasNtUser = $false
+            if ($profilePath) {
+                try { $hasNtUser = [System.IO.File]::Exists([System.IO.Path]::Combine($profilePath, "NTUSER.DAT")) }
+                catch { Write-Verbose "Checking the NTUSER.DAT of ${sid}: $($_.Exception.Message)" }
+            }
+            $user = Resolve-TriageSidUser $sid
+            if (-not $user) { $user = $sid }
+            $users += [PSCustomObject]@{ Sid = $sid; User = $user; HasNtUser = $hasNtUser }
+        }
+    } catch {
+        Write-Verbose "Listing ProfileList: $($_.Exception.Message)"
+    } finally {
+        $profileList.Close()
+    }
+    return $users
+}
+
+# The log lines after run_keys.csv: the Run values per hive (HKLM, the
+# loaded user hives), and the user profiles whose hive is not loaded, so
+# none of their Run values is in run_keys.csv / run_keys.txt (read from the
+# live registry): the timeline builder reads them from the collected
+# NTUSER.DAT (Registry\<user>\), when the Registry category ran
+function Get-TriageRunKeyLogLines {
+    [OutputType([string[]])]
+    param(
+        [object[]]$Rows,
+        [string[]]$LoadedSids,
+        [object[]]$Profiles,
+        [bool]$RegistryCollected
+    )
+    $hklmCount = @($Rows | Where-Object { $_.Hive -eq "HKLM" }).Count
+    $userCount = @($Rows).Count - $hklmCount
+    $lines = @("Run keys: $hklmCount value(s) in HKLM, $userCount value(s) in $(@($LoadedSids).Count) loaded user hive(s).")
+    $notLoaded = @($Profiles | Where-Object { $_.HasNtUser -and @($LoadedSids) -notcontains $_.Sid })
+    if ($notLoaded.Count -gt 0) {
+        $names = @($notLoaded | ForEach-Object { $_.User }) -join ", "
+        if ($RegistryCollected) {
+            $lines += "Run keys not read live for $($notLoaded.Count) user(s) whose hive is not loaded: $names (their Run values are in the collected Registry\<user>\NTUSER.DAT, which the timeline builder reads)."
+        } else {
+            $lines += "Run keys not read live for $($notLoaded.Count) user(s) whose hive is not loaded: $names (their NTUSER.DAT is collected only with the Registry category)."
+        }
+    }
+    return $lines
+}
+
 # Human-readable listing of the Run keys (and Shell Folders) for run_keys.txt
 function Get-TriageRunKeyText {
     $keyPaths = $script:triageRunKeyPaths + $script:triageShellFolderPaths
@@ -4611,13 +5051,13 @@ if ($Categories -contains "Execution") {
             Log-Warning "No BAM entries found (bam key missing or not readable)."
         }
 
-        # ShimCache / AppCompatCache
+        # ShimCache / AppCompatCache (the text of "reg query", read with .NET)
         Log "Collecting AppCompatCache..."
+        $script:appCompatCacheMethod = ""
         Save-CommandOutput -Description "AppCompatCache" `
             -DestPath (Join-Path $execDir "appcompat_cache.reg") `
-            -Command {
-                reg query "HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\AppCompatCache" /v AppCompatCache 2>&1
-            }
+            -Command { Get-TriageAppCompatCacheText }
+        if ($script:appCompatCacheMethod) { Log "AppCompatCache: $($script:appCompatCacheMethod)." }
     } else {
         Log "Skipping RecentApps, BAM, AppCompatCache (mounted image -- live registry not available)"
     }
@@ -5600,13 +6040,7 @@ if ($Categories -contains "USB") {
     # USB device registry entries (live system only -- queries live HKLM registry)
     if ($script:IsLive) {
         Log "Collecting USB device registry info..."
-        Save-CommandOutput -Description "USB storage devices" `
-            -DestPath (Join-Path $usbDir "usb_storage_devices.txt") `
-            -Command {
-                Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Enum\USBSTOR\*\*" -ErrorAction SilentlyContinue |
-                    Select-Object FriendlyName, HardwareID, Mfg, Service, ContainerID, PSChildName |
-                    Format-List
-            }
+        $null = Save-TriageUsbStorDevices -UsbDir $usbDir
 
         # USB storage disks with PnP first-install / arrival / removal times
         # (includes devices that are not currently connected)
@@ -5696,7 +6130,9 @@ if ($Categories -contains "Persistence") {
             -DestPath (Join-Path $persDir "run_keys.csv") `
             -Columns @("Hive", "User", "KeyPath", "ValueName", "Command", "KeyLastWriteUtc") `
             -Rows $runKeyRows
-        Log "Run keys: $($runKeyRows.Count) value(s) in HKLM and $(@(Get-TriageLoadedUserSids).Count) loaded user hive(s)."
+        $runKeyLines = Get-TriageRunKeyLogLines -Rows $runKeyRows -LoadedSids @(Get-TriageLoadedUserSids) `
+            -Profiles @(Get-TriageProfileListUsers) -RegistryCollected ($Categories -contains "Registry")
+        foreach ($runKeyLine in $runKeyLines) { Log $runKeyLine }
 
         # Startup folder contents (all-users folder + every user profile)
         Log "Collecting startup folders..."
@@ -7234,6 +7670,15 @@ if ($script:memDumpIncompletePath -and -not $script:memDumpIncompletePath.EndsWi
     $script:memDumpIncompletePath = Move-IncompleteMemoryDump -DumpPath $script:memDumpIncompletePath
 }
 $memDumpIncompleteInCollection = [bool]($script:memDumpIncompletePath -and (Get-CollectionRelativePath $script:memDumpIncompletePath))
+# Sizes: the collection without the memory dump (Record-Manifest counted a
+# recorded dump in totalBytes; it is not in the zip), the dump on its own
+# on its "Memory dump:" line, and the zip at the end, once it exists
+$collectionBytes = [long]$script:totalBytes - [long]$script:memDumpRecordedBytes
+if ($collectionBytes -lt 0) { $collectionBytes = [long]$script:totalBytes }
+$collectionSizeLine = "  Collection size: $(Format-TriageSize $collectionBytes)"
+if ($script:memDumpPath) { $collectionSizeLine += " (without the memory dump)" }
+$memDumpSize = ""
+if ($script:memDumpPath -and (Get-FileLength $script:memDumpPath) -ge 0) { $memDumpSize = Format-TriageSize (Get-FileLength $script:memDumpPath) }
 
 $summaryLines = @(
     "============================================================="
@@ -7247,19 +7692,23 @@ $summaryLines = @(
     "  Duration:       $($duration.ToString('hh\:mm\:ss'))"
     "  Files collected: $($script:fileCount)"
     "  Errors:         $($script:errorCount)"
-    "  Total size:     $([math]::Round($script:totalBytes / 1MB, 2)) MB"
+    $collectionSizeLine
 )
 if ($NoCompress) {
     $summaryLines += "  Output:         $OutputPath"
 } else {
     $summaryLines += "  Output:         $zipPath"
 }
+# The dump's size, and later what happened to it, in brackets after its path
+$memDumpNote = ""
+if ($memDumpSize) { $memDumpNote = "$memDumpSize, " }
 $memDumpSummaryIndex = -1   # the line to correct if the dump cannot be moved
 if ($memDumpInCollection -and -not $NoCompress) {
     $memDumpSummaryIndex = $summaryLines.Count
-    $summaryLines += "  Memory dump:    ${OutputPath}_$([System.IO.Path]::GetFileName($script:memDumpPath)) (kept outside the zip)"
+    $summaryLines += "  Memory dump:    ${OutputPath}_$([System.IO.Path]::GetFileName($script:memDumpPath)) (${memDumpNote}kept outside the zip)"
 } elseif ($script:memDumpPath) {
-    $summaryLines += "  Memory dump:    $($script:memDumpPath)"
+    if ($memDumpSize) { $summaryLines += "  Memory dump:    $($script:memDumpPath) ($memDumpSize)" }
+    else { $summaryLines += "  Memory dump:    $($script:memDumpPath)" }
     # Not in the collection and not next to it (in the folder that holds
     # the collection and its zip, under <collection>_memory_dump.<ext>, as
     # -MemoryOutputPath names it): the timeline builder finds it through
@@ -7375,7 +7824,7 @@ if (-not $NoCompress) {
             $memDumpMoveFailed = $true
             # The summary (logged above, shown again at the end) names the
             # path next to the zip: correct it
-            $summaryLines[$memDumpSummaryIndex] = "  Memory dump:    $($script:memDumpPath) (not moved out, the folder is not zipped)"
+            $summaryLines[$memDumpSummaryIndex] = "  Memory dump:    $($script:memDumpPath) (${memDumpNote}not moved out, the folder is not zipped)"
             Log $summaryLines[$memDumpSummaryIndex]
         }
         # The manifest, zipped next, names where the dump is now
@@ -7458,7 +7907,7 @@ if (-not $NoCompress -and -not $memDumpMoveFailed) {
             # Back in Memory\: so are its manifest row and summary line
             if ((Get-FileLength $script:memDumpPath) -ge 0) {
                 if ($memDumpRowMoved) { [void](Set-ManifestDumpPath -OldPath $memDumpMovedTo -NewPath $script:memDumpPath) }
-                $summaryLines[$memDumpSummaryIndex] = "  Memory dump:    $($script:memDumpPath) (moved back, no zip was created)"
+                $summaryLines[$memDumpSummaryIndex] = "  Memory dump:    $($script:memDumpPath) (${memDumpNote}moved back, no zip was created)"
                 Log $summaryLines[$memDumpSummaryIndex]
             }
         }
@@ -7486,14 +7935,7 @@ if (-not $NoCompress) {
         Write-Host "  Timeline:       drop the folder on Run-TimelineBuilder.bat" -ForegroundColor DarkGray
     }
 }
-if ($memDumpMovedTo -and (Test-Path -LiteralPath $memDumpMovedTo)) {
-    $dumpGB = [math]::Round((Get-FileLength $memDumpMovedTo) / 1GB, 2)
-    Write-Host "  Memory dump:    $memDumpMovedTo ($dumpGB GB)"
-} elseif ($script:memDumpPath -and (Test-Path -LiteralPath $script:memDumpPath)) {
-    # -NoCompress, -MemoryOutputPath, or moved back after a failed zip
-    $dumpGB = [math]::Round((Get-FileLength $script:memDumpPath) / 1GB, 2)
-    Write-Host "  Memory dump:    $($script:memDumpPath) ($dumpGB GB)"
-}
+# The memory dump, with its size, is on the summary's "Memory dump:" line
 
 # The run is done: the console's mode back as it was before it (QuickEdit),
 # so the summary can be selected with the mouse again

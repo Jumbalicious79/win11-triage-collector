@@ -21,9 +21,10 @@
 #      a tool that cannot start throws; a stop (as Ctrl+C) ends a tool
 #      still running
 #   d. collection_info.json written twice: one manifest row, with the
-#      second version's hash and size; a second write that fails keeps
-#      the first version and the row; a mounted image gets no
-#      CollectorProcesses
+#      second version's hash and size, and the provenance fields
+#      (CollectorVersion, CollectorScriptSha256, CollectorGitCommit) in
+#      both versions; a second write that fails keeps the first version
+#      and the row; a mounted image gets no CollectorProcesses
 #   e. the memory section: the process list is read before the tool runs,
 #      the tool's record is added right after it, and collection_info.json
 #      is written again after the capture
@@ -32,8 +33,12 @@
 #      returning 1 MB, so the stand-in's 1 MB dump is complete and no real
 #      memory is captured) run through cmd.exe with -Unattended: a capture
 #      (Collector, Launcher, Console and MemoryCapture, each PID and the
-#      parent links checked), memory not chosen, no capture tool, a tool
-#      that cannot start, and a mounted image (no CollectorProcesses).
+#      parent links checked; the stand-in prints a "SHA-256:" line as
+#      DumpIt does, which the collector reads from the tool's output and
+#      finds equal to its own hash of the dump; the file written again
+#      after the capture keeps the provenance fields), memory not chosen,
+#      no capture tool, a tool that cannot start, and a mounted image (no
+#      CollectorProcesses).
 #
 # a to e need no admin rights. f runs the collector, which needs
 # Administrator rights (GitHub Actions Windows runners are elevated); for
@@ -76,7 +81,7 @@ foreach ($node in $nodes) {
     if (-not (Test-InsideFunction $node)) { $definitions.Add($node.Extent.Text) }
 }
 . ([scriptblock]::Create($definitions -join "`r`n"))
-foreach ($name in @("Select-CollectorProcesses", "Get-CollectorProcessRecords", "Add-CollectorProcessRecord", "ConvertTo-CollectorProcessField", "Invoke-MemoryCaptureTool", "ConvertTo-NativeArgument", "Write-CollectionInfo", "Update-ManifestFileRow", "Get-NativeMachineType")) {
+foreach ($name in @("Select-CollectorProcesses", "Get-CollectorProcessRecords", "Add-CollectorProcessRecord", "ConvertTo-CollectorProcessField", "Invoke-MemoryCaptureTool", "ConvertTo-NativeArgument", "Write-CollectionInfo", "Update-ManifestFileRow", "Get-NativeMachineType", "Get-CollectorProvenance")) {
     if (-not (Get-Command $name -CommandType Function -ErrorAction SilentlyContinue)) {
         Write-Host "FAIL: $name not found in $collector" -ForegroundColor Red
         exit 1
@@ -167,6 +172,15 @@ function Test-InfoManifestRow {
         if ([System.IO.File]::Exists($leftover)) { $Problems.Add("left behind: $leftover") }
     }
 }
+# The provenance fields of a live run's collection_info.json: right after
+# SchemaVersion, with this version and script SHA-256; CollectorProcesses
+# last
+function Test-InfoProvenance {
+    param([object]$Info, [string]$Version, [string]$Sha256, [System.Collections.Generic.List[string]]$Problems)
+    $names = (@($Info.PSObject.Properties | ForEach-Object { $_.Name }) -join ",")
+    if ($names -notmatch '^SchemaVersion,CollectorVersion,CollectorScriptSha256,CollectorGitCommit,.+,CollectorProcesses$') { $Problems.Add("fields: $names") }
+    if ($Info.CollectorVersion -cne $Version -or $Info.CollectorScriptSha256 -cne $Sha256) { $Problems.Add("provenance '$($Info.CollectorVersion)', '$($Info.CollectorScriptSha256)'; expected '$Version', '$Sha256'") }
+}
 # Run a console tool and return its exit code
 function Invoke-NativeTool {
     param([string]$FilePath, [string[]]$Arguments)
@@ -183,8 +197,11 @@ function Invoke-NativeTool {
 # capture tools on ARM64 Windows, and a C# compiler for that is not part
 # of Windows). It prints DumpIt-like lines, its own PID and start time and
 # each argument, one "Error:" line on standard error, sleeps (/SLEEP ms,
-# 300 by default), writes /OUTPUT <file> of /SIZE bytes (1 MB + 8 KB by
-# default: complete for a RAM of 1 MB) and exits with 0
+# 300 by default), writes /OUTPUT <file> of /SIZE bytes (1 MB + 8 KB of
+# zeros by default: complete for a RAM of 1 MB) and exits with 0. When the
+# environment variable TRIAGE_TEST_STANDIN_SHA256 is set, it also prints
+# "    SHA-256: <its value>" (before the NtStatus line), as DumpIt prints
+# the dump's hash
 $standInIl = @'
 .assembly extern mscorlib { .publickeytoken = (B7 7A 5C 56 19 34 E0 89) .ver 4:0:0:0 }
 .assembly extern System { .publickeytoken = (B7 7A 5C 56 19 34 E0 89) .ver 4:0:0:0 }
@@ -197,7 +214,7 @@ $standInIl = @'
   {
     .entrypoint
     .maxstack 4
-    .locals init (class [System]System.Diagnostics.Process self, string output, int32 sleepMs, int64 size, int32 i, string arg, valuetype [mscorlib]System.DateTime start, class [mscorlib]System.IO.FileStream fs)
+    .locals init (class [System]System.Diagnostics.Process self, string output, int32 sleepMs, int64 size, int32 i, string arg, valuetype [mscorlib]System.DateTime start, class [mscorlib]System.IO.FileStream fs, string sha)
     ldnull
     stloc.1
     ldc.i4 300
@@ -316,6 +333,16 @@ $standInIl = @'
     ldstr " bytes"
     call string [mscorlib]System.String::Concat(object, object, object)
     call void [mscorlib]System.Console::WriteLine(string)
+    ldstr "TRIAGE_TEST_STANDIN_SHA256"
+    call string [mscorlib]System.Environment::GetEnvironmentVariable(string)
+    stloc.s sha
+    ldloc.s sha
+    brfalse NOSHA
+    ldstr "    SHA-256: "
+    ldloc.s sha
+    call string [mscorlib]System.String::Concat(string, string)
+    call void [mscorlib]System.Console::WriteLine(string)
+  NOSHA:
     ldstr "    NtStatus (troubleshooting):   0x00000000"
     call void [mscorlib]System.Console::WriteLine(string)
     ldc.i4.0
@@ -643,6 +670,10 @@ while (-not [System.IO.File]::Exists($Release) -and (Get-Date) -lt $deadline) { 
     $script:fileCount = 0
     $script:errorCount = 0
     $script:totalBytes = 0
+    # The collector's provenance, as the run reads it at its start: both
+    # versions of the file carry it
+    $script:collectorProvenance = Get-CollectorProvenance -ScriptPath $collector -Version "2099.01.02"
+    $collectorSha256 = (Get-FileHash -LiteralPath $collector -Algorithm SHA256).Hash
 
     $problems = New-Problems
     Write-CollectionInfo 6>$null
@@ -657,6 +688,7 @@ while (-not [System.IO.File]::Exists($Release) -and (Get-Date) -lt $deadline) { 
         $expectedLine = "Collector's own processes recorded in collection_info.json: $powershellName (PID $PID, collector)"
         if (@($logLines | Where-Object { $_.Contains($expectedLine) }).Count -ne 1) { $problems.Add("log: $($logLines -join ' | ')") }
         if ($first.Info.Mode -cne "Live" -or $first.Info.SchemaVersion -ne 1) { $problems.Add("Mode '$($first.Info.Mode)', SchemaVersion $($first.Info.SchemaVersion)") }
+        Test-InfoProvenance -Info $first.Info -Version "2099.01.02" -Sha256 $collectorSha256 -Problems $problems
     }
     Add-Result "d: first write: field, manifest row, log" $problems -Info "$(@($first.Info.CollectorProcesses).Count) process(es)"
 
@@ -673,13 +705,16 @@ while (-not [System.IO.File]::Exists($Release) -and (Get-Date) -lt $deadline) { 
     $last = $entries[-1]
     if ($last.Role -cne "MemoryCapture" -or $last.Pid -ne 4242 -or $last.ParentPid -ne $PID -or (Get-DiffMs (ConvertTo-TestUtc $last.StartUtc) $captureStart) -gt 0.001) { $problems.Add("last entry: $($last | ConvertTo-Json -Compress)") }
     if ([System.IO.File]::ReadAllText($infoPath) -eq [System.Text.Encoding]::UTF8.GetString($firstBytes)) { $problems.Add("the file did not change") }
+    # The provenance fields stay as they were
+    Test-InfoProvenance -Info $second.Info -Version "2099.01.02" -Sha256 $collectorSha256 -Problems $problems
+    if ($first -and $second.Info.CollectorGitCommit -cne $first.Info.CollectorGitCommit) { $problems.Add("CollectorGitCommit '$($second.Info.CollectorGitCommit)', first '$($first.Info.CollectorGitCommit)'") }
     Test-InfoManifestRow -Manifest $manifestFile -InfoPath $infoPath -Problems $problems
     $sizes = @(Import-Csv -LiteralPath $manifestFile | ForEach-Object { [long]$_.SizeBytes })
     if ($script:totalBytes -ne ($sizes | Measure-Object -Sum).Sum -or $script:fileCount -ne $sizes.Count) { $problems.Add("counters: $($script:fileCount) file(s), $($script:totalBytes) bytes; manifest $($sizes.Count) row(s)") }
     $logLines = @(Get-Content -LiteralPath $logFile)
     if (@($logLines | Where-Object { $_ -match 'collection_info\.json updated: DumpIt\.exe \(PID 4242\) recorded as the memory capture tool$' }).Count -ne 1) { $problems.Add("log: $($logLines -join ' | ')") }
     if (@($logLines | Where-Object { $_ -match 'WARNING|ERROR' }).Count -gt 0 -or $script:errorCount -ne 0) { $problems.Add("warnings or errors: $($logLines -join ' | ')") }
-    Add-Result "d: second write: the row follows it" $problems -Info "$($entries.Count) process(es)"
+    Add-Result "d: second write: the row follows it, provenance kept" $problems -Info "$($entries.Count) process(es)"
 
     # The rewrite fails (the file is open, so it cannot be replaced): the
     # second version stays, whole, with its manifest row; a warning, no error
@@ -880,10 +915,33 @@ while (-not [System.IO.File]::Exists($Release) -and (Get-Date) -lt $deadline) { 
             return $byRole
         }
 
-        # f1. A capture with the stand-in: the capture tool's process is added
+        # f1. A capture with the stand-in: the capture tool's process is
+        # added. The stand-in prints a "SHA-256:" line as DumpIt does, with
+        # the SHA-256 of the dump it writes (1 MB + 8 KB of zeros): the
+        # collector reads it from the output Invoke-MemoryCaptureTool
+        # returns and compares it with its own hash of the dump
         $problems = New-Problems
-        $run = Invoke-CollectorRun -Name "capture" -Copy $copies["standin"] -Arguments @("-Categories", "Memory")
+        $hasher = [System.Security.Cryptography.SHA256]::Create()
+        try { $standInDumpSha = ([System.BitConverter]::ToString($hasher.ComputeHash((New-Object byte[] 1056768)))).Replace("-", "") }
+        finally { $hasher.Dispose() }
+        $env:TRIAGE_TEST_STANDIN_SHA256 = $standInDumpSha
+        try { $run = Invoke-CollectorRun -Name "capture" -Copy $copies["standin"] -Arguments @("-Categories", "Memory") }
+        finally { Remove-Item -Path Env:\TRIAGE_TEST_STANDIN_SHA256 -ErrorAction SilentlyContinue }
         $byRole = Test-LiveRun -Run $run -Roles @("Collector", "Launcher", "Console", "MemoryCapture") -Problems $problems
+        # The file written again after the capture keeps the provenance
+        # fields: the version the log names and the SHA-256 of the copy
+        # that ran
+        if ($run.Info) {
+            $versionLines = @($run.Log | Where-Object { $_ -match '\] Collector: version \S+, triage-collector\.ps1 SHA-256 [0-9A-F]{64}$' })
+            $loggedVersion = ""
+            if ($versionLines.Count -eq 1 -and $versionLines[0] -match '\] Collector: version (\S+), ') { $loggedVersion = $Matches[1] }
+            if (-not $loggedVersion) { $problems.Add("provenance log line(s): $($versionLines -join ' | ')") }
+            Test-InfoProvenance -Info $run.Info.Info -Version $loggedVersion -Sha256 (Get-FileHash -LiteralPath $copies["standin"] -Algorithm SHA256).Hash -Problems $problems
+        }
+        $hashLines = @($run.Log | Where-Object { $_ -match 'Memory dump SHA-256' })
+        if ($hashLines.Count -ne 1 -or -not $hashLines[0].EndsWith("] Memory dump SHA-256 check: match -- the collector's SHA-256 of the dump equals the one DumpIt printed ($standInDumpSha)")) { $problems.Add("SHA-256 line(s): $($hashLines -join ' | ')") }
+        $dumpRows = @(if ([System.IO.File]::Exists($run.Manifest)) { Import-Csv -LiteralPath $run.Manifest | Where-Object { $_.SourcePath -eq "(memory dump via DumpIt)" } })
+        if ($dumpRows.Count -ne 1 -or $dumpRows[0].SHA256 -cne $standInDumpSha) { $problems.Add("memory dump manifest row(s): $(@($dumpRows | ForEach-Object { $_.SHA256 }) -join ', ')") }
         if ($byRole -and $byRole["MemoryCapture"]) {
             $memoryEntry = $byRole["MemoryCapture"]
             $report = Get-StandInReport $run.Acquisition
@@ -894,7 +952,7 @@ while (-not [System.IO.File]::Exists($Release) -and (Get-Date) -lt $deadline) { 
             if (@($run.Log | Where-Object { $_ -match 'OK: Memory dump captured: ' }).Count -ne 1) { $problems.Add("the dump was not captured: $(@($run.Log | Where-Object { $_ -match 'Memory' }) -join ' | ')") }
             if ($run.Acquisition.Count -lt 2 -or $run.Acquisition[-1] -cne $standInEndLines[1] -or $run.Acquisition[-2] -cne $standInEndLines[0]) { $problems.Add("acquisition log: $($run.Acquisition -join ' | ')") }
         }
-        Add-Result "f: capture: collector, launcher, console, capture tool" $problems -Info $(if ($byRole) { "PIDs " + (@($byRole.Values | Sort-Object { $_.Pid } | ForEach-Object { "$($_.Role) $($_.Pid)" }) -join ", ") })
+        Add-Result "f: capture: processes, DumpIt's SHA-256, provenance" $problems -Info $(if ($byRole) { "PIDs " + (@($byRole.Values | Sort-Object { $_.Pid } | ForEach-Object { "$($_.Role) $($_.Pid)" }) -join ", ") })
 
         # f2. Memory not chosen (-Unattended without Memory, as "No" at the
         # prompt): no capture tool, no second write

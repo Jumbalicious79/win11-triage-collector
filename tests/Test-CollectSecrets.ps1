@@ -8,7 +8,9 @@
 # a free drive letter with subst and runs triage-collector.ps1 twice:
 #
 #   WITHOUT -IncludeSecrets: the canary appears in no browser copy, there is
-#     no Secrets folder, and collection_info.json has SecretsIncluded false.
+#     no Secrets folder, and collection_info.json has SecretsIncluded false
+#     (and no CollectorProcesses: a mounted image's run records no process
+#     IDs).
 #   WITH -IncludeSecrets: the browser copies are byte-for-byte the originals
 #     (their manifest hash equals the original's), every credential file is
 #     collected with a manifest row carrying the original path and original
@@ -283,6 +285,9 @@ try {
     $plainInfo = Get-Content -LiteralPath (Join-Path $outNoSecrets "collection_info.json") -Raw | ConvertFrom-Json
     Write-TestResult -Succeeded ($plainInfo.SecretsIncluded -eq $false) -Message "no switch: collection_info.json SecretsIncluded is false"
     Write-TestResult -Succeeded ($plainInfo.PSObject.Properties["ThunderbirdIndexIncluded"] -and $plainInfo.ThunderbirdIndexIncluded -eq $false) -Message "no switch: collection_info.json ThunderbirdIndexIncluded is false"
+    # A mounted image: the collector's process IDs are not recorded (they
+    # would mean nothing for the image's memory)
+    Write-TestResult -Succeeded ($plainInfo.Mode -eq "MountedImage" -and -not $plainInfo.PSObject.Properties["CollectorProcesses"]) -Message "mounted image: collection_info.json has no CollectorProcesses"
 
     # ==========================================================
     # Run 2: WITH -IncludeSecrets

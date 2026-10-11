@@ -1914,8 +1914,10 @@ capture before collection begins.
     written twice: one manifest row, with the second version's hash and
     size, and the provenance fields in both versions; a second write that
     fails keeps the first version and its row; a mounted image gets no
-    CollectorProcesses. The memory section: the process list read before
-    the tool runs, the tool's process recorded right after,
+    CollectorProcesses but the same provenance fields (CollectorVersion,
+    CollectorScriptSha256 and CollectorGitCommit right after SchemaVersion,
+    ThunderbirdIndexIncluded last). The memory section: the process list
+    read before the tool runs, the tool's process recorded right after,
     collection_info.json written again after the capture. End to end: the
     collector (a copy in a temporary folder, with the stand-in as
     tools\dumpit\<arch>\DumpIt.exe and a RAM size of 1 MB, so no real
@@ -1926,7 +1928,7 @@ capture before collection begins.
     dump; the file written after the capture keeps the provenance fields),
     a run without Memory, one with no capture tool and one with a tool
     that cannot start (no capture tool recorded), and a mounted image
-    (subst; no CollectorProcesses). The
+    (subst; no CollectorProcesses, the provenance fields kept). The
     end-to-end part needs Administrator rights, like the collector;
     without them, pass -CollectorPath with a copy of the collector that
     has no admin check.

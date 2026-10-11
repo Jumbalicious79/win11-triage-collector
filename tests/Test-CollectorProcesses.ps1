@@ -24,7 +24,8 @@
 #      second version's hash and size, and the provenance fields
 #      (CollectorVersion, CollectorScriptSha256, CollectorGitCommit) in
 #      both versions; a second write that fails keeps the first version
-#      and the row; a mounted image gets no CollectorProcesses
+#      and the row; a mounted image gets no CollectorProcesses but the
+#      same provenance fields
 #   e. the memory section: the process list is read before the tool runs,
 #      the tool's record is added right after it, and collection_info.json
 #      is written again after the capture
@@ -38,7 +39,7 @@
 #      finds equal to its own hash of the dump; the file written again
 #      after the capture keeps the provenance fields), memory not chosen,
 #      no capture tool, a tool that cannot start, and a mounted image (no
-#      CollectorProcesses).
+#      CollectorProcesses; the provenance fields as in a live run).
 #
 # a to e need no admin rights. f runs the collector, which needs
 # Administrator rights (GitHub Actions Windows runners are elevated); for
@@ -172,13 +173,15 @@ function Test-InfoManifestRow {
         if ([System.IO.File]::Exists($leftover)) { $Problems.Add("left behind: $leftover") }
     }
 }
-# The provenance fields of a live run's collection_info.json: right after
-# SchemaVersion, with this version and script SHA-256; CollectorProcesses
-# last
+# The provenance fields of collection_info.json: right after SchemaVersion,
+# with this version and script SHA-256; CollectorProcesses last (a live
+# run), or, with -MountedImage, ThunderbirdIndexIncluded last and no
+# CollectorProcesses
 function Test-InfoProvenance {
-    param([object]$Info, [string]$Version, [string]$Sha256, [System.Collections.Generic.List[string]]$Problems)
+    param([object]$Info, [string]$Version, [string]$Sha256, [System.Collections.Generic.List[string]]$Problems, [switch]$MountedImage)
     $names = (@($Info.PSObject.Properties | ForEach-Object { $_.Name }) -join ",")
-    if ($names -notmatch '^SchemaVersion,CollectorVersion,CollectorScriptSha256,CollectorGitCommit,.+,CollectorProcesses$') { $Problems.Add("fields: $names") }
+    $lastField = if ($MountedImage) { "ThunderbirdIndexIncluded" } else { "CollectorProcesses" }
+    if ($names -notmatch ('^SchemaVersion,CollectorVersion,CollectorScriptSha256,CollectorGitCommit,.+,' + $lastField + '$') -or ($MountedImage -and $names -match 'CollectorProcesses')) { $Problems.Add("fields: $names") }
     if ($Info.CollectorVersion -cne $Version -or $Info.CollectorScriptSha256 -cne $Sha256) { $Problems.Add("provenance '$($Info.CollectorVersion)', '$($Info.CollectorScriptSha256)'; expected '$Version', '$Sha256'") }
 }
 # Run a console tool and return its exit code
@@ -735,7 +738,9 @@ while (-not [System.IO.File]::Exists($Release) -and (Get-Date) -lt $deadline) { 
     if ($script:errorCount -ne 0) { $problems.Add("error count $($script:errorCount)") }
     Add-Result "d: a failed rewrite keeps the file and its row" $problems
 
-    # A mounted image: no CollectorProcesses (its PIDs are not the image's)
+    # A mounted image: no CollectorProcesses (its PIDs are not the image's),
+    # and the same provenance fields as a live run (the collector that ran,
+    # $script:collectorProvenance, is still set from above)
     $problems = New-Problems
     $OutputPath = Join-Path $caseDir "TriageCollection_mounted"
     New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null
@@ -749,7 +754,11 @@ while (-not [System.IO.File]::Exists($Release) -and (Get-Date) -lt $deadline) { 
     Write-CollectionInfo 6>$null
     $mounted = Read-CollectionInfo (Join-Path $OutputPath "collection_info.json")
     if (-not $mounted -or $mounted.Info.Mode -cne "MountedImage" -or $mounted.Info.PSObject.Properties["CollectorProcesses"] -or $mounted.Raw.Contains("CollectorProcesses")) { $problems.Add("collection_info.json: $($mounted.Raw)") }
-    Add-Result "d: mounted image: no CollectorProcesses" $problems
+    if ($mounted) {
+        Test-InfoProvenance -Info $mounted.Info -Version "2099.01.02" -Sha256 $collectorSha256 -Problems $problems -MountedImage
+        if ([string]$mounted.Info.CollectorGitCommit -cne [string]$script:collectorProvenance.GitCommit) { $problems.Add("CollectorGitCommit '$($mounted.Info.CollectorGitCommit)', expected '$($script:collectorProvenance.GitCommit)'") }
+    }
+    Add-Result "d: mounted image: no CollectorProcesses, provenance kept" $problems
 
     # =========================================================
     # e. The memory section in the collector's code
@@ -979,7 +988,7 @@ while (-not [System.IO.File]::Exists($Release) -and (Get-Date) -lt $deadline) { 
         Add-Result "f: a tool that cannot start: nothing recorded" $problems
 
         # f5. A mounted image (a folder mapped to a drive letter with subst):
-        # no CollectorProcesses, no capture
+        # no CollectorProcesses, no capture, the provenance fields kept
         $problems = New-Problems
         $imageDir = Join-Path $e2eDir "image"
         New-Item -ItemType Directory -Path (Join-Path $imageDir "Windows\System32") -Force | Out-Null
@@ -992,9 +1001,18 @@ while (-not [System.IO.File]::Exists($Release) -and (Get-Date) -lt $deadline) { 
             $run = Invoke-CollectorRun -Name "mounted" -Copy $copies["standin"] -Arguments @("-TargetDrive", $script:substLetter, "-Categories", "Memory")
             if (-not $run.Info -or $run.Info.Info.Mode -cne "MountedImage" -or $run.Info.Info.PSObject.Properties["CollectorProcesses"] -or $run.Info.Raw.Contains("CollectorProcesses")) { $problems.Add("collection_info.json: $(if ($run.Info) { $run.Info.Raw } else { 'none' })") }
             if (@($run.Log | Where-Object { $_ -match 'Skipping Memory capture \(mounted image' }).Count -ne 1) { $problems.Add("memory capture not skipped") }
-            if ($run.Info) { Test-InfoManifestRow -Manifest $run.Manifest -InfoPath $run.InfoPath -Problems $problems }
+            if ($run.Info) {
+                Test-InfoManifestRow -Manifest $run.Manifest -InfoPath $run.InfoPath -Problems $problems
+                # The provenance fields, as in a live run: the version the
+                # log names and the SHA-256 of the copy that ran
+                $versionLines = @($run.Log | Where-Object { $_ -match '\] Collector: version \S+, triage-collector\.ps1 SHA-256 [0-9A-F]{64}$' })
+                $loggedVersion = ""
+                if ($versionLines.Count -eq 1 -and $versionLines[0] -match '\] Collector: version (\S+), ') { $loggedVersion = $Matches[1] }
+                if (-not $loggedVersion) { $problems.Add("provenance log line(s): $($versionLines -join ' | ')") }
+                Test-InfoProvenance -Info $run.Info.Info -Version $loggedVersion -Sha256 (Get-FileHash -LiteralPath $copies["standin"] -Algorithm SHA256).Hash -Problems $problems -MountedImage
+            }
         }
-        Add-Result "f: mounted image: no CollectorProcesses" $problems
+        Add-Result "f: mounted image: no CollectorProcesses, provenance kept" $problems
     }
 }
 catch {

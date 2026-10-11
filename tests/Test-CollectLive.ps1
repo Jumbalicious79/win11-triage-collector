@@ -87,14 +87,20 @@ try {
     Write-Host "Running the collector ($powershellExe) on this computer: -TargetDrive $systemLetter -Categories Execution,USB,Persistence ..."
     $watch = [System.Diagnostics.Stopwatch]::StartNew()
     $ErrorActionPreference = "Continue"
-    # A script block, not -File: -File passes "Execution,USB,Persistence" as
-    # one string, which -Categories refuses; a script block's arguments keep
-    # their types. (Its exit code would be the last native tool's the
-    # collector ran, so the end of the run is read from the log instead.)
-    $output = & $powershellExe -NoProfile -ExecutionPolicy Bypass -Command {
-        param($Script, $Letter, $Out)
-        & $Script -TargetDrive $Letter -Categories Execution, USB, Persistence -Unattended -NoCompress -OutputPath $Out
-    } -args $collector, $systemLetter, $outputPath 2>&1
+    # A small wrapper script run with -File: -File would pass
+    # "Execution,USB,Persistence" to the collector as one string, which
+    # -Categories refuses, so the wrapper passes the list. Not a script block:
+    # PowerShell hands a script block to powershell.exe as -encodedCommand,
+    # which the timeline builder's report then flags as encoded PowerShell in
+    # the next collection of this computer. (The exit code would be the last
+    # native tool's the collector ran, so the end of the run is read from the
+    # log instead.)
+    $wrapper = Join-Path $workDir "run-collector.ps1"
+    [System.IO.File]::WriteAllText($wrapper, (@(
+        'param([string]$Script, [string]$Letter, [string]$Out)',
+        '& $Script -TargetDrive $Letter -Categories Execution, USB, Persistence -Unattended -NoCompress -OutputPath $Out'
+    ) -join "`r`n") + "`r`n")
+    $output = & $powershellExe -NoProfile -ExecutionPolicy Bypass -File $wrapper -Script $collector -Letter $systemLetter -Out $outputPath 2>&1
     $ErrorActionPreference = "Stop"
     $watch.Stop()
     Write-Host "  the collector ran for $([Math]::Round($watch.Elapsed.TotalSeconds)) s"
@@ -127,7 +133,7 @@ try {
     }
     Write-TestResult -Succeeded $commitOk -Message "provenance: one 'Collector git commit' line, the same commit as collection_info.json's CollectorGitCommit ($(if ($info.CollectorGitCommit) { $info.CollectorGitCommit } else { 'none' }))"
     # The collector's own processes (live runs) beside the provenance: its
-    # PowerShell first, started by this test (the -Command child)
+    # PowerShell first, started by this test (the -File child)
     $processEntries = @($info.CollectorProcesses)
     $powershellName = [System.IO.Path]::GetFileName($powershellExe)
     $collectorEntryOk = $processEntries.Count -ge 1 -and $processEntries[0].Role -eq "Collector" -and $processEntries[0].Name -eq $powershellName -and $processEntries[0].ParentPid -eq $PID

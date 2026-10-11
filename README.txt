@@ -1621,10 +1621,11 @@ capture before collection begins.
     file, a file extended past its written data, and an NTFS-compressed
     file, which the raw read must decline cleanly.
 
-  tests\Test-Collect*.ps1 (run as Administrator; all six also run in CI)
-    Each builds a fake mounted image in a temporary folder (a
-    Windows\System32 tree with test artifacts), maps it to a free drive
-    letter with subst, runs the collector on it with -Unattended
+  tests\Test-Collect*.ps1 (run as Administrator; all seven also run in CI)
+    Each but Test-CollectLive.ps1 (below) builds a fake mounted image in
+    a temporary folder (a Windows\System32 tree with test artifacts),
+    maps it to a free drive letter with subst, runs the collector on it
+    with -Unattended
     -NoCompress and one category, and checks what was and was not
     collected (byte for byte, with manifest rows: original path, hash of
     the copy, original times). The drive letter and the files are removed
@@ -1690,8 +1691,30 @@ capture before collection begins.
     true, the warning is logged, and a junction out of the profile is not
     followed.
 
+  tests\Test-CollectLive.ps1 (-Categories Execution,USB,Persistence on
+    this computer)
+    Runs the collector on the computer running the test, as
+    Run-TriageCollector.bat does for its system drive (-TargetDrive <the
+    system drive's letter> -Unattended -NoCompress), into a temporary
+    folder that is removed afterwards, and checks what only a live run
+    reaches: the provenance log lines ("Collector: version ...,
+    triage-collector.ps1 SHA-256 ...", "Collector git commit: ...") and
+    collection_info.json's CollectorVersion, CollectorScriptSha256 (the
+    SHA-256 of the script that ran) and CollectorGitCommit agree; the
+    AppCompatCache line ("N bytes read from the registry") and
+    Execution\appcompat_cache.reg in reg query's layout with 2 x N hex
+    digits; one USBSTOR result line and a USB\usb_storage_devices.txt with
+    those devices or a note; and the Run key line, whose HKLM and user
+    counts are those of Persistence\run_keys.csv. It reads this computer's
+    registry and files and changes nothing (as Administrator the collector
+    makes and removes its shadow copy and temporary Defender exclusion, as
+    in any run). Without Administrator rights, pass -CollectorPath as
+    above; the steps that need them then log warnings, which it does not
+    check.
+
     powershell -ExecutionPolicy Bypass -File tests\Test-CollectBrowser.ps1
     powershell -ExecutionPolicy Bypass -File tests\Test-CollectEmail.ps1 -AllowSystemChanges
+    powershell -ExecutionPolicy Bypass -File tests\Test-CollectLive.ps1
 
   tests\Test-ShadowCopy.ps1 (no admin needed; also runs in CI)
     Checks how a copy from the shadow copy is reported, with a folder

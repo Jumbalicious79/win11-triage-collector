@@ -103,6 +103,13 @@ jobs:
         if: ${{ !cancelled() }}
         run: ./tests/Test-CollectSecrets.ps1
 
+      # A live collection of the runner itself (Execution, USB, Persistence):
+      # the provenance, AppCompatCache, USBSTOR and Run key log lines and
+      # files. Reads only; the collection folder is removed afterwards
+      - name: Run live collection test
+        if: ${{ !cancelled() }}
+        run: ./tests/Test-CollectLive.ps1
+
   unit-tests:
     # Tests of single collector functions, loaded from the script's syntax
     # tree: no collection runs and no admin rights are needed. Steps after

@@ -7944,6 +7944,10 @@ if (-not $NoCompress) {
 Restore-ConsoleMode
 
 if (-not $Unattended) {
+    # Keys pressed during the run (an extra Enter at a prompt, a key to wake
+    # the screen) wait in the console's input buffer and would close the
+    # window at once: drop them, so the summary stays until a key is pressed
+    try { $Host.UI.RawUI.FlushInputBuffer() } catch { Write-Verbose "Console input buffer not flushed: $($_.Exception.Message)" }
     Write-Host ""
     Write-Host "Press any key to exit..." -ForegroundColor Cyan
     $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")

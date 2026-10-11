@@ -39,9 +39,10 @@ Required directory structure:
       timeline-builder.ps1
       Run-TimelineBuilder.bat
       README.txt
-      report\                     <-- findings report rules and renderer
+      lib\                        <-- the builder's own scripts
+        report\                   <-- findings report rules and renderer
                                       (needed for report.pdf)
-      memory\                     <-- ARM64 memory dump analysis
+        memory\                   <-- ARM64 memory dump analysis
       tools\                      <-- auto-downloaded tools (each in own subfolder)
         dbgeng\                   <-- optional: debugger engine DLLs
                                       (ARM64 memory dumps)
@@ -174,8 +175,9 @@ To prepare a USB drive as a portable forensic triage kit:
       timeline-builder.ps1
       Run-TimelineBuilder.bat
       README.txt
-      report\                     <-- findings report rules and renderer
-      memory\                     <-- ARM64 memory dump analysis
+      lib\                        <-- the builder's own scripts
+        report\                   <-- findings report rules and renderer
+        memory\                   <-- ARM64 memory dump analysis
       tools\                      <-- sqlite3\, TimelineExplorer\, volatility3\,
                                       dbgeng\, symbols\
       reports\                    <-- timelines save here

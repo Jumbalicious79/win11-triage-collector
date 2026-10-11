@@ -320,7 +320,8 @@ the summary say where it is.
 Inside the zip:
 
   TriageCollection_2026-04-08_08-04\
-    collection_info.json              -- host, mode, start time, time zones
+    collection_info.json              -- host, mode, start time, time zones,
+                                         the collector's own process IDs
     collection_log.txt                -- full run log
     collection_manifest.csv           -- SHA256, source, dest, size, source file
                                          times per file (see Output File Formats)
@@ -486,6 +487,10 @@ Inside the zip:
                      for DumpIt the only record of its SHA-256 of the dump
                      and its NtStatus. Kept in the zip and listed in the
                      manifest.
+  Tool's process     The capture tool's process ID and start time, added
+                     to collection_info.json (CollectorProcesses) after
+                     the capture, so the timeline builder can tell the
+                     tool's own process in the dump apart from the rest.
 
 ### FileSystem
 
@@ -854,7 +859,8 @@ with only a header row means the query ran and found nothing.
 
 ### collection_info.json
 
-Written at the start of the run, at the root of the collection:
+Written at the start of the run (and again after a memory capture, see
+CollectorProcesses), at the root of the collection:
 
   SchemaVersion        1
   ComputerName         Machine running the collector
@@ -875,11 +881,71 @@ Written at the start of the run, at the root of the collection:
                        reads nothing under Secrets\.
   ThunderbirdIndexIncluded  true when the run used -IncludeThunderbirdIndex
                        (Thunderbird's search index was copied).
+  CollectorProcesses   Live runs only (left out for a mounted image: the
+                       collecting machine's process IDs mean nothing for
+                       the image). The collector's own processes, one
+                       object each:
+                         Role       see below
+                         Pid        process ID
+                         Name       program file name, e.g. "cmd.exe"
+                         StartUtc   when the process started, to 100 ns,
+                                    e.g. "2026-10-09T08:15:02.1234567Z"
+                         ParentPid  process ID of its parent
+                       Roles, in this order:
+                         Collector      the collector's PowerShell
+                         Launcher       the cmd.exe that started it (the
+                                        .bat's window), only when its
+                                        parent is cmd.exe started before it
+                         Console        conhost.exe, the host of the
+                                        launcher's console window
+                                        (started between the launcher
+                                        and the collector)
+                         Child          a program the collector started
+                                        during the run that was still
+                                        running when the list was read
+                                        (at the start of the run and
+                                        right before a memory capture;
+                                        in PowerShell 7 the Windows
+                                        PowerShell process its Defender
+                                        cmdlets run in)
+                         MemoryCapture  the memory capture tool (DumpIt)
+                       Written at the start of the run, and updated after a
+                       memory capture to add the capture tool. The command
+                       lines are not recorded.
 
-SecretsIncluded and ThunderbirdIndexIncluded are additive fields;
-SchemaVersion stays 1. The timeline builder uses the time-zone and culture
-fields to convert local-time text (USN journal, setupapi logs) correctly even
-when the analysis machine uses a different time zone or locale.
+SecretsIncluded, ThunderbirdIndexIncluded and CollectorProcesses are
+additive fields; SchemaVersion stays 1. The timeline builder uses the
+time-zone and culture fields to convert local-time text (USN journal,
+setupapi logs) correctly even when the analysis machine uses a different
+time zone or locale.
+
+CollectorProcesses lets the timeline builder tell the collector's own
+processes in the memory dump apart from everything else. Its report leaves
+exactly these processes -- recognized by process ID, name and start time,
+never by name alone, so a program cannot hide by calling itself
+triage-collector.ps1 -- and the processes they started during the
+collection unflagged; their rows stay in the timeline, and the report says
+how many it left out and lists them. A double-click with a memory capture
+typically records four: powershell.exe (Collector), cmd.exe (Launcher),
+conhost.exe (Console) and DumpIt.exe (MemoryCapture). Short-lived programs
+the collector ran before the dump (systeminfo.exe; csc.exe in Windows
+PowerShell 5.1) are not recorded -- they have ended by then -- but count as
+the collector's when the dump still lists them. When Windows Terminal is
+the default terminal, the console host can hand the window over to it and
+end before the dump, so the dump may not have the Console entry: that is
+normal. Only the parent links and the start times decide what is recorded:
+not the launcher's other children (programs run earlier from the same cmd
+window), not the collector's children from before the run (a run from an
+open PowerShell window, whose console host is then not recorded either),
+and not a process whose ID was reused. The report checks each entry against
+these same rules in the memory dump (the collector a PowerShell process
+started before the collection, the launcher its cmd.exe parent, and so on),
+so an entry added to collection_info.json afterwards is never left out: it
+is listed with its reason, and the report and the builder log say to check
+whether the file was altered. Collections
+made by earlier versions have no CollectorProcesses, and their reports can
+show the collector itself (DumpIt, Run-TriageCollector.bat,
+triage-collector.ps1) as leads.
 
 ### collection_manifest.csv
 
@@ -1150,6 +1216,22 @@ The fastest path from collection to analysis:
     The dump is still next to the zip, where the timeline builder also
     looks.
     Warning: "Could not update the memory dump's row in collection_manifest.csv, it still names ...: ..."
+
+  - collection_info.json records the collector's own processes
+    (CollectorProcesses) at the start of the run and, after a memory
+    capture, again with the capture tool added; the second write replaces
+    the file only once it is complete, and its manifest row is updated.
+    If the process list cannot be read (a WMI error, or no answer within
+    30 seconds), only the collector's own PowerShell is recorded (its
+    parent as 0); if the second write fails (for example on a drive the
+    dump has filled), the first version is kept. Either way the timeline
+    builder's report still recognizes the collector's PowerShell and the
+    processes it started during the collection, the capture tool among
+    them. When only the PowerShell is recorded, the .bat's cmd window is
+    not left out: a lead on it (the .bat run from Downloads) is marked on
+    its card as possibly the collector. Neither is an error.
+    Warning: "Could not read the collector's process tree (Win32_Process): ... Only the collector's own PowerShell process is recorded in collection_info.json."
+    Warning: "collection_info.json not updated (...): DumpIt.exe (PID 10232) is not recorded as the memory capture tool, so the timeline builder's report can show it as a lead. ..."
 
   - Per-user live registry data (Run/RunOnce keys, RecentApps) covers every
     user whose hive is loaded, i.e. users logged in at collection time, not
@@ -1514,6 +1596,12 @@ capture before collection begins.
            free space that can still hold deleted files: another drive is
            better. FAT32 (common on USB sticks) cannot hold a dump of 4 GB
            or more.
+  Process: The tool runs in the collector's console window. Its output
+           (standard output, then standard error) is saved as
+           memory_acquisition_log.txt, and its process ID and start time
+           are added to collection_info.json (CollectorProcesses). Ctrl+C
+           reaches the tool too; one still running 5 seconds later is
+           ended, with a warning.
   Checks: After the capture, DumpIt's "Error:" lines are copied into the
           log, and the dump is kept only when it exists, is not empty,
           DumpIt reported NtStatus 0x00000000 and the size the file has,
@@ -1602,8 +1690,9 @@ capture before collection begins.
     master key files (Protect\<SID>\<GUID>, hidden+system), Preferred,
     CREDHIST, Credentials, Vault, and the system keys
     System32\Microsoft\Protect\S-1-5-18. Without the switch: the canary is
-    in no browser copy, there is no Secrets folder, and SecretsIncluded is
-    false. With the switch: the browser copies are byte-for-byte the
+    in no browser copy, there is no Secrets folder, SecretsIncluded is
+    false, and there is no CollectorProcesses (a mounted image). With the
+    switch: the browser copies are byte-for-byte the
     originals (manifest hash equals the original's), every credential file is
     collected with a manifest row and original times, SecretsIncluded is
     true, the warning is logged, and a junction out of the profile is not
@@ -1670,16 +1759,51 @@ capture before collection begins.
 
   tests\Test-MemoryAcquisitionLog.ps1 (no admin needed; also runs in CI)
     Runs a stand-in capture tool (a .cmd file that prints DumpIt-like
-    lines, one of them on stderr) and saves its output the way the
-    collector does: every line is in Memory\memory_acquisition_log.txt,
-    which is listed in the manifest with its hash and size, with no log
-    line and no error; a tool that prints nothing gives a log with a note,
-    also listed. The collection folders have [ ] in their names. Also
-    checks that the collector saves the log only this way, right after
-    the tool runs and before it checks the dump (so a failed capture also
-    has its log), and writes nothing to it afterwards, so the hash in the
-    manifest matches the file.
+    lines, one of them on stderr) through Invoke-MemoryCaptureTool and
+    saves its output the way the collector does: every line is in
+    Memory\memory_acquisition_log.txt (the stderr line as plain text,
+    after the stdout lines), which is listed in the manifest with its hash
+    and size, with no log line and no error; a tool that prints nothing
+    gives a log with a note, also listed. The collection folders have [ ]
+    in their names. Also checks that the collector saves the log only this
+    way, right after the tool runs and before it checks the dump (so a
+    failed capture also has its log), and writes nothing to it afterwards,
+    so the hash in the manifest matches the file.
       powershell -ExecutionPolicy Bypass -File tests\Test-MemoryAcquisitionLog.ps1
+
+  tests\Test-CollectorProcesses.ps1 (no admin needed, except for its
+    end-to-end part; also runs in CI)
+    Checks the collector's own processes in collection_info.json
+    (CollectorProcesses). Which processes of a process list are the
+    collector's: its PowerShell, the cmd.exe that started it and the
+    console host, its children started during the run -- not the cmd
+    window's other children, a launcher or child whose process ID was
+    reused, the collector's children from before the run, or a PowerShell
+    parent. The real process tree: PowerShell started by cmd.exe with a
+    console of its own, as Run-TriageCollector.bat starts it (no .bat
+    runs), each PID and start time checked against the live process. The
+    memory capture tool, run through Invoke-MemoryCaptureTool with a
+    stand-in console program the test builds with the .NET Framework's
+    ilasm.exe (for x64, ARM64 or x86): its PID and start time, every
+    output line (stderr after stdout), arguments with spaces, [ ], quotes
+    and backslashes, the dump file; a tool that cannot start throws, and a
+    stop (as Ctrl+C) ends a tool still running. collection_info.json
+    written twice: one manifest row, with the second version's hash and
+    size; a second write that fails keeps the first version and its row;
+    a mounted image gets no CollectorProcesses. The memory section: the
+    process list read before the tool runs, the tool's process recorded
+    right after, collection_info.json written again after the capture.
+    End to end: the collector (a copy in a temporary folder, with the
+    stand-in as tools\dumpit\<arch>\DumpIt.exe and a RAM size of 1 MB, so
+    no real memory is captured) run through cmd.exe with -Unattended: a
+    capture (Collector, Launcher, Console and MemoryCapture, each PID,
+    start time and parent link checked), a run without Memory, one with no
+    capture tool and one with a tool that cannot start (no capture tool
+    recorded), and a mounted image (subst; no CollectorProcesses). The
+    end-to-end part needs Administrator rights, like the collector;
+    without them, pass -CollectorPath with a copy of the collector that
+    has no admin check.
+      powershell -ExecutionPolicy Bypass -File tests\Test-CollectorProcesses.ps1
 
   tests\Test-MemorySpaceCheck.ps1 (no admin needed; also runs in CI)
     Checks the free space check before a memory capture and the check of
@@ -1697,9 +1821,12 @@ capture before collection begins.
     warning), a complete, failed, empty or missing dump, an earlier dump at
     the path, -MemoryOutputPath, WinPmem and Magnet RAM Capture, a failed
     dump that cannot be renamed or is held open; the dump's manifest row
-    has its full path, size and hash. The summary and compression step:
-    the dump moved next to the zip (the manifest in the zip then names that
-    path), or the folder kept unzipped (and the summary corrected) when it
+    has its full path, size and hash; a capture reads the collector's
+    process list first, then records the tool's process and writes
+    collection_info.json again (not when the tool did not start). The
+    summary and compression step: the dump moved next to the zip (the
+    manifest in the zip then names that path), or the folder kept unzipped
+    (and the summary corrected) when it
     cannot be moved; moved back with its manifest row when the zip fails;
     the rest of the manifest unchanged, and kept as it was (a warning) when
     it cannot be changed; for a dump that is not next to the zip, the lines

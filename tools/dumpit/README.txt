@@ -58,7 +58,9 @@ ANALYZING THE DUMP
 ------------------
   - win11-timeline-builder analyzes x64 dumps with Volatility 3
     (see that project's tools\volatility3\README.txt).
-  - Windows ARM64 dumps can be captured but Volatility 3 cannot analyze
-    Windows ARM64 memory; open the .dmp in WinDbg instead.
+  - Volatility 3 cannot analyze Windows ARM64 memory, so the timeline
+    builder reads Windows ARM64 dumps with Microsoft's debugger engine
+    (part of Windows): the processes and their command lines, not network
+    connections or services. WinDbg opens both kinds of dump.
   - Dmp2Bin.exe (in the DumpIt download) converts a .dmp to a raw image
     if another tool needs one.

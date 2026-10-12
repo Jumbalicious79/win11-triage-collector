@@ -229,9 +229,9 @@ needed -- plug in, double-click, collect, analyze.
   tools\dumpit\README.txt). The script prompts on live system runs when a
   capture tool is detected. See the "Optional Tools" section below. On a
   Windows ARM64 machine the prompt notes that the timeline builder reads
-  ARM64 memory with Microsoft's debugger engine: the processes and their
-  command lines, not network connections or services (Volatility 3 does
-  not support ARM64). What the prompt showed (the space check, the system
+  ARM64 memory with Microsoft's debugger engine (Volatility 3 does not
+  support ARM64): processes, DLLs, drivers, handles, registry, network
+  connections and services. What the prompt showed (the space check, the system
   drive warning and the other drives offered, the ARM64 note) and the
   answer given are written to collection_log.txt once it exists
   ("Memory prompt:" lines after "Collection Started"); so is why it was
@@ -1195,9 +1195,10 @@ The fastest path from collection to analysis:
      the script prompts to include memory analysis: with Volatility 3 (in
      the builder's tools\volatility3\) for an x64 dump, with Microsoft's
      debugger engine (part of Windows) for a Windows ARM64 dump, which
-     gives the processes and their command lines (not network connections
-     or services; the first time per Windows build it downloads the
-     kernel's symbol file, about 10 MB, from Microsoft). A dump that is not
+     gives processes and command lines, users, DLLs, drivers, handles,
+     registry, console history, network connections and services (the
+     first time per Windows build it downloads the kernel's symbol file,
+     about 10 MB, from Microsoft). A dump that is not
      analyzed is noted in the findings report
   5. Timeline builds (about 5 minutes for a 100 MB collection, ~300,000
      events with the $MFT and the USN journal; longer with memory)
@@ -1710,8 +1711,8 @@ capture before collection begins.
   Live only: Memory capture is skipped for mounted forensic images.
   Analysis: win11-timeline-builder analyzes x64 dumps with Volatility 3
             and Windows ARM64 dumps with Microsoft's debugger engine
-            (processes and command lines; not network connections or
-            services). WinDbg opens both.
+            (processes, DLLs, drivers, handles, registry, network
+            connections, services and more). WinDbg opens both.
 
   If no tool is found in tools\, the script does not prompt and proceeds
   with standard artifact collection. No errors, no noise.

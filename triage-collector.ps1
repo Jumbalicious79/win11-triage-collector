@@ -772,11 +772,11 @@ if ($script:IsLive -and ($Categories -notcontains "Memory") -and -not $Unattende
         Write-Host "  Runs FIRST to preserve pristine memory state." -ForegroundColor DarkGray
         if ((Get-NativeMachineType) -eq 0xAA64) {
             # The timeline builder reads ARM64 dumps with Microsoft's debugger engine
-            # (Volatility 3 has no ARM64 support): processes and command lines only
+            # (Volatility 3 has no ARM64 support)
             Write-Host "  Note: this is an ARM64 machine. The timeline builder reads ARM64 memory" -ForegroundColor DarkGray
-            Write-Host "  with Microsoft's debugger engine: processes and command lines, not" -ForegroundColor DarkGray
-            Write-Host "  network connections or services (Volatility 3 does not support ARM64)." -ForegroundColor DarkGray
-            $script:memoryPromptLog.Add("Memory prompt: ARM64 note shown (the timeline builder reads ARM64 memory with Microsoft's debugger engine: processes and command lines, not network connections or services).")
+            Write-Host "  with Microsoft's debugger engine (Volatility 3 does not support ARM64):" -ForegroundColor DarkGray
+            Write-Host "  processes, DLLs, drivers, handles, registry, network and services." -ForegroundColor DarkGray
+            $script:memoryPromptLog.Add("Memory prompt: ARM64 note shown (the timeline builder reads ARM64 memory with Microsoft's debugger engine: processes, DLLs, drivers, handles, registry, network and services).")
         }
         Write-Host "  Dump file: $memDumpTarget" -ForegroundColor DarkGray
         Write-Host "  $(Format-SpaceCheck $memSpace)" -ForegroundColor DarkGray
